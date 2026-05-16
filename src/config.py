@@ -90,6 +90,24 @@ class Settings(BaseSettings):
             raise ValueError(f"NS_API_SECRET должен быть валидным base64: {exc}") from exc
         return v
 
+    @field_validator("ns_totp_secret")
+    @classmethod
+    def _check_totp_secret_base32(cls, v: SecretStr | None) -> SecretStr | None:
+        if v is None:
+            return None
+        raw = v.get_secret_value().strip().replace(" ", "").upper()
+        if not raw:
+            return None
+        import base64
+
+        try:
+            base64.b32decode(raw + "=" * ((-len(raw)) % 8))
+        except Exception as exc:
+            raise ValueError(
+                f"NS_TOTP_SECRET должен быть валидным base32 (буквы A-Z и цифры 2-7): {exc}"
+            ) from exc
+        return SecretStr(raw)
+
     @property
     def project_root(self) -> Path:
         return PROJECT_ROOT

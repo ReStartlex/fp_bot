@@ -48,6 +48,7 @@ async def main() -> int:
     logger.info(f"  Base URL: {settings.ns_base_url}")
     logger.info(f"  User ID:  {settings.ns_user_id}")
     logger.info(f"  Login:    {settings.ns_login}")
+    logger.info(f"  TOTP:     {'есть' if settings.ns_totp_secret else 'нет'}")
     logger.info(f"  Playground режим: {settings.ns_use_playground}")
 
     logger.info("0/4 Определение внешнего IP сервера...")

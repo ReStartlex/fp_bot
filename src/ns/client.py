@@ -104,13 +104,16 @@ class NSClient:
     async def login(self) -> str:
         """POST /api/v2/get_token. Возвращает свежий токен (TTL 2 часа)."""
         path = "/api/v2/get_token"
-        body = json.dumps(
-            {
-                "login": self._settings.ns_login,
-                "password": self._settings.ns_password.get_secret_value(),
-            },
-            separators=(",", ":"),
-        ).encode()
+        payload: dict[str, Any] = {
+            "login": self._settings.ns_login,
+            "password": self._settings.ns_password.get_secret_value(),
+        }
+        if self._settings.ns_totp_secret:
+            payload["totp_code"] = pyotp.TOTP(
+                self._settings.ns_totp_secret.get_secret_value()
+            ).now()
+            logger.debug("NS login: добавили TOTP-код в body")
+        body = json.dumps(payload, separators=(",", ":")).encode()
         ts = str(int(time.time()))
         headers = {
             "X-User-Id": str(self._settings.ns_user_id),
