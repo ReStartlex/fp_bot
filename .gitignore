@@ -1,0 +1,57 @@
+# ===== Секреты =====
+.env
+.env.*
+!.env.example
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+.venv/
+venv/
+env/
+ENV/
+
+# ===== Тесты =====
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ===== Локальные данные =====
+data/
+logs/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.log
+
+# ===== Архивы и временные =====
+app.zip
+*.tar.gz
+*.tgz
+
+# ===== IDE =====
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ===== Маппинги (могут содержать чувствительные данные) =====
+mappings.csv
+mappings_*.csv
+
+# ===== Прочие приватные файлы =====
+*.local
+secrets/
