@@ -127,28 +127,57 @@ class FunPayClient:
 
     async def get_my_lots(self) -> list[Any]:
         """
-        Возвращает список лотов пользователя.
-        Имя метода в FunPayAPI варьируется: get_my_subcategory_lots / get_my_lots / etc.
+        Возвращает список лотов текущего пользователя (LotShortcut-like).
+        В FunPayAPI это берётся через UserProfile самого юзера.
         """
 
-        def _try() -> list[Any]:
+        def _get() -> list[Any]:
             acc = self.account
-            for name in ("get_my_lots", "get_subcategory_public_lots", "get_lots"):
-                fn = getattr(acc, name, None)
-                if callable(fn):
+            profile = acc.get_user(acc.id)
+            # В разных версиях имена варьируются
+            for attr in ("lots", "get_lots", "get_sorted_lots"):
+                value = getattr(profile, attr, None)
+                if value is None:
+                    continue
+                if callable(value):
                     try:
-                        result = fn()
-                        if isinstance(result, list):
-                            return result
-                    except TypeError:
-                        # Метод требует аргументы — пропускаем
-                        continue
+                        value = value()
                     except Exception as exc:
-                        logger.debug(f"FunPayAPI.{name}() упал: {exc}")
+                        logger.debug(f"profile.{attr}() упал: {exc}")
                         continue
+                if isinstance(value, list):
+                    return value
+                if isinstance(value, dict):
+                    flat: list[Any] = []
+                    for v in value.values():
+                        if isinstance(v, list):
+                            flat.extend(v)
+                        elif isinstance(v, dict):
+                            for vv in v.values():
+                                if isinstance(vv, list):
+                                    flat.extend(vv)
+                                else:
+                                    flat.append(vv)
+                        else:
+                            flat.append(v)
+                    return flat
             return []
 
-        return await self._to_thread(_try)
+        return await self._to_thread(_get)
+
+    async def get_lot_fields(self, lot_id: int) -> Any:
+        """Поля лота для редактирования (LotFields)."""
+        return await self._to_thread(self.account.get_lot_fields, lot_id)
+
+    async def save_lot(self, lot_fields: Any) -> None:
+        """Сохранить изменения лота (после правки полей)."""
+        await self._to_thread(self.account.save_lot, lot_fields)
+
+    async def send_message(self, chat_id: int, text: str) -> Any:
+        """Отправить сообщение в чат с покупателем."""
+        return await self._to_thread(
+            self.account.send_message, chat_id, text
+        )
 
     # ----- Диагностика -----
 
