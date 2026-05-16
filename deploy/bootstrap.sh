@@ -1,27 +1,25 @@
 #!/usr/bin/env bash
-# Мастер-скрипт первичной установки бота на свежем VPS.
-# Запускать ОДИН РАЗ от root в веб-консоли Timeweb:
-#
-#   curl -fsSL https://raw.githubusercontent.com/ReStartlex/fp_bot/main/deploy/bootstrap.sh | bash
-#
-# Или, если репо приватный, через git clone:
-#
-#   apt update && apt install -y git
-#   git clone https://github.com/ReStartlex/fp_bot.git /opt/funpay-ns-bot
-#   bash /opt/funpay-ns-bot/deploy/bootstrap.sh
+# Bootstrap-скрипт.
+# Предполагает, что код проекта уже распакован в /opt/funpay-ns-bot
+# (см. deploy/fetch_code.sh — скачивает через gh-proxy.com).
 #
 # Что делает:
 #   1. apt update/upgrade
 #   2. ставит python3.12, pip, venv, git, unzip, ufw, fail2ban
-#   3. настраивает firewall и fail2ban
-#   4. клонирует репо (если ещё не клонирован)
-#   5. создаёт venv + ставит зависимости
-#   6. напоминает создать .env вручную
+#   3. создаёт пользователя bot
+#   4. создаёт venv + ставит pip-зависимости
+#   5. настраивает firewall и fail2ban
+#   6. устанавливает systemd-юнит
 
 set -euo pipefail
 
 APP_DIR=/opt/funpay-ns-bot
-REPO_URL=${REPO_URL:-https://github.com/ReStartlex/fp_bot.git}
+
+if [[ ! -f "${APP_DIR}/requirements.txt" ]]; then
+    echo "ОШИБКА: ${APP_DIR}/requirements.txt не найден."
+    echo "Сначала скачай код: bash ${APP_DIR}/deploy/fetch_code.sh (или вручную)."
+    exit 1
+fi
 
 echo "==> 1/6 Обновление пакетов"
 export DEBIAN_FRONTEND=noninteractive
@@ -40,21 +38,9 @@ if ! id -u bot >/dev/null 2>&1; then
     useradd -m -s /bin/bash bot
 fi
 
-echo "==> 4/6 Клонирование репозитория"
-if [[ ! -d "${APP_DIR}/.git" ]]; then
-    if [[ -d "${APP_DIR}" ]] && [[ -n "$(ls -A "${APP_DIR}" 2>/dev/null)" ]]; then
-        echo "    ${APP_DIR} не пустой и не git-репо — переименовываю в ${APP_DIR}.bak"
-        mv "${APP_DIR}" "${APP_DIR}.bak.$(date +%s)"
-    fi
-    git clone "${REPO_URL}" "${APP_DIR}"
-else
-    cd "${APP_DIR}"
-    git pull --ff-only
-fi
-
 mkdir -p "${APP_DIR}/data" "${APP_DIR}/logs"
 
-echo "==> 5/6 Виртуальное окружение и зависимости"
+echo "==> 4/6 Виртуальное окружение и зависимости"
 if [[ ! -d "${APP_DIR}/.venv" ]]; then
     python3.12 -m venv "${APP_DIR}/.venv"
 fi
@@ -63,7 +49,7 @@ fi
 
 chown -R bot:bot "${APP_DIR}"
 
-echo "==> 6/6 Firewall (открыт только SSH) и fail2ban"
+echo "==> 5/6 Firewall (открыт только SSH 22 + 443) и fail2ban"
 ufw --force reset >/dev/null
 ufw default deny incoming
 ufw default allow outgoing
@@ -73,7 +59,7 @@ ufw --force enable >/dev/null
 systemctl enable fail2ban >/dev/null 2>&1 || true
 systemctl restart fail2ban
 
-# systemd-юнит на будущее (пока не запускаем)
+echo "==> 6/6 systemd-юнит"
 if [[ -f "${APP_DIR}/deploy/funpay-ns-bot.service" ]]; then
     cp "${APP_DIR}/deploy/funpay-ns-bot.service" /etc/systemd/system/funpay-ns-bot.service
     systemctl daemon-reload
