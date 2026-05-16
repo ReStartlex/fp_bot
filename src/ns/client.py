@@ -57,10 +57,15 @@ class NSClient:
         )
 
     async def __aenter__(self) -> "NSClient":
+        # Принудительно используем IPv4: у нас в whitelist NS только IPv4,
+        # а api.ns.gifts отдаёт ещё и AAAA-запись (IPv6), которая Python'у
+        # отдаётся первой и приводит к 403 "Invalid login details".
+        transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0")
         self._client = httpx.AsyncClient(
             base_url=self._settings.ns_base_url,
             timeout=httpx.Timeout(30.0),
             headers={"User-Agent": "ns-funpay-bridge/0.1"},
+            transport=transport,
         )
         return self
 
