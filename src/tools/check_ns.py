@@ -5,6 +5,7 @@ CLI-проверка доступа к ns.gifts.
     python -m src.tools.check_ns
 
 Делает:
+0. Печатает внешний (исходящий) IP сервера — он должен быть в whitelist у NS.
 1. Логинится (POST /get_token).
 2. Запрашивает баланс (GET /check_balance).
 3. Запрашивает каталог (GET /stock) и печатает первые 10 услуг.
@@ -16,12 +17,26 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 from loguru import logger
 
 from src.config import get_settings
 from src.logging_setup import setup_logging
 from src.ns import NSClient
 from src.ns.exceptions import NSAPIError, NSAuthError, NSForbiddenError
+
+
+def _detect_external_ip() -> str | None:
+    """Узнать с какого IP сервер выходит наружу (важно для whitelist)."""
+    for url in ("https://api.ipify.org", "https://ifconfig.me", "https://ipv4.icanhazip.com"):
+        try:
+            with httpx.Client(timeout=5.0, follow_redirects=True) as c:
+                r = c.get(url)
+                if r.status_code == 200:
+                    return r.text.strip()
+        except Exception:
+            continue
+    return None
 
 
 async def main() -> int:
@@ -34,6 +49,15 @@ async def main() -> int:
     logger.info(f"  User ID:  {settings.ns_user_id}")
     logger.info(f"  Login:    {settings.ns_login}")
     logger.info(f"  Playground режим: {settings.ns_use_playground}")
+
+    logger.info("0/4 Определение внешнего IP сервера...")
+    external_ip = _detect_external_ip()
+    if external_ip:
+        logger.success(f"    Сервер выходит наружу с IP: {external_ip}")
+        logger.info(f"    Именно этот IP должен быть в whitelist у ns.gifts.")
+    else:
+        logger.warning("    Не удалось определить внешний IP (api.ipify.org/ifconfig.me недоступны)")
+
     logger.info("=" * 60)
 
     try:
@@ -91,19 +115,28 @@ async def main() -> int:
 
     except NSAuthError as exc:
         logger.error(f"401 (auth): {exc}")
+        logger.error(f"Полный ответ сервера:\n{exc.response_body}")
         logger.error("Проверь NS_USER_ID, NS_LOGIN, NS_PASSWORD, NS_API_SECRET в .env")
         return 1
     except NSForbiddenError as exc:
         logger.error(f"403 (forbidden): {exc}")
+        logger.error(f"Полный ответ сервера:\n{exc.response_body}")
+        if external_ip:
+            logger.error(
+                f"Внешний IP сервера: {external_ip}. "
+                f"Этот IP должен быть в whitelist у ns.gifts."
+            )
         logger.error(
-            "Твой IP не в whitelist у ns.gifts. "
-            "Напиши в саппорт и попроси добавить IP сервера. "
-            "Пока можно работать через playground (NS_USE_PLAYGROUND=true), "
-            "но он не позволяет реально оплачивать заказы."
+            "Если IP в whitelist, но 403 всё равно — возможны причины:\n"
+            "  - неверный логин/пароль (некоторые API отдают 403 вместо 401)\n"
+            "  - IP добавлен, но изменения ещё не применились\n"
+            "  - аккаунт заблокирован/требует верификации\n"
+            "Покажи саппорту полный ответ выше — попроси разобраться."
         )
         return 2
     except NSAPIError as exc:
         logger.error(f"NS API ошибка: {exc}")
+        logger.error(f"Полный ответ сервера:\n{exc.response_body}")
         return 3
     except Exception as exc:
         logger.exception(f"Неожиданная ошибка: {exc}")
