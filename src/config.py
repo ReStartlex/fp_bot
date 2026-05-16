@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: int | None = None
     telegram_enabled: bool = True
+    telegram_use_proxy: bool = False
     telegram_proxy_type: ProxyType = ProxyType.SOCKS5
     telegram_proxy_host: str | None = None
     telegram_proxy_port: int | None = None
@@ -122,6 +123,8 @@ class Settings(BaseSettings):
 
     @property
     def telegram_proxy_url(self) -> str | None:
+        if not self.telegram_use_proxy:
+            return None
         if not self.telegram_proxy_host or not self.telegram_proxy_port:
             return None
         scheme = self.telegram_proxy_type.value
