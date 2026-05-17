@@ -58,3 +58,4 @@ mappings_*.csv
 # ===== Прочие приватные файлы =====
 *.local
 secrets/
+.gitcommitmsg.tmp
