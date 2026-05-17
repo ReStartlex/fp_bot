@@ -101,7 +101,11 @@ class App:
                 self.watcher = None
 
         # 4. Telegram-бот с командами
-        self.bot = TelegramBot(self.settings, sync_trigger=self._trigger_sync)
+        self.bot = TelegramBot(
+            self.settings,
+            sync_trigger=self._trigger_sync,
+            funpay_client=self.fp,
+        )
         await self.bot.start()
 
         # 5. Планировщик: sync + heartbeat + low-balance

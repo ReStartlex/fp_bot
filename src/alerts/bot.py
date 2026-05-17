@@ -29,8 +29,10 @@ from loguru import logger
 from sqlalchemy import desc, select
 
 from src.config import Settings, get_settings
-from src.db.models import Order, SyncRun
+from src.db.models import Mapping, Order, SyncRun
+from src.db.repo import upsert_mapping
 from src.db.session import session_factory
+from src.funpay.client import FunPayClient
 from src.ns import NSClient
 
 
@@ -94,9 +96,17 @@ class TelegramBot:
     HELP_TEXT = (
         "<b>Команды:</b>\n"
         "/status — состояние бота, последний sync, баланс\n"
-        "/balance — только баланс NS\n"
+        "/balance — баланс NS\n"
         "/orders — последние 10 заказов\n"
         "/sync — запустить синхронизацию прямо сейчас\n"
+        "\n"
+        "<b>Маппинги (NS↔FunPay):</b>\n"
+        "/lots — мои лоты на FunPay (для поиска funpay_lot_id)\n"
+        "/mappings — список текущих маппингов\n"
+        "/map &lt;funpay_lot_id&gt; &lt;ns_service_id&gt; [markup%] — добавить/обновить\n"
+        "/unmap &lt;funpay_lot_id&gt; — выключить маппинг\n"
+        "\n"
+        "<b>Прочее:</b>\n"
         "/whoami — твой chat_id\n"
         "/help — это сообщение"
     )
@@ -106,9 +116,11 @@ class TelegramBot:
         settings: Settings | None = None,
         *,
         sync_trigger: SyncTrigger | None = None,
+        funpay_client: FunPayClient | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._sync_trigger = sync_trigger
+        self._funpay_client = funpay_client
         self._bot: Bot | None = None
         self._dp: Dispatcher | None = None
         self._task: asyncio.Task | None = None
@@ -221,6 +233,30 @@ class TelegramBot:
                 return
             await self._do_sync(msg)
 
+        @dp.message(Command("lots"))
+        async def cmd_lots(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_lots(msg)
+
+        @dp.message(Command("mappings"))
+        async def cmd_mappings(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_mappings(msg)
+
+        @dp.message(Command("map"))
+        async def cmd_map(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_map(msg)
+
+        @dp.message(Command("unmap"))
+        async def cmd_unmap(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_unmap(msg)
+
     # ---------- Реализации команд ----------
 
     async def _do_status(self, msg: Message) -> None:
@@ -276,3 +312,146 @@ class TelegramBot:
         except Exception as exc:
             logger.exception("Sync trigger failed")
             await msg.answer(f"❌ Sync упал: <code>{exc}</code>")
+
+    async def _do_lots(self, msg: Message) -> None:
+        if self._funpay_client is None:
+            await msg.answer(
+                "FunPay-клиент не подключён к боту. Скорее всего FunPay сейчас недоступен, "
+                "смотри логи."
+            )
+            return
+        try:
+            lots = await self._funpay_client.get_my_lots()
+        except Exception as exc:
+            await msg.answer(f"FunPay get_my_lots упал: <code>{exc}</code>")
+            return
+
+        if not lots:
+            await msg.answer("Лотов нет.")
+            return
+
+        lines = [f"<b>Лоты на FunPay ({len(lots)}):</b>"]
+        for lot in lots[:30]:
+            lot_id = (
+                getattr(lot, "id", None)
+                or getattr(lot, "lot_id", None)
+                or getattr(lot, "offer_id", None)
+                or "?"
+            )
+            title = (
+                getattr(lot, "description", None)
+                or getattr(lot, "title", None)
+                or getattr(lot, "name", None)
+                or ""
+            )
+            price = (
+                getattr(lot, "price", None)
+                or getattr(lot, "cost", None)
+                or "—"
+            )
+            title_short = (str(title) or "")[:60]
+            lines.append(
+                f"<code>{lot_id}</code> — {price} — {title_short}"
+            )
+        if len(lots) > 30:
+            lines.append(f"... и ещё {len(lots) - 30}")
+        await msg.answer("\n".join(lines))
+
+    async def _do_mappings(self, msg: Message) -> None:
+        async with session_factory()() as session:
+            stmt = select(Mapping).order_by(Mapping.funpay_lot_id)
+            mappings = (await session.execute(stmt)).scalars().all()
+
+        if not mappings:
+            await msg.answer(
+                "Маппингов нет.\n"
+                "Используй /map &lt;funpay_lot_id&gt; &lt;ns_service_id&gt; [markup%]"
+            )
+            return
+
+        lines = [f"<b>Маппинги ({len(mappings)}):</b>"]
+        for m in mappings:
+            status = "✅" if m.enabled else "⏸"
+            markup = f"{m.markup_percent}%" if m.markup_percent is not None else "default"
+            cap = m.stock_cap if m.stock_cap is not None else "default"
+            label = m.label or ""
+            lines.append(
+                f"{status} <code>{m.funpay_lot_id}</code> → NS#{m.ns_service_id} "
+                f"(markup={markup}, cap={cap}) {label}"
+            )
+        await msg.answer("\n".join(lines))
+
+    async def _do_map(self, msg: Message) -> None:
+        text = (msg.text or "").strip()
+        parts = text.split()
+        if len(parts) < 3:
+            await msg.answer(
+                "Использование:\n"
+                "<code>/map &lt;funpay_lot_id&gt; &lt;ns_service_id&gt; [markup%] [label]</code>\n\n"
+                "Пример: <code>/map 69300023 20 15 Apple 2 USD</code>"
+            )
+            return
+        try:
+            funpay_lot_id = int(parts[1])
+            ns_service_id = int(parts[2])
+        except ValueError:
+            await msg.answer("funpay_lot_id и ns_service_id должны быть числами")
+            return
+
+        markup: float | None = None
+        if len(parts) >= 4:
+            try:
+                markup = float(parts[3].replace(",", ".").rstrip("%"))
+            except ValueError:
+                await msg.answer(f"Не могу распарсить markup '{parts[3]}'")
+                return
+
+        label = " ".join(parts[4:]) if len(parts) >= 5 else None
+
+        async with session_factory()() as session:
+            obj = await upsert_mapping(
+                session,
+                funpay_lot_id=funpay_lot_id,
+                ns_service_id=ns_service_id,
+                markup_percent=markup,
+                stock_cap=None,
+                ns_fields_template='{"quantity":"@QUANTITY"}',
+                enabled=True,
+                label=label,
+            )
+            await session.commit()
+
+        markup_text = f"{obj.markup_percent}%" if obj.markup_percent is not None else "default"
+        await msg.answer(
+            f"✅ Маппинг сохранён:\n"
+            f"FunPay <code>{obj.funpay_lot_id}</code> → NS#{obj.ns_service_id}\n"
+            f"Markup: {markup_text}\n"
+            f"Label: {obj.label or '—'}\n\n"
+            f"Запусти /sync чтобы применить."
+        )
+
+    async def _do_unmap(self, msg: Message) -> None:
+        text = (msg.text or "").strip()
+        parts = text.split()
+        if len(parts) < 2:
+            await msg.answer(
+                "Использование: <code>/unmap &lt;funpay_lot_id&gt;</code>"
+            )
+            return
+        try:
+            funpay_lot_id = int(parts[1])
+        except ValueError:
+            await msg.answer("funpay_lot_id должен быть числом")
+            return
+
+        async with session_factory()() as session:
+            stmt = select(Mapping).where(Mapping.funpay_lot_id == funpay_lot_id)
+            obj = (await session.execute(stmt)).scalar_one_or_none()
+            if obj is None:
+                await msg.answer(f"Маппинг для лота {funpay_lot_id} не найден")
+                return
+            obj.enabled = False
+            await session.commit()
+        await msg.answer(
+            f"⏸ Маппинг для лота <code>{funpay_lot_id}</code> выключен"
+        )
