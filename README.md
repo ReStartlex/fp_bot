@@ -13,13 +13,17 @@
 
 ## Текущая стадия
 
-**F0 — фундамент готов.** Реализован:
+**F0–F2 готовы.** Реализовано:
 
-- Конфиг с валидацией (`src/config.py`)
-- Асинхронный клиент ns.gifts с HMAC, auto-refresh токена, ретраями (`src/ns/`)
-- CLI-проверка доступа к ns.gifts (`src/tools/check_ns.py`)
+- F0: Конфиг (`src/config.py`), NS-клиент с HMAC + auto-refresh + ретраями (`src/ns/`), `check_ns` CLI.
+- F1: FunPay-клиент-обёртка (`src/funpay/`), CLI: `check_funpay`, `list_funpay_lots`.
+- F2: SQLite (SQLAlchemy + aiosqlite) с моделями `Mapping`, `Order`, `FxRate`, `SyncRun`.
+  CSV-импорт маппингов. Получение курса USD/RUB с ЦБ РФ (cbr-xml-daily) с кэшем.
+  Расчёт целевой цены/стока с наценкой и порогом обновления.
+  Sync engine (dry-run и реальный).
 
-Дальше: F1 (FunPay), F2 (БД и маппинги), F3 (обработка заказов).
+Дальше: F3 (обработка заказов FunPay → NS → доставка) и F4–F6 (чат-автоответчик,
+планировщик, Telegram-алерты).
 
 ---
 
@@ -53,6 +57,18 @@ pip install -r requirements.txt
 
 ```powershell
 python -m src.tools.check_ns
+```
+
+### 5. Проверить курс USD/RUB
+
+```powershell
+python -m src.tools.check_fx
+```
+
+### 6. Тесты (unit, без сети)
+
+```powershell
+python -m pytest tests/ -q
 ```
 
 Должен показать:
@@ -102,8 +118,35 @@ d:\money\
     ├── chat/             # авто-ответы (F4)
     ├── alerts/           # Telegram (F6)
     └── tools/
-        └── check_ns.py   # проверка доступа к NS
+        ├── check_ns.py            # проверка доступа к NS
+        ├── check_funpay.py        # проверка доступа к FunPay
+        ├── check_fx.py            # проверка курса USD/RUB
+        ├── list_funpay_lots.py    # листинг лотов на FunPay
+        ├── import_mappings.py     # импорт маппингов из CSV в БД
+        └── dry_run_sync.py        # прогон синхронизатора без записи на FunPay
 ```
+
+---
+
+## F2: Маппинги и синхронизация
+
+После того как у тебя появится хотя бы один лот на FunPay:
+
+1. Скопируй `data/mappings.example.csv` → `data/mappings.csv`, заполни своими `funpay_lot_id` ↔ `ns_service_id`.
+2. Импортируй в БД:
+
+```powershell
+python -m src.tools.import_mappings data\mappings.csv
+```
+
+3. Сделай dry-run (бот покажет, что изменил бы, но **ничего не запишет** на FunPay):
+
+```powershell
+python -m src.tools.dry_run_sync
+```
+
+Когда вывод устроит — включишь `ENABLE_REAL_ACTIONS=true` в `.env`.
+См. `data/README.md` для подробного описания CSV-формата.
 
 ---
 

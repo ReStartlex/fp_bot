@@ -55,7 +55,7 @@ $bytes = (Get-Item $outZip).Length
 $sizeKB = [math]::Round($bytes / 1024.0, 1)
 Write-Host ("==> Done: {0} ({1} KB)" -f $outZip, $sizeKB)
 Write-Host ""
-Write-Host "Next steps:"
-Write-Host "  scp app.zip root@85.239.42.127:/opt/funpay-ns-bot/"
-Write-Host "  scp .env    root@85.239.42.127:/opt/funpay-ns-bot/"
-Write-Host "  ssh root@85.239.42.127 'cd /opt/funpay-ns-bot && unzip -o app.zip && bash deploy/install_app.sh'"
+Write-Host "Next steps (replace VPS_IP with your server's IP):"
+Write-Host "  scp app.zip root@VPS_IP:/opt/funpay-ns-bot/"
+Write-Host "  scp .env    root@VPS_IP:/opt/funpay-ns-bot/"
+Write-Host "  ssh root@VPS_IP 'cd /opt/funpay-ns-bot && unzip -o app.zip && bash deploy/install_app.sh'"

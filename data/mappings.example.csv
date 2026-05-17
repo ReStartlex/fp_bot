@@ -1,0 +1,2 @@
+funpay_lot_id,ns_service_id,markup_percent,stock_cap,ns_fields_template,enabled,label
+12345678,20,,,"{""quantity"":""@QUANTITY""}",true,Apple Gift Card USA 2 USD

@@ -3,7 +3,7 @@
 Так как у нас провайдер режет TCP к Timeweb (ping проходит, TCP — нет),
 работаем через **Git + веб-консоль Timeweb**.
 
-Сервер: Timeweb VPS `85.239.42.127`
+Сервер: Timeweb VPS (IP смотри в ЛК хостинга или в `.env`)
 Репо: `https://github.com/ReStartlex/fp_bot.git`
 
 ---
