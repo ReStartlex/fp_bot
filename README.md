@@ -13,21 +13,21 @@
 
 ## Текущая стадия
 
-**F0–F3 и F6 готовы.** Реализовано:
+**F0–F6 + main entrypoint готовы. Бот цельный, можно запускать.**
 
 - **F0**: Конфиг (`src/config.py`), NS-клиент с HMAC + auto-refresh + ретраями (`src/ns/`), `check_ns` CLI.
 - **F1**: FunPay-клиент-обёртка (`src/funpay/`), CLI: `check_funpay`, `list_funpay_lots`.
 - **F2**: SQLite (SQLAlchemy + aiosqlite) — модели `Mapping`, `Order`, `FxRate`, `SyncRun`.
-  CSV-импорт маппингов. Курс USD/RUB с ЦБ РФ (cbr-xml-daily) с кэшем.
-  Расчёт цены/стока с наценкой и порогом обновления. Sync engine (dry-run / real).
-- **F3-ядро**: order processor (`src/orders/processor.py`): FunPay-событие → NS create → NS pay →
-  доставка кодов в FunPay-чат + запись в БД + Telegram-отчёт. Идемпотентность по `funpay_order_id`.
-  Безопасный dry-run, пока `ENABLE_REAL_ACTIONS=false`. CLI: `src.tools.test_order`.
-- **F4 (частично)**: шаблоны сообщений покупателю (`src/chat/templates.py`, ru/en).
-- **F6**: Telegram-нотификатор (`src/alerts/telegram.py`). CLI: `src.tools.check_telegram`.
-
-Дальше: **F5** — FunPay watcher (получение событий о новых заказах) и **main entrypoint**
-(планировщик: sync каждые N секунд + watcher на заказы 24/7).
+  CSV-импорт маппингов. Курс USD/RUB с ЦБ РФ с кэшем. Sync engine (dry-run / real).
+- **F3**: order processor: FunPay → NS create → pay → доставка кодов в чат → запись в БД → Telegram-отчёт.
+  Идемпотентность. Dry-run пока `ENABLE_REAL_ACTIONS=false`.
+- **F4**: шаблоны сообщений покупателю (`src/chat/templates.py`, ru/en).
+- **F5**: FunPay watcher (`src/funpay/watcher.py`) — слушает события Runner'а в потоке,
+  отдаёт нормализованные события в asyncio.
+- **F6**: Telegram — нотификатор (алерты) + интерактивный бот с командами
+  `/status`, `/balance`, `/orders`, `/sync`, `/whoami`. Авторизация по `TELEGRAM_CHAT_ID`.
+- **Main** (`src/main.py`): один asyncio-процесс, который связывает sync (APScheduler),
+  watcher, telegram-бота, heartbeat и low-balance-алерт. Управляется systemd.
 
 ---
 
@@ -121,11 +121,13 @@ d:\money\
     ├── orders/           # пайплайн заказов (F3)
     ├── chat/             # авто-ответы (F4)
     ├── alerts/           # Telegram (F6)
+    ├── main.py                # entrypoint (запускается через systemd)
     └── tools/
         ├── check_ns.py            # проверка доступа к NS
         ├── check_funpay.py        # проверка доступа к FunPay
         ├── check_fx.py            # проверка курса USD/RUB
         ├── check_telegram.py      # тестовая отправка в Telegram
+        ├── discover_chat_id.py    # авто-определение TELEGRAM_CHAT_ID
         ├── list_funpay_lots.py    # листинг лотов на FunPay
         ├── import_mappings.py     # импорт маппингов из CSV в БД
         ├── dry_run_sync.py        # прогон синхронизатора без записи на FunPay
@@ -171,6 +173,46 @@ python -m src.tools.test_order `
 
 Без флага `--really` `pay_order` НЕ вызывается, NS отменит созданный заказ
 автоматически через ~10 минут (это нормальное поведение).
+
+---
+
+## Telegram: настройка с нуля
+
+1. Создай бота через **@BotFather** → получишь токен. Положи в `.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=12345:AAA...
+   ```
+2. Узнай свой `chat_id` — есть две дороги:
+
+   **A. Автоматически (рекомендуется):**
+   ```powershell
+   python -m src.tools.discover_chat_id
+   ```
+   Скрипт ждёт сообщения. Открой Telegram → найди своего бота → напиши `/start`.
+   Скрипт распечатает `TELEGRAM_CHAT_ID=...` — скопируй в `.env`.
+
+   **B. Через `@userinfobot`** — просто напиши ему любое сообщение.
+
+3. Проверка отправки:
+   ```powershell
+   python -m src.tools.check_telegram
+   ```
+
+После этого `python -m src.main` поднимет всё: бот ответит на `/help`,
+`/status` покажет состояние, `/sync` запустит синхронизацию вручную.
+
+---
+
+## Запуск 24/7
+
+На сервере (Linux + systemd):
+
+```bash
+systemctl enable --now funpay-ns-bot
+journalctl -u funpay-ns-bot -f
+```
+
+См. `deploy/README.md` — там пошагово первичная установка и обновления.
 
 ---
 

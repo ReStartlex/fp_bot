@@ -61,26 +61,70 @@ sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.check_ns
 
 ---
 
-## Обновление кода (когда я что-то меняю)
+## Обновление кода
 
 **Локально:**
 
 ```powershell
 git add .
-git commit -m "F1: FunPay client"
+git commit -m "..."
 git push
 ```
 
-**На сервере (веб-консоль):**
+**На сервере (одна команда):**
 
 ```bash
-cd /opt/funpay-ns-bot
-sudo -u bot git pull
-sudo -u bot /opt/funpay-ns-bot/.venv/bin/pip install -r requirements.txt
-systemctl restart funpay-ns-bot 2>/dev/null || true
+bash /opt/funpay-ns-bot/deploy/update.sh
 ```
 
-Можно завернуть в одну строку — позже сделаем алиас.
+Скрипт скачает свежий код через `gh-proxy`, обновит зависимости и
+перезапустит systemd-сервис (если он включён).
+
+---
+
+## Запуск бота
+
+### Telegram: первый запуск (определить chat_id)
+
+1. В `.env` укажи `TELEGRAM_BOT_TOKEN`, оставь `TELEGRAM_CHAT_ID` пустым.
+2. На сервере запусти discovery (он будет ждать твоего сообщения):
+
+```bash
+sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.discover_chat_id
+```
+
+3. Открой Telegram, найди своего бота, напиши ему `/start`.
+4. Скрипт распечатает твой `chat_id`. Скопируй в `.env`:
+
+```bash
+nano /opt/funpay-ns-bot/.env
+# TELEGRAM_CHAT_ID=123456789
+```
+
+5. Проверь, что нотификации отправляются:
+
+```bash
+sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.check_telegram
+```
+
+### Включить systemd-сервис (24/7)
+
+```bash
+systemctl enable --now funpay-ns-bot
+systemctl status funpay-ns-bot
+journalctl -u funpay-ns-bot -f
+```
+
+В Telegram придёт сообщение «Бот запущен ✅». В чате с ботом командой
+`/status` можно увидеть состояние, `/help` — список команд.
+
+### Остановить / перезапустить
+
+```bash
+systemctl stop funpay-ns-bot
+systemctl restart funpay-ns-bot
+systemctl status funpay-ns-bot
+```
 
 ---
 
