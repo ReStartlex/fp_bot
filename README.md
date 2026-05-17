@@ -13,17 +13,21 @@
 
 ## Текущая стадия
 
-**F0–F2 готовы.** Реализовано:
+**F0–F3 и F6 готовы.** Реализовано:
 
-- F0: Конфиг (`src/config.py`), NS-клиент с HMAC + auto-refresh + ретраями (`src/ns/`), `check_ns` CLI.
-- F1: FunPay-клиент-обёртка (`src/funpay/`), CLI: `check_funpay`, `list_funpay_lots`.
-- F2: SQLite (SQLAlchemy + aiosqlite) с моделями `Mapping`, `Order`, `FxRate`, `SyncRun`.
-  CSV-импорт маппингов. Получение курса USD/RUB с ЦБ РФ (cbr-xml-daily) с кэшем.
-  Расчёт целевой цены/стока с наценкой и порогом обновления.
-  Sync engine (dry-run и реальный).
+- **F0**: Конфиг (`src/config.py`), NS-клиент с HMAC + auto-refresh + ретраями (`src/ns/`), `check_ns` CLI.
+- **F1**: FunPay-клиент-обёртка (`src/funpay/`), CLI: `check_funpay`, `list_funpay_lots`.
+- **F2**: SQLite (SQLAlchemy + aiosqlite) — модели `Mapping`, `Order`, `FxRate`, `SyncRun`.
+  CSV-импорт маппингов. Курс USD/RUB с ЦБ РФ (cbr-xml-daily) с кэшем.
+  Расчёт цены/стока с наценкой и порогом обновления. Sync engine (dry-run / real).
+- **F3-ядро**: order processor (`src/orders/processor.py`): FunPay-событие → NS create → NS pay →
+  доставка кодов в FunPay-чат + запись в БД + Telegram-отчёт. Идемпотентность по `funpay_order_id`.
+  Безопасный dry-run, пока `ENABLE_REAL_ACTIONS=false`. CLI: `src.tools.test_order`.
+- **F4 (частично)**: шаблоны сообщений покупателю (`src/chat/templates.py`, ru/en).
+- **F6**: Telegram-нотификатор (`src/alerts/telegram.py`). CLI: `src.tools.check_telegram`.
 
-Дальше: F3 (обработка заказов FunPay → NS → доставка) и F4–F6 (чат-автоответчик,
-планировщик, Telegram-алерты).
+Дальше: **F5** — FunPay watcher (получение событий о новых заказах) и **main entrypoint**
+(планировщик: sync каждые N секунд + watcher на заказы 24/7).
 
 ---
 
@@ -121,9 +125,11 @@ d:\money\
         ├── check_ns.py            # проверка доступа к NS
         ├── check_funpay.py        # проверка доступа к FunPay
         ├── check_fx.py            # проверка курса USD/RUB
+        ├── check_telegram.py      # тестовая отправка в Telegram
         ├── list_funpay_lots.py    # листинг лотов на FunPay
         ├── import_mappings.py     # импорт маппингов из CSV в БД
-        └── dry_run_sync.py        # прогон синхронизатора без записи на FunPay
+        ├── dry_run_sync.py        # прогон синхронизатора без записи на FunPay
+        └── test_order.py          # ручной прогон order processor с тестовыми данными
 ```
 
 ---
@@ -147,6 +153,24 @@ python -m src.tools.dry_run_sync
 
 Когда вывод устроит — включишь `ENABLE_REAL_ACTIONS=true` в `.env`.
 См. `data/README.md` для подробного описания CSV-формата.
+
+---
+
+## F3: Ручной тест order processor
+
+Можно прогнать весь pipeline (без оплаты) одной командой — полезно, чтобы убедиться,
+что NS принимает наш заказ для нужного `service_id`:
+
+```powershell
+python -m src.tools.test_order `
+    --funpay-order-id TEST-001 `
+    --funpay-lot-id 12345678 `
+    --quantity 1 `
+    --buyer TestBuyer
+```
+
+Без флага `--really` `pay_order` НЕ вызывается, NS отменит созданный заказ
+автоматически через ~10 минут (это нормальное поведение).
 
 ---
 
