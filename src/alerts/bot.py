@@ -39,7 +39,7 @@ from src.funpay.client import FunPayClient
 from src.mapping.rules import compute_pricing
 from src.ns import NSClient
 from src.ns.models import StockResponse
-from src.sync.fx import get_usd_rub_rate
+from src.sync.fx import get_rate_breakdown
 
 
 SyncTrigger = Callable[[], Awaitable[dict]]
@@ -67,6 +67,7 @@ def _format_status_text(
     last_run: SyncRun | None,
     ns_balance: str,
     fp_status: str,
+    rate_line: str,
 ) -> str:
     lines = [
         "📊 <b>NS↔FunPay Bridge — статус</b>",
@@ -75,6 +76,7 @@ def _format_status_text(
         f"⏱ Sync каждые: <b>{settings.sync_interval_seconds}c</b>",
         f"💱 Валюта FunPay: <b>{settings.funpay_currency.value}</b>",
         f"📈 Наценка по умолчанию: <b>{settings.markup_percent}%</b>",
+        rate_line,
         f"💰 Баланс NS: <b>{ns_balance}</b>",
         f"🔌 FunPay: <b>{fp_status}</b>",
     ]
@@ -153,6 +155,8 @@ class TelegramBot:
         "/mappings — текущие маппинги\n"
         "/map &lt;funpay_lot_id&gt; &lt;ns_service_id&gt; [markup%] [label]\n"
         "/unmap &lt;funpay_lot_id&gt;\n"
+        "/setmarkup &lt;funpay_lot_id&gt; &lt;percent|default&gt;\n"
+        "/clear_target — забыть выбранный целевой лот\n"
         "/calc &lt;funpay_lot_id&gt; — посчитать цены по маппингу\n"
         "/inspect_lot &lt;funpay_lot_id&gt; — заглянуть в LotFields\n"
         "\n"
@@ -183,6 +187,9 @@ class TelegramBot:
         self._target_lots: dict[int, int] = {}
         # chat_id -> человеческая подпись лота для подсказок
         self._target_labels: dict[int, str] = {}
+        # chat_id -> id "панели управления" в этом чате; при новой команде
+        # старая удаляется, чтобы не плодить дубликаты сообщений-меню.
+        self._control_msg: dict[int, int] = {}
         # кэш каталога NS на 60 секунд, чтобы не дёргать API на каждый клик
         self._stock_cache: tuple[float, StockResponse] | None = None
         self._stock_lock = asyncio.Lock()
@@ -253,6 +260,7 @@ class TelegramBot:
             BotCommand(command="ns_search", description="🔍 Поиск NS"),
             BotCommand(command="sync", description="🔄 Синхронизация"),
             BotCommand(command="orders", description="📦 Последние заказы"),
+            BotCommand(command="setmarkup", description="✏ Изменить наценку"),
             BotCommand(command="funpay_reconnect", description="🔌 FunPay reconnect"),
             BotCommand(command="ping", description="🏓 Проверка связи"),
             BotCommand(command="help", description="❓ Помощь"),
@@ -328,13 +336,16 @@ class TelegramBot:
                     "и перезапусти сервис."
                 )
                 return
-            await msg.answer(self.HELP_TEXT, reply_markup=ui.single_close_kb())
+            await self._send_view(
+                msg.chat.id, self.HELP_TEXT, reply_markup=ui.single_close_kb()
+            )
 
         @dp.message(Command("menu"))
         async def cmd_menu(msg: Message) -> None:
             if not self._is_owner(msg):
                 return
-            await msg.answer(
+            await self._send_view(
+                msg.chat.id,
                 self._menu_text(msg.chat.id),
                 reply_markup=ui.main_menu(self._target_label_for(msg.chat.id)),
             )
@@ -416,6 +427,20 @@ class TelegramBot:
             if not self._is_owner(msg):
                 return
             await self._do_inspect_lot(msg)
+
+        @dp.message(Command("setmarkup"))
+        async def cmd_setmarkup(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_setmarkup(msg)
+
+        @dp.message(Command("clear_target"))
+        async def cmd_clear_target(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            self._target_lots.pop(msg.chat.id, None)
+            self._target_labels.pop(msg.chat.id, None)
+            await msg.answer("Цель сброшена.", reply_markup=ui.single_close_kb())
 
         # ----- callback router -----
 
@@ -530,20 +555,58 @@ class TelegramBot:
         text: str,
         reply_markup: InlineKeyboardMarkup | None = None,
     ) -> None:
-        """Пытаемся отредактировать сообщение; если нельзя — шлём новое."""
+        """
+        Редактируем сообщение, которое тапнул пользователь. Если редакт не
+        получился — оставляем пользователю alert, не плодим новые сообщения.
+        Так история чата не зарастает дубликатами «Маппинги / Всего: 1».
+        """
         if cq.message is None:
-            await cq.answer("Старое сообщение недоступно")
+            await cq.answer(
+                "Это старое сообщение, кнопки уже неактивны. Открой /menu заново.",
+                show_alert=True,
+            )
             return
         try:
             await cq.message.edit_text(text, reply_markup=reply_markup)
+            # Этот message теперь — единственная «панель управления» в чате
+            chat_id = cq.message.chat.id
+            self._control_msg[chat_id] = cq.message.message_id
         except TelegramBadRequest as exc:
-            if "message is not modified" in str(exc).lower():
+            err = str(exc).lower()
+            if "message is not modified" in err:
+                return
+            logger.debug(f"edit_text упал ({err[:80]}); прошу открыть /menu заново")
+            await cq.answer(
+                "Не могу обновить старое сообщение. Открой /menu заново.",
+                show_alert=True,
+            )
+
+    async def _send_view(
+        self,
+        chat_id: int,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> Message | None:
+        """
+        Шлёт «панель» в чат, предварительно удаляя предыдущую.
+        Так в истории чата всегда максимум одно «живое» меню-сообщение,
+        и нет каскада повторяющихся заголовков.
+        """
+        if self._bot is None:
+            return None
+        prev_id = self._control_msg.get(chat_id)
+        if prev_id is not None:
+            try:
+                await self._bot.delete_message(chat_id, prev_id)
+            except TelegramBadRequest:
                 pass
-            elif "message to edit not found" in str(exc).lower():
-                await cq.message.answer(text, reply_markup=reply_markup)
-            else:
-                logger.debug(f"edit_text упал: {exc}; шлю новым сообщением")
-                await cq.message.answer(text, reply_markup=reply_markup)
+            except Exception as exc:
+                logger.debug(f"delete prev control: {exc}")
+        new_msg = await self._bot.send_message(
+            chat_id, text, reply_markup=reply_markup
+        )
+        self._control_msg[chat_id] = new_msg.message_id
+        return new_msg
 
     # ─────────────── /start ───────────────
 
@@ -561,7 +624,8 @@ class TelegramBot:
         if msg.chat.id != owner:
             await msg.answer("Этот бот — личный, чужие команды я не выполняю.")
             return
-        await msg.answer(
+        await self._send_view(
+            msg.chat.id,
             self._menu_text(msg.chat.id),
             reply_markup=ui.main_menu(self._target_label_for(msg.chat.id)),
         )
@@ -933,7 +997,7 @@ class TelegramBot:
     @_guard
     async def _do_status(self, msg: Message) -> None:
         text = await self._render_status_text()
-        await msg.answer(text, reply_markup=ui.single_close_kb())
+        await self._send_view(msg.chat.id, text, reply_markup=ui.single_close_kb())
 
     @_guard
     async def _show_status_via_cq(self, cq: CallbackQuery) -> None:
@@ -946,12 +1010,32 @@ class TelegramBot:
             last_run = (await session.execute(stmt)).scalar_one_or_none()
         ns_bal = await self._safe_ns_balance()
         fp_status = await self._safe_fp_status()
-        return _format_status_text(self._settings, last_run, ns_bal, fp_status)
+        # эффективный курс с премией
+        try:
+            rate = await get_rate_breakdown(self._settings)
+            cur = self._settings.funpay_currency.value
+            if rate.has_premium:
+                rate_line = (
+                    f"💱 Курс USD→{cur}: <b>{rate.effective:.4f}</b> "
+                    f"(биржа {rate.base:.4f} + {rate.premium_percent:.1f}%)"
+                )
+            elif self._settings.funpay_currency.value == "USD":
+                rate_line = "💱 Курс: <b>USD к USD = 1.0</b>"
+            else:
+                rate_line = (
+                    f"💱 Курс USD→{cur}: <b>{rate.effective:.4f}</b> "
+                    f"({rate.source})"
+                )
+        except Exception as exc:
+            rate_line = f"💱 Курс: <i>n/a ({html.escape(str(exc))[:60]})</i>"
+        return _format_status_text(
+            self._settings, last_run, ns_bal, fp_status, rate_line
+        )
 
     @_guard
     async def _do_balance(self, msg: Message) -> None:
         text = await self._render_balance_text()
-        await msg.answer(text, reply_markup=ui.single_close_kb())
+        await self._send_view(msg.chat.id, text, reply_markup=ui.single_close_kb())
 
     @_guard
     async def _show_balance_via_cq(self, cq: CallbackQuery) -> None:
@@ -979,11 +1063,17 @@ class TelegramBot:
                     val = fp_bal.get("rub") or fp_bal.get("total") or fp_bal.get("available")
                     if val is not None:
                         lines.append(f"  FunPay (RUB): <b>{val}</b>")
-                    raw = fp_bal.get("raw_repr")
-                    if raw:
-                        lines.append(
-                            f"  <i>raw:</i> <code>{html.escape(str(raw)[:120])}</code>"
-                        )
+                    else:
+                        # Если не вытянули конкретное число — показываем raw,
+                        # чтобы было видно что вернул FunPay
+                        raw = fp_bal.get("raw_repr")
+                        if raw:
+                            lines.append(
+                                f"  FunPay: <i>не распарсил, raw:</i> "
+                                f"<code>{html.escape(str(raw)[:120])}</code>"
+                            )
+                        else:
+                            lines.append("  FunPay: <i>пусто</i>")
             except asyncio.TimeoutError:
                 lines.append("  FunPay: <i>timeout {0:.0f}s</i>".format(FP_TIMEOUT_SECONDS))
             except Exception as exc:
@@ -994,7 +1084,10 @@ class TelegramBot:
     async def _do_orders(self, msg: Message) -> None:
         sid, total = await self._collect_orders()
         if total == 0:
-            await msg.answer("Заказов ещё нет.", reply_markup=ui.single_close_kb())
+            await self._send_view(
+                msg.chat.id, "Заказов ещё нет.",
+                reply_markup=ui.single_close_kb(),
+            )
             return
         await self._render_paginated_from_cmd(msg, kind="orders", sid=sid, page=0)
 
@@ -1058,7 +1151,8 @@ class TelegramBot:
     @_guard
     async def _do_lots(self, msg: Message) -> None:
         if self._funpay_client is None:
-            await msg.answer(
+            await self._send_view(
+                msg.chat.id,
                 "FunPay не подключён. Попробуй /funpay_reconnect.",
                 reply_markup=ui.single_close_kb(),
             )
@@ -1068,12 +1162,16 @@ class TelegramBot:
                 self._funpay_client.get_my_lots(), timeout=FP_TIMEOUT_SECONDS
             )
         except Exception as exc:
-            await msg.answer(
-                f"FunPay get_my_lots упал: <code>{html.escape(str(exc))}</code>"
+            await self._send_view(
+                msg.chat.id,
+                f"FunPay get_my_lots упал: <code>{html.escape(str(exc))}</code>",
+                reply_markup=ui.single_close_kb(),
             )
             return
         if not lots:
-            await msg.answer("Лотов нет.", reply_markup=ui.single_close_kb())
+            await self._send_view(
+                msg.chat.id, "Лотов нет.", reply_markup=ui.single_close_kb()
+            )
             return
         sid = self._sessions.put(lots, title="funpay lots")
         await self._render_paginated_from_cmd(msg, kind="lots", sid=sid, page=0)
@@ -1110,7 +1208,8 @@ class TelegramBot:
     async def _do_mappings(self, msg: Message) -> None:
         sid, total = await self._collect_mappings()
         if total == 0:
-            await msg.answer(
+            await self._send_view(
+                msg.chat.id,
                 "Маппингов нет.\n\n"
                 "Открой /lots, выбери лот кнопкой 🎯, затем из /ns_cats или "
                 "/ns_search нажми «Замапить» на нужной услуге.",
@@ -1145,10 +1244,16 @@ class TelegramBot:
         try:
             stock = await self._get_stock()
         except Exception as exc:
-            await msg.answer(f"NS get_stock упал: <code>{html.escape(str(exc))}</code>")
+            await self._send_view(
+                msg.chat.id,
+                f"NS get_stock упал: <code>{html.escape(str(exc))}</code>",
+                reply_markup=ui.single_close_kb(),
+            )
             return
         if not stock.categories:
-            await msg.answer("Каталог NS пустой.", reply_markup=ui.single_close_kb())
+            await self._send_view(
+                msg.chat.id, "Каталог NS пустой.", reply_markup=ui.single_close_kb()
+            )
             return
         sid = self._sessions.put(
             stock.categories,
@@ -1185,17 +1290,24 @@ class TelegramBot:
         text = (msg.text or "").strip()
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            await msg.answer(ui.HINT_NS_SEARCH, reply_markup=ui.single_close_kb())
+            await self._send_view(
+                msg.chat.id, ui.HINT_NS_SEARCH, reply_markup=ui.single_close_kb()
+            )
             return
         query = parts[1].strip()
         try:
             stock = await self._get_stock()
         except Exception as exc:
-            await msg.answer(f"NS get_stock упал: <code>{html.escape(str(exc))}</code>")
+            await self._send_view(
+                msg.chat.id,
+                f"NS get_stock упал: <code>{html.escape(str(exc))}</code>",
+                reply_markup=ui.single_close_kb(),
+            )
             return
         results = _filter_services(stock, query)
         if not results:
-            await msg.answer(
+            await self._send_view(
+                msg.chat.id,
                 f"По запросу «{html.escape(query)}» ничего не нашёл.\n"
                 "Попробуй /ns_cats — там виден весь каталог.",
                 reply_markup=ui.single_close_kb(),
@@ -1298,12 +1410,12 @@ class TelegramBot:
         if svc is None:
             return f"NS service_id <code>{mapping.ns_service_id}</code> не найден в каталоге."
 
-        fx_rate = await get_usd_rub_rate(self._settings)
+        rate = await get_rate_breakdown(self._settings)
         pricing = compute_pricing(
             ns_service=svc,
             mapping=mapping,
             settings=self._settings,
-            fx_rate_usd_to_target=fx_rate,
+            fx_rate_usd_to_target=rate.effective,
         )
         current_seller: float | None = None
         if self._funpay_client is not None:
@@ -1325,11 +1437,19 @@ class TelegramBot:
             will_update = diff >= threshold
 
         cur = self._settings.funpay_currency.value
+        # Курс: если есть премия, показываем разложение
+        if rate.has_premium:
+            rate_line = (
+                f"Курс USD→{cur}: <b>{rate.effective:.4f}</b> "
+                f"(биржа {rate.base:.4f} + {rate.premium_percent:.1f}%)\n"
+            )
+        else:
+            rate_line = f"Курс USD→{cur}: <b>{rate.effective:.4f}</b>\n"
         text = (
             f"📊 <b>Расчёт цены для лота {funpay_lot_id}</b>\n\n"
             f"NS: <b>{pricing.ns_price_usd:.4f}</b> USD\n"
             f"<i>{svc.service_name[:60]}</i>\n\n"
-            f"Курс USD→{cur}: <b>{pricing.fx_rate:.4f}</b>\n"
+            f"{rate_line}"
             f"Наценка: <b>{pricing.markup_percent}%</b>\n"
             f"Комиссия FunPay (справочно): <b>{pricing.commission_percent}%</b>\n\n"
             f"➡ Цена продавцу: <b>{pricing.round_price()} {cur}</b>\n"
@@ -1342,6 +1462,58 @@ class TelegramBot:
                 f"Обновлять? <b>{'да' if will_update else 'нет (в пределах порога)'}</b>"
             )
         return text
+
+    @_guard
+    async def _do_setmarkup(self, msg: Message) -> None:
+        """
+        /setmarkup <funpay_lot_id> <percent>
+        Меняет наценку конкретного маппинга, не трогая остальное.
+        """
+        parts = (msg.text or "").strip().split()
+        if len(parts) < 3:
+            await msg.answer(
+                "Использование: <code>/setmarkup &lt;funpay_lot_id&gt; &lt;percent&gt;</code>\n\n"
+                "Пример: <code>/setmarkup 69300023 6</code>\n"
+                "Чтобы вернуть default — <code>/setmarkup 69300023 default</code>",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        try:
+            funpay_lot_id = int(parts[1])
+        except ValueError:
+            await msg.answer("funpay_lot_id должен быть числом")
+            return
+        raw = parts[2].lower().replace(",", ".").rstrip("%")
+        markup: float | None
+        if raw in ("default", "none", "-", ""):
+            markup = None
+        else:
+            try:
+                markup = float(raw)
+            except ValueError:
+                await msg.answer(f"Не могу распарсить markup «{parts[2]}»")
+                return
+
+        async with session_factory()() as session:
+            stmt = select(Mapping).where(Mapping.funpay_lot_id == funpay_lot_id)
+            obj = (await session.execute(stmt)).scalar_one_or_none()
+            if obj is None:
+                await msg.answer(
+                    f"Маппинг для лота <code>{funpay_lot_id}</code> не найден."
+                )
+                return
+            obj.markup_percent = markup
+            await session.commit()
+
+        shown = (
+            "default" if markup is None
+            else f"{markup}% (вместо default {self._settings.markup_percent}%)"
+        )
+        await msg.answer(
+            f"✏ Markup для лота <code>{funpay_lot_id}</code>: <b>{shown}</b>\n\n"
+            f"Запусти 🔄 Синхронизация или /sync, чтобы новая цена применилась.",
+            reply_markup=ui.single_close_kb(),
+        )
 
     @_guard
     async def _do_inspect_lot(self, msg: Message) -> None:
@@ -1621,7 +1793,8 @@ class TelegramBot:
     async def _render_paginated_from_cmd(
         self, msg: Message, *, kind: str, sid: str, page: int
     ) -> None:
-        """Первая отрисовка из обычной команды (не из callback'а)."""
+        """Первая отрисовка из обычной команды (не из callback'а).
+        Использует _send_view — старая «панель» в чате удаляется."""
         sess = self._sessions.get(sid)
         if sess is None:
             await msg.answer("Сессия не создана")
@@ -1639,7 +1812,7 @@ class TelegramBot:
             await msg.answer(f"Неизвестный список: {kind}")
             return
         text, kb = builder(sess, sid, page_items, page, total_pages)
-        await msg.answer(text, reply_markup=kb)
+        await self._send_view(msg.chat.id, text, reply_markup=kb)
 
 
 # ─────────────── модульные функции ───────────────

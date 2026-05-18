@@ -1,5 +1,23 @@
-"""Получение курса USD->RUB."""
+"""
+Получение курса USD->RUB.
+
+Архитектура курса:
+
+    биржевой курс (ЦБ или ручной)  ──premium──>  эффективный курс
+                                                       │
+                                                       ▼
+                                          compute_pricing (markup)
+
+В режиме AUTO базовый курс берём с cbr-xml-daily.ru и кэшируем, к нему
+добавляем premium (% поверх) — это компенсация разницы между биржевым
+и реальным курсом покупки USD (на Bybit, P2P и т.п.).
+
+В режиме MANUAL premium игнорируется: предполагается, что в `USD_RUB_RATE`
+уже зашит финальный курс, который хочет видеть оператор.
+"""
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import httpx
 from loguru import logger
@@ -16,6 +34,19 @@ CACHE_TTL_SECONDS = 600  # 10 минут
 _cache: tuple[float, float] | None = None  # (timestamp_when_fetched, rate)
 
 
+@dataclass(frozen=True)
+class RateBreakdown:
+    """Детализированный курс — для UI и логов."""
+    base: float
+    premium_percent: float
+    effective: float
+    source: str  # "cbr" / "manual" / "cache_mem" / "cache_db" / "fallback"
+
+    @property
+    def has_premium(self) -> bool:
+        return self.premium_percent > 0
+
+
 async def _fetch_cbr_rate() -> float:
     """USD/RUB с cbr-xml-daily.ru."""
     async with httpx.AsyncClient(timeout=10.0) as client:
@@ -25,53 +56,95 @@ async def _fetch_cbr_rate() -> float:
         return float(data["Valute"]["USD"]["Value"])
 
 
-async def get_usd_rub_rate(settings: Settings | None = None) -> float:
-    """
-    Получить курс USD->RUB.
+def _apply_premium(base: float, settings: Settings) -> float:
+    """База + premium → эффективный курс."""
+    if settings.usd_rub_rate_mode == RateMode.MANUAL:
+        return base
+    return base * (1.0 + settings.usd_rub_premium_percent / 100.0)
 
-    В режиме manual возвращает USD_RUB_RATE.
-    В режиме auto пытается обновить с cbr-xml-daily, при ошибке возвращает кэш / fallback.
+
+async def get_rate_breakdown(settings: Settings | None = None) -> RateBreakdown:
+    """
+    Получить детализированный курс: базовый + premium + эффективный.
+    Используется в /calc и логах для прозрачности.
     """
     settings = settings or get_settings()
+    premium = (
+        settings.usd_rub_premium_percent
+        if settings.usd_rub_rate_mode == RateMode.AUTO
+        else 0.0
+    )
 
     if settings.usd_rub_rate_mode == RateMode.MANUAL:
-        return settings.usd_rub_rate
+        return RateBreakdown(
+            base=settings.usd_rub_rate,
+            premium_percent=0.0,
+            effective=settings.usd_rub_rate,
+            source="manual",
+        )
 
     global _cache
     import time
     now = time.time()
     if _cache is not None and now - _cache[0] < CACHE_TTL_SECONDS:
-        return _cache[1]
+        base = _cache[1]
+        return RateBreakdown(
+            base=base, premium_percent=premium,
+            effective=_apply_premium(base, settings), source="cache_mem",
+        )
 
     try:
-        rate = await _fetch_cbr_rate()
-        _cache = (now, rate)
-        logger.info(f"USD/RUB обновлён с ЦБ РФ: {rate:.4f}")
-        # Параллельно пишем в БД (best-effort)
+        base = await _fetch_cbr_rate()
+        _cache = (now, base)
+        effective = _apply_premium(base, settings)
+        logger.info(
+            f"USD/RUB ЦБ={base:.4f}, +{premium:.1f}% = "
+            f"{effective:.4f} (эффективный)"
+        )
         try:
             async with session_factory()() as session:
-                await save_fx_rate(session, pair="USD/RUB", rate=rate, source="cbr-xml-daily")
+                await save_fx_rate(
+                    session, pair="USD/RUB", rate=base, source="cbr-xml-daily"
+                )
                 await session.commit()
         except Exception as exc:
             logger.debug(f"Не записал FX в БД (не критично): {exc}")
-        return rate
+        return RateBreakdown(
+            base=base, premium_percent=premium, effective=effective, source="cbr"
+        )
     except Exception as exc:
         logger.warning(f"Не удалось получить курс USD/RUB с ЦБ: {exc}. Беру кэш/fallback.")
 
-    # Пробуем кэш в памяти
     if _cache is not None:
-        return _cache[1]
+        base = _cache[1]
+        return RateBreakdown(
+            base=base, premium_percent=premium,
+            effective=_apply_premium(base, settings), source="cache_mem",
+        )
 
-    # Пробуем кэш в БД
     try:
         async with session_factory()() as session:
             db_rate = await latest_fx_rate(session, "USD/RUB")
             if db_rate is not None:
                 logger.info(f"Беру кэш из БД: USD/RUB={db_rate.rate:.4f}")
-                return db_rate.rate
+                return RateBreakdown(
+                    base=db_rate.rate, premium_percent=premium,
+                    effective=_apply_premium(db_rate.rate, settings),
+                    source="cache_db",
+                )
     except Exception as exc:
         logger.debug(f"БД-кэш недоступен: {exc}")
 
-    # Fallback из настроек
     logger.warning(f"Использую fallback курс из .env: USD/RUB={settings.usd_rub_rate}")
-    return settings.usd_rub_rate
+    return RateBreakdown(
+        base=settings.usd_rub_rate, premium_percent=premium,
+        effective=_apply_premium(settings.usd_rub_rate, settings),
+        source="fallback",
+    )
+
+
+async def get_usd_rub_rate(settings: Settings | None = None) -> float:
+    """Эффективный курс USD->RUB с уже применённым premium. Это то, что
+    используется в compute_pricing и определяет цену лота."""
+    breakdown = await get_rate_breakdown(settings)
+    return breakdown.effective

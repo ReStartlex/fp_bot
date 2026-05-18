@@ -321,14 +321,14 @@ def render_list(
 ) -> str:
     if total_items == 0:
         return f"<b>{title}</b>\n\n{empty_text}"
-    header = (
-        f"<b>{title}</b>\n"
-        f"Всего: <b>{total_items}</b> · "
-        f"страница <b>{page + 1}/{total_pages}</b>\n"
-        "─" * 8
-    )
+    # компактный одностроковый заголовок: меньше повторов на скрине,
+    # больше места под собственно карточки
+    if total_pages > 1:
+        header = f"<b>{title}</b>  ·  {total_items}  ·  {page + 1}/{total_pages}"
+    else:
+        header = f"<b>{title}</b>  ·  {total_items}"
     body = "\n".join(formatter(it) for it in page_items)
-    return f"{header}\n{body}"
+    return f"{header}\n\n{body}"
 
 
 # ─────────────── текстовые подсказки ───────────────

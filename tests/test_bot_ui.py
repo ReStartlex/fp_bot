@@ -284,6 +284,26 @@ def test_render_list_has_header_and_body():
     assert "2/3" in out  # page+1=2
     assert "- a" in out
     assert "- c" in out
+    # одна строка заголовка (сейчас компактнее, чтобы повторы в чате
+    # не растягивались на полэкрана)
+    lines = out.splitlines()
+    header_lines = [l for l in lines if "My list" in l]
+    assert len(header_lines) == 1
+
+
+def test_render_list_single_page_omits_page_marker():
+    out = ui.render_list(
+        page_items=["only"],
+        formatter=lambda x: x,
+        title="Solo",
+        page=0,
+        total_pages=1,
+        total_items=1,
+    )
+    # При одной странице не должно быть «1/1» — лишний шум
+    assert "1/1" not in out
+    assert "Solo" in out
+    assert "only" in out
 
 
 # ─────────────── list_keyboard ───────────────
