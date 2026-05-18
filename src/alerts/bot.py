@@ -38,6 +38,7 @@ from src.ns.models import StockResponse
 
 
 SyncTrigger = Callable[[], Awaitable[dict]]
+FunPayReconnect = Callable[[], Awaitable[dict]]
 
 
 def _format_dt(dt: datetime | None) -> str:
@@ -100,6 +101,7 @@ class TelegramBot:
         "/balance — баланс NS\n"
         "/orders — последние 10 заказов\n"
         "/sync — запустить синхронизацию\n"
+        "/funpay_reconnect — переподключить FunPay\n"
         "\n"
         "<b>Каталог NS</b>\n"
         "/ns_search &lt;слово&gt; — поиск по названию услуги\n"
@@ -122,13 +124,19 @@ class TelegramBot:
         *,
         sync_trigger: SyncTrigger | None = None,
         funpay_client: FunPayClient | None = None,
+        funpay_reconnect: FunPayReconnect | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._sync_trigger = sync_trigger
         self._funpay_client = funpay_client
+        self._funpay_reconnect = funpay_reconnect
         self._bot: Bot | None = None
         self._dp: Dispatcher | None = None
         self._task: asyncio.Task | None = None
+
+    def update_funpay_client(self, fp: FunPayClient | None) -> None:
+        """Подменить FunPay-клиент после реконнекта."""
+        self._funpay_client = fp
 
     @property
     def enabled(self) -> bool:
@@ -274,6 +282,12 @@ class TelegramBot:
                 return
             await self._do_ns_cats(msg)
 
+        @dp.message(Command("funpay_reconnect"))
+        async def cmd_funpay_reconnect(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_funpay_reconnect(msg)
+
     # ---------- Реализации команд ----------
 
     async def _do_status(self, msg: Message) -> None:
@@ -289,7 +303,19 @@ class TelegramBot:
         except Exception as exc:
             balance_text = f"<i>n/a ({exc})</i>"
 
-        await msg.answer(_format_status(self._settings, last_run, balance_text))
+        fp_status = "—"
+        if self._funpay_client is not None:
+            try:
+                fp_status = (
+                    f"id={self._funpay_client.account_id}, "
+                    f"username={self._funpay_client.username}"
+                )
+            except Exception:
+                fp_status = "ошибка чтения"
+
+        text = _format_status(self._settings, last_run, balance_text)
+        text += f"\n\n🔌 FunPay: <b>{fp_status}</b>"
+        await msg.answer(text)
 
     async def _do_balance(self, msg: Message) -> None:
         try:
@@ -496,6 +522,29 @@ class TelegramBot:
         if total_found > 40:
             header += " (показываю первые 40)"
         await msg.answer(header + "\n\n" + "\n".join(lines))
+
+    async def _do_funpay_reconnect(self, msg: Message) -> None:
+        if self._funpay_reconnect is None:
+            await msg.answer("Реконнект не подключён в этой конфигурации.")
+            return
+        await msg.answer("⏳ Переподключаю FunPay...")
+        try:
+            result = await self._funpay_reconnect()
+        except Exception as exc:
+            await msg.answer(f"❌ Реконнект упал: <code>{exc}</code>")
+            return
+        if result.get("connected"):
+            await msg.answer(
+                f"✅ FunPay подключён\n"
+                f"id: <code>{result.get('account_id')}</code>\n"
+                f"username: <b>{result.get('username') or '—'}</b>"
+            )
+        else:
+            await msg.answer(
+                "❌ FunPay всё ещё недоступен. Проверь cookies (golden_key, PHPSESSID) "
+                "в .env и запусти диагностику:\n"
+                "<code>sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.check_funpay</code>"
+            )
 
     async def _do_ns_cats(self, msg: Message) -> None:
         try:

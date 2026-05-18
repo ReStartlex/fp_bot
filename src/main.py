@@ -37,6 +37,7 @@ from src.sync.stock_sync import sync_once
 
 HEARTBEAT_HOURS = 6
 LOW_BALANCE_CHECK_INTERVAL_MINUTES = 30
+FUNPAY_RECONNECT_INTERVAL_MINUTES = 5
 
 
 class App:
@@ -79,40 +80,15 @@ class App:
         await self.tg.__aenter__()
         await self.tg.info("Бот запущен ✅")
 
-        # 3. FunPay-клиент + watcher
-        self.fp = FunPayClient(self.settings)
-        await self.fp.__aenter__()
-        try:
-            await self.fp.connect()
-        except Exception as exc:
-            logger.warning(
-                f"FunPay подключение упало: {exc}. "
-                "Watcher не будет запущен, но sync и Telegram-бот будут работать."
-            )
-            await self.tg.warning(
-                f"FunPay не подключился: <code>{exc}</code>. "
-                "Sync engine работает, watcher выключен."
-            )
-            self.fp = None  # помечаем что FunPay недоступен
-
-        if self.fp is not None:
-            self.chat_handler = ChatHandler(self.fp, telegram=self.tg, settings=self.settings)
-            self.watcher = FunPayWatcher(
-                self.fp,
-                on_new_order=self._on_new_order,
-                on_new_message=self._on_new_message,
-            )
-            try:
-                self.watcher.start()
-            except Exception as exc:
-                logger.exception(f"FunPay watcher не запустился: {exc}")
-                self.watcher = None
+        # 3. FunPay-клиент + watcher (с авто-повторами)
+        await self._try_connect_funpay(initial=True)
 
         # 4. Telegram-бот с командами
         self.bot = TelegramBot(
             self.settings,
             sync_trigger=self._trigger_sync,
             funpay_client=self.fp,
+            funpay_reconnect=self._funpay_reconnect,
         )
         await self.bot.start()
 
@@ -139,6 +115,14 @@ class App:
             minutes=LOW_BALANCE_CHECK_INTERVAL_MINUTES,
             id="low_balance",
             next_run_time=datetime.now() + timedelta(seconds=10),
+        )
+        self.scheduler.add_job(
+            self._funpay_reconnect_if_needed,
+            "interval",
+            minutes=FUNPAY_RECONNECT_INTERVAL_MINUTES,
+            id="funpay_reconnect",
+            max_instances=1,
+            coalesce=True,
         )
         self.scheduler.start()
         logger.info(
@@ -180,6 +164,89 @@ class App:
 
         await self._stop_evt.wait()
         await self.stop()
+
+    # ---------- FunPay (re)connect ----------
+
+    async def _try_connect_funpay(self, *, initial: bool = False) -> bool:
+        """
+        Пытается поднять FunPay-клиент и watcher.
+        Возвращает True если подключение успешно.
+        """
+        if self.fp is not None and self.watcher is not None:
+            return True
+
+        fp = FunPayClient(self.settings)
+        try:
+            await fp.__aenter__()
+            await fp.connect()
+        except Exception as exc:
+            await fp.__aexit__(None, None, None)
+            if initial:
+                logger.warning(
+                    f"FunPay подключение упало: {exc}. "
+                    "Sync и Telegram-бот продолжат работать; "
+                    f"авто-повтор через {FUNPAY_RECONNECT_INTERVAL_MINUTES} мин."
+                )
+                if self.tg is not None:
+                    await self.tg.warning(
+                        f"FunPay не подключился: <code>{exc}</code>. "
+                        f"Авто-повтор каждые {FUNPAY_RECONNECT_INTERVAL_MINUTES} мин. "
+                        "Если хочешь подтолкнуть — /funpay_reconnect."
+                    )
+            else:
+                logger.debug(f"FunPay reconnect упал снова: {exc}")
+            return False
+
+        self.fp = fp
+        self.chat_handler = ChatHandler(self.fp, telegram=self.tg, settings=self.settings)
+        self.watcher = FunPayWatcher(
+            self.fp,
+            on_new_order=self._on_new_order,
+            on_new_message=self._on_new_message,
+        )
+        try:
+            self.watcher.start()
+        except Exception as exc:
+            logger.exception(f"FunPay watcher не запустился: {exc}")
+            self.watcher = None
+
+        # Перепривяжем бота к новому FunPay-клиенту
+        if self.bot is not None:
+            self.bot.update_funpay_client(self.fp)
+
+        msg = (
+            f"FunPay подключился: id={self.fp.account_id}, "
+            f"username={self.fp.username}, balance={self.fp.balance}"
+        )
+        logger.success(msg)
+        if not initial and self.tg is not None:
+            await self.tg.info(f"✅ {msg}")
+        return True
+
+    async def _funpay_reconnect_if_needed(self) -> None:
+        if self.fp is not None and self.watcher is not None:
+            return
+        ok = await self._try_connect_funpay(initial=False)
+        if not ok:
+            logger.debug("FunPay scheduled reconnect: всё ещё недоступно")
+
+    async def _funpay_reconnect(self) -> dict:
+        """Ручной триггер из Telegram-бота. Сбрасывает текущее подключение и пробует заново."""
+        if self.watcher is not None:
+            self.watcher.stop()
+            self.watcher = None
+        if self.fp is not None:
+            await self.fp.__aexit__(None, None, None)
+            self.fp = None
+        if self.bot is not None:
+            self.bot.update_funpay_client(None)
+
+        ok = await self._try_connect_funpay(initial=False)
+        return {
+            "connected": ok,
+            "account_id": self.fp.account_id if self.fp else None,
+            "username": self.fp.username if self.fp else None,
+        }
 
     # ---------- Sync ----------
 
