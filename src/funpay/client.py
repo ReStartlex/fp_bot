@@ -108,59 +108,134 @@ class FunPayClient:
     @property
     def balance(self) -> Any:
         """
-        В разных версиях FunPayAPI имя поля баланса различается:
-        total_balance / balance / get_balance().
+        В разных версиях FunPayAPI имя поля баланса различается. Пробуем все
+        известные варианты по очереди.
         """
-        for attr in ("total_balance", "balance"):
+        for attr in (
+            "total_balance",
+            "balance",
+            "funds",
+            "wallet",
+            "money",
+            "active_sales",
+        ):
             value = getattr(self.account, attr, None)
-            if value is not None:
-                return value
-        getter = getattr(self.account, "get_balance", None)
-        if callable(getter):
-            try:
-                return getter()
-            except Exception:
-                return None
+            if value is None:
+                continue
+            # Если это сложный объект (например Balance с .total) — пробуем raw value
+            if hasattr(value, "total"):
+                return getattr(value, "total")
+            if hasattr(value, "rub"):
+                return getattr(value, "rub")
+            return value
+        for method in ("get_balance", "get_funds", "get_wallet"):
+            getter = getattr(self.account, method, None)
+            if callable(getter):
+                try:
+                    result = getter()
+                except Exception:
+                    continue
+                if result is not None:
+                    if hasattr(result, "total"):
+                        return getattr(result, "total")
+                    return result
         return None
 
     # ----- Лоты -----
 
     async def get_my_lots(self) -> list[Any]:
         """
-        Возвращает список лотов текущего пользователя (LotShortcut-like).
-        В FunPayAPI это берётся через UserProfile самого юзера.
+        Возвращает список лотов текущего пользователя.
+
+        В разных версиях FunPayAPI лоты лежат в разных местах:
+        - Account.get_lots() / Account.get_my_lots()
+        - UserProfile из get_user(my_id): атрибут .lots или метод .get_lots()
+        - Иногда лоты — это dict {Subcategory: list[Lot]}, иногда — flat list.
         """
 
-        def _get() -> list[Any]:
-            acc = self.account
-            profile = acc.get_user(acc.id)
-            # В разных версиях имена варьируются
-            for attr in ("lots", "get_lots", "get_sorted_lots"):
-                value = getattr(profile, attr, None)
+        def _flatten(value: Any) -> list[Any]:
+            if value is None:
+                return []
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                flat: list[Any] = []
+                for v in value.values():
+                    if isinstance(v, list):
+                        flat.extend(v)
+                    elif isinstance(v, dict):
+                        for vv in v.values():
+                            if isinstance(vv, list):
+                                flat.extend(vv)
+                            else:
+                                flat.append(vv)
+                    else:
+                        flat.append(v)
+                return flat
+            return [value]
+
+        def _try_object(obj: Any, methods: list[str]) -> list[Any]:
+            for attr in methods:
+                value = getattr(obj, attr, None)
                 if value is None:
                     continue
                 if callable(value):
                     try:
                         value = value()
                     except Exception as exc:
-                        logger.debug(f"profile.{attr}() упал: {exc}")
+                        logger.debug(f"{type(obj).__name__}.{attr}() упал: {exc}")
                         continue
-                if isinstance(value, list):
-                    return value
-                if isinstance(value, dict):
-                    flat: list[Any] = []
-                    for v in value.values():
-                        if isinstance(v, list):
-                            flat.extend(v)
-                        elif isinstance(v, dict):
-                            for vv in v.values():
-                                if isinstance(vv, list):
-                                    flat.extend(vv)
-                                else:
-                                    flat.append(vv)
-                        else:
-                            flat.append(v)
+                flat = _flatten(value)
+                if flat:
+                    logger.debug(
+                        f"get_my_lots: получил {len(flat)} лотов через "
+                        f"{type(obj).__name__}.{attr}"
+                    )
                     return flat
+            return []
+
+        def _get() -> list[Any]:
+            acc = self.account
+
+            # 1. Прямые методы на Account
+            lots = _try_object(acc, ["get_my_lots", "get_lots", "lots"])
+            if lots:
+                return lots
+
+            # 2. Через UserProfile
+            try:
+                profile = acc.get_user(acc.id)
+            except Exception as exc:
+                logger.warning(f"get_my_lots: account.get_user(self.id) упал: {exc}")
+                return []
+
+            lots = _try_object(
+                profile,
+                ["lots", "get_lots", "get_sorted_lots", "get_lot_pages"],
+            )
+            if lots:
+                return lots
+
+            # 3. Через get_subcategories + перебор
+            try:
+                if hasattr(profile, "get_subcategories"):
+                    subs = profile.get_subcategories()
+                    flat = []
+                    for sub in (subs or []):
+                        sub_lots = _try_object(sub, ["lots", "get_lots"])
+                        flat.extend(sub_lots)
+                    if flat:
+                        logger.debug(
+                            f"get_my_lots: получил {len(flat)} лотов через subcategories"
+                        )
+                        return flat
+            except Exception as exc:
+                logger.debug(f"profile.get_subcategories() упал: {exc}")
+
+            logger.warning(
+                "get_my_lots: ни один путь не сработал. "
+                "Запусти `python -m src.tools.funpay_introspect` для разведки."
+            )
             return []
 
         return await self._to_thread(_get)
