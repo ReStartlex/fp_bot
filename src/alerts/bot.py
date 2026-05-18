@@ -108,6 +108,38 @@ def _format_status_text(
     return "\n".join(lines)
 
 
+def _read_build_info() -> str:
+    """
+    Возвращает короткую строку с версией задеплоенного кода — git SHA и
+    дату последнего коммита. Берёт это из файла BUILD_INFO, который пишет
+    deploy/fetch_code.sh при каждом обновлении.
+    """
+    import os
+    candidates = [
+        os.path.join(os.getcwd(), "BUILD_INFO"),
+        os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "..",
+            "BUILD_INFO",
+        ),
+    ]
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = dict(
+                    line.strip().split("=", 1)
+                    for line in f if "=" in line
+                )
+        except OSError:
+            continue
+        sha = (data.get("sha") or "")[:12]
+        date = data.get("date") or ""
+        subj = (data.get("subject") or "")[:80]
+        if sha:
+            return f"build: <code>{sha}</code> ({date})\nкоммит: <i>{subj}</i>\n"
+    return "build: <i>BUILD_INFO не найден — обнови через deploy/update.sh</i>\n"
+
+
 def _guard(handler):
     """Декоратор: ловит исключения внутри хэндлера и шлёт юзеру внятный ответ."""
 
@@ -335,8 +367,10 @@ class TelegramBot:
                 if self._is_owner(msg)
                 else "❌ ты НЕ владелец — большинство команд проигнорирую"
             )
+            build_line = _read_build_info()
             await msg.answer(
                 f"🤖 <b>NS↔FunPay Bridge</b>\n"
+                f"{build_line}"
                 f"real_actions: <b>{self._settings.enable_real_actions}</b>\n"
                 f"timezone: <b>{self._settings.timezone}</b>\n"
                 f"TELEGRAM_CHAT_ID: {owner_text}\n"

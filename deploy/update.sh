@@ -42,4 +42,12 @@ fi
 chown -R bot:bot "${APP_DIR}"
 chmod 600 "${APP_DIR}/.env" 2>/dev/null || true
 
+# 5. Печатаем версию, чтобы сразу было видно — фикс задеплоился?
+if [[ -f "${APP_DIR}/BUILD_INFO" ]]; then
+    echo
+    echo "── Версия задеплоенного кода ──"
+    cat "${APP_DIR}/BUILD_INFO"
+    echo "───────────────────────────────"
+fi
+
 echo "Обновление завершено."

@@ -67,4 +67,24 @@ if [[ -n "${PRESERVE_DATA}" ]]; then
     rm -rf "${PRESERVE_DATA}"
 fi
 
+# Записываем BUILD_INFO для /version и update.sh. Тянем последний коммит
+# main через gh-proxy (тарбол сам по себе SHA не содержит). Если запрос
+# упал — оставляем то, что лежало до этого.
+COMMITS_URL="${GH_PROXY}/https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/commits/${BRANCH}"
+if BUILD_JSON=$(curl -fsSL --max-time 30 "${COMMITS_URL}" 2>/dev/null); then
+    SHA=$(echo "${BUILD_JSON}" | grep -o '"sha":[[:space:]]*"[a-f0-9]\{40\}"' | head -n1 | grep -o '[a-f0-9]\{40\}')
+    DATE=$(echo "${BUILD_JSON}" | grep -o '"date":[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*"date":[[:space:]]*"\([^"]*\)".*/\1/')
+    SUBJECT=$(echo "${BUILD_JSON}" | grep -o '"message":[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*"message":[[:space:]]*"\([^"]*\)".*/\1/' | head -c 160)
+    if [[ -n "${SHA}" ]]; then
+        {
+            echo "sha=${SHA}"
+            echo "branch=${BRANCH}"
+            echo "date=${DATE}"
+            echo "subject=${SUBJECT}"
+            echo "fetched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } > "${APP_DIR}/BUILD_INFO"
+        echo "    BUILD_INFO: ${SHA:0:12}  ${DATE}  ${SUBJECT}"
+    fi
+fi
+
 echo "    Готово через gh-proxy."
