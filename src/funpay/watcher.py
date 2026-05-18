@@ -141,7 +141,21 @@ class FunPayWatcher:
         if self._loop is None:
             logger.warning("Нет asyncio-loop для dispatch события")
             return
-        asyncio.run_coroutine_threadsafe(coro, self._loop)
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        future.add_done_callback(self._on_dispatch_done)
+
+    @staticmethod
+    def _on_dispatch_done(future: Any) -> None:
+        """Логируем исключения из dispatched корутин (иначе теряются)."""
+        try:
+            exc = future.exception()
+        except Exception as e:
+            logger.warning(f"Не смог прочитать future.exception(): {e}")
+            return
+        if exc is not None:
+            logger.opt(exception=exc).error(
+                f"Неперехваченное исключение в dispatched FunPay handler: {exc}"
+            )
 
     # ---------- Нормализация ----------
 
@@ -159,11 +173,19 @@ class FunPayWatcher:
             return None
         funpay_order_id = str(funpay_order_id)
 
-        funpay_lot_id_raw = self._g(order_obj, "lot_id", "subcategory_id", "node_id", "offer_id")
+        # lot_id критичен — мы по нему ищем маппинг. subcategory_id и node_id
+        # это совсем другие сущности, fallback на них даст ложный поиск.
+        funpay_lot_id_raw = self._g(order_obj, "lot_id", "offer_id", "subcategory_id")
         try:
             funpay_lot_id = int(funpay_lot_id_raw) if funpay_lot_id_raw is not None else 0
         except (TypeError, ValueError):
             funpay_lot_id = 0
+        if funpay_lot_id <= 0:
+            logger.warning(
+                f"FunPay NEW_ORDER: не нашёл валидный lot_id, "
+                f"order={funpay_order_id}, raw={order_obj!r}. Пропускаю."
+            )
+            return None
 
         buyer = self._g(order_obj, "buyer", "buyer_username", "username")
         buyer_username = (

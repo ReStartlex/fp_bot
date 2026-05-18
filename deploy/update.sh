@@ -18,9 +18,16 @@ if [[ ! -d "${APP_DIR}" ]]; then
     exit 1
 fi
 
-# 1. Скачиваем свежий код, сохраняя .env и data
-bash "${APP_DIR}/deploy/fetch_code.sh" 2>/dev/null || \
+# 1. Скачиваем свежий код, сохраняя .env и data.
+# Сначала пробуем локальный fetch_code.sh. Если его нет — тянем свежий
+# с GitHub (через proxy, потому что Timeweb-сеть GitHub блокирует).
+# stderr НЕ глотаем: при настоящих ошибках их видно в логе.
+if [[ -x "${APP_DIR}/deploy/fetch_code.sh" ]]; then
+    bash "${APP_DIR}/deploy/fetch_code.sh"
+else
+    echo "==> локального fetch_code.sh нет, тяну с GitHub через gh-proxy"
     bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/ReStartlex/fp_bot/main/deploy/fetch_code.sh)
+fi
 
 # 2. Обновляем pip-зависимости (если изменились)
 "${APP_DIR}/.venv/bin/pip" install -q -r "${APP_DIR}/requirements.txt"

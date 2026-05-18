@@ -86,12 +86,22 @@ async def finish_sync_run(
     lots_skipped: int = 0,
     error: str | None = None,
 ) -> None:
-    run.finished_at = datetime.utcnow()
-    run.status = status
-    run.lots_checked = lots_checked
-    run.lots_updated = lots_updated
-    run.lots_skipped = lots_skipped
-    run.error = error
+    """
+    Завершить SyncRun. Корректно работает, даже если `run` создан в
+    другой сессии: подтягиваем актуальный экземпляр через session.get
+    по PK, иначе SQLAlchemy будет ругаться на detached object.
+    """
+    target = run
+    if run.id is not None:
+        loaded = await session.get(SyncRun, run.id)
+        if loaded is not None:
+            target = loaded
+    target.finished_at = datetime.utcnow()
+    target.status = status
+    target.lots_checked = lots_checked
+    target.lots_updated = lots_updated
+    target.lots_skipped = lots_skipped
+    target.error = error
     await session.flush()
 
 

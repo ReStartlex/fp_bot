@@ -52,6 +52,8 @@ class App:
         self.chat_handler: ChatHandler | None = None
         self._stop_evt = asyncio.Event()
         self._last_low_balance_alert: datetime | None = None
+        # Один lock на все sync-вызовы (scheduler + ручной /sync из бота)
+        self._sync_lock = asyncio.Lock()
 
     # ---------- Lifecycle ----------
 
@@ -256,16 +258,20 @@ class App:
     # ---------- Sync ----------
 
     async def _safe_sync(self) -> None:
-        try:
-            await sync_once(funpay_client=self.fp, ns_client=self.ns)
-        except Exception as exc:
-            logger.exception(f"Sync упал: {exc}")
-            if self.tg is not None:
-                await self.tg.error(f"Sync run упал: <code>{exc}</code>")
+        async with self._sync_lock:
+            try:
+                await sync_once(funpay_client=self.fp, ns_client=self.ns)
+            except Exception as exc:
+                logger.exception(f"Sync упал: {exc}")
+                if self.tg is not None:
+                    # Детали ошибки только в лог; в Telegram — сжатое сообщение
+                    short = str(exc)[:200]
+                    await self.tg.error(f"Sync run упал: <code>{short}</code>")
 
     async def _trigger_sync(self) -> dict:
-        """Вручную из Telegram-бота."""
-        return await sync_once(funpay_client=self.fp, ns_client=self.ns)
+        """Вручную из Telegram-бота. Не запустится параллельно с scheduler-sync."""
+        async with self._sync_lock:
+            return await sync_once(funpay_client=self.fp, ns_client=self.ns)
 
     # ---------- FunPay events ----------
 
@@ -290,9 +296,13 @@ class App:
         except Exception as exc:
             logger.exception(f"Order processor упал для {event.funpay_order_id}: {exc}")
             if self.tg is not None:
+                # Полный traceback — в файловый лог (см. journalctl/logs/),
+                # в Telegram отдаём короткое сообщение и тип исключения.
+                short = f"{type(exc).__name__}: {str(exc)[:160]}"
                 await self.tg.error(
                     f"Order processor exception для "
-                    f"<code>{event.funpay_order_id}</code>: <code>{exc}</code>"
+                    f"<code>{event.funpay_order_id}</code>: <code>{short}</code>\n"
+                    "Полный traceback — в логах сервера."
                 )
 
     # ---------- Health ----------

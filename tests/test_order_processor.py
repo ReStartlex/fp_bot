@@ -1,0 +1,336 @@
+"""
+Тесты pipeline-а заказов.
+
+Используют in-memory SQLite (file::memory:?cache=shared) и моки NS/FunPay
+клиентов. Цель — проверить:
+- идемпотентность (повторный вход не пересоздаёт NS-заказ);
+- разделение pins_ready / delivered (если send_message клиенту падает,
+  состояние остаётся pins_ready и при следующем входе доставка повторится);
+- сериализацию по funpay_order_id (две параллельные обработки не плодят
+  два NS-заказа).
+"""
+from __future__ import annotations
+
+import asyncio
+from contextlib import asynccontextmanager
+from typing import Any
+
+import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+from src.config import Settings
+from src.db.models import Base, Mapping, Order
+from src.db.repo import find_order_by_funpay_id, upsert_mapping
+from src.ns.models import (
+    CreateOrderResponse,
+    OrderInfo,
+    OrderStatus,
+    PayOrderResponse,
+)
+from src.orders import processor as proc
+from src.orders.processor import (
+    FunPayOrderEvent,
+    process_funpay_order,
+)
+
+
+# ─────────────── изолированная БД и сессии ───────────────
+
+
+@pytest.fixture()
+async def db_session_factory(monkeypatch):
+    """In-memory SQLite на каждый тест, изолированная база."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    # processor.session_factory() возвращает фабрику; подменяем модульно
+    monkeypatch.setattr("src.orders.processor.session_factory", lambda: factory)
+
+    # Чистим in-memory locks между тестами
+    proc._order_locks.clear()
+
+    yield factory
+    await engine.dispose()
+
+
+@pytest.fixture()
+def settings() -> Settings:
+    return Settings(  # type: ignore[call-arg]
+        ns_user_id=1, ns_login="x", ns_password="x",
+        ns_api_secret="QQ==", funpay_golden_key="x", funpay_user_id=1,
+        enable_real_actions=True,
+    )
+
+
+# ─────────────── фейковые клиенты ───────────────
+
+
+class FakeNS:
+    """Имитирует NSClient: запоминает, сколько раз дёргали create/pay."""
+
+    def __init__(
+        self, *,
+        custom_id: str = "ns-custom-1",
+        total: str = "1.93",
+        pay_status: str = "completed",
+        pay_pins: list[str] | None = None,
+        wait_status: int = OrderStatus.COMPLETED.value,
+        wait_pins: list[str] | None = None,
+    ) -> None:
+        self.created_calls = 0
+        self.paid_calls = 0
+        self.waited_calls = 0
+        self._custom_id = custom_id
+        self._total = total
+        self._pay_status = pay_status
+        self._pay_pins = pay_pins
+        self._wait_status = wait_status
+        self._wait_pins = wait_pins
+
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return None
+
+    async def create_order(self, *, service_id: int, fields: list[dict]):
+        self.created_calls += 1
+        return CreateOrderResponse(
+            custom_id=self._custom_id, total_to_pay=self._total
+        )
+
+    async def pay_order(self, custom_id: str):
+        self.paid_calls += 1
+        return PayOrderResponse(
+            custom_id=custom_id,
+            status=self._pay_status,  # type: ignore[arg-type]
+            pins=self._pay_pins,
+        )
+
+    async def wait_order_completion(self, custom_id: str):
+        self.waited_calls += 1
+        return OrderInfo(
+            custom_id=custom_id, status=self._wait_status,
+            status_message="ok", pins=self._wait_pins,
+        )
+
+
+class FakeFunPay:
+    """Имитирует FunPayClient.send_message; можно сделать падающим."""
+
+    def __init__(self, *, fail: bool = False, fail_times: int = 0):
+        self.sent: list[tuple[int, str]] = []
+        self._fail = fail
+        self._fail_times = fail_times
+
+    async def send_message(self, chat_id: int, text: str):
+        if self._fail or self._fail_times > 0:
+            self._fail_times = max(0, self._fail_times - 1)
+            raise RuntimeError("FunPay send_message моковый сбой")
+        self.sent.append((chat_id, text))
+
+
+class FakeTelegram:
+    def __init__(self):
+        self.errors: list[str] = []
+        self.successes: list[dict] = []
+        self.failures: list[dict] = []
+
+    async def error(self, text: str): self.errors.append(text)
+    async def order_success(self, **kw): self.successes.append(kw)
+    async def order_failure(self, **kw): self.failures.append(kw)
+
+
+# ─────────────── helpers ───────────────
+
+
+def _event(order_id: str = "fp-100", lot_id: int = 69300023) -> FunPayOrderEvent:
+    return FunPayOrderEvent(
+        funpay_order_id=order_id,
+        funpay_lot_id=lot_id,
+        buyer_username="alice",
+        buyer_user_id=42,
+        chat_id=555,
+        quantity=1,
+        funpay_price_rub=200.0,
+    )
+
+
+async def _make_mapping(factory, *, lot_id: int = 69300023, svc_id: int = 20) -> None:
+    async with factory() as s:
+        await upsert_mapping(
+            s, funpay_lot_id=lot_id, ns_service_id=svc_id,
+            markup_percent=6.0, stock_cap=10,
+            ns_fields_template='{"quantity":"@QUANTITY"}',
+            enabled=True, label="Test Apple USA 2 USD",
+        )
+        await s.commit()
+
+
+async def _order(factory, fp_order_id: str) -> Order | None:
+    async with factory() as s:
+        return await find_order_by_funpay_id(s, fp_order_id)
+
+
+# ─────────────── собственно тесты ───────────────
+
+
+@pytest.mark.asyncio
+async def test_happy_path_pay_returns_pins_immediately(db_session_factory, settings):
+    await _make_mapping(db_session_factory)
+    ns = FakeNS(pay_pins=["AAAA-AAAA"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    result = await process_funpay_order(
+        _event(), settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+    assert result["status"] == "delivered"
+    assert result["pins_count"] == 1
+    assert ns.created_calls == 1
+    assert ns.paid_calls == 1
+    assert ns.waited_calls == 0  # pins пришли сразу, ждать не надо
+    assert len(fp.sent) == 2  # приветствие + доставка
+    assert tg.successes and not tg.failures
+
+    db_order = await _order(db_session_factory, "fp-100")
+    assert db_order is not None
+    assert db_order.status == "delivered"
+    assert db_order.ns_custom_id == "ns-custom-1"
+
+
+@pytest.mark.asyncio
+async def test_pay_returns_in_progress_then_wait(db_session_factory, settings):
+    """Если pay_order вернул pending — должен дёрнуться wait_order_completion."""
+    await _make_mapping(db_session_factory)
+    ns = FakeNS(
+        pay_status="in_progress", pay_pins=None,
+        wait_pins=["BBBB-BBBB", "CCCC-CCCC"],
+    )
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    result = await process_funpay_order(
+        _event(), settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+    assert result["status"] == "delivered"
+    assert result["pins_count"] == 2
+    assert ns.waited_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_delivery_failure_keeps_pins_ready_for_retry(
+    db_session_factory, settings,
+):
+    """
+    Если FunPay-чат недоступен при доставке, статус остаётся pins_ready.
+    Повторный вход не дёргает NS заново, а только пытается доставить.
+    """
+    await _make_mapping(db_session_factory)
+    ns = FakeNS(pay_pins=["XXXX-YYYY"])
+    fp_fail = FakeFunPay(fail=True)
+    tg = FakeTelegram()
+
+    result = await process_funpay_order(
+        _event(), settings=settings, ns_client=ns,
+        funpay_client=fp_fail, telegram=tg,
+    )
+    assert result["status"] == "pins_ready"
+    assert ns.paid_calls == 1
+    db_order = await _order(db_session_factory, "fp-100")
+    assert db_order is not None
+    assert db_order.status == "pins_ready"
+    assert db_order.pins_json is not None
+    assert "XXXX-YYYY" in db_order.pins_json
+
+    # Re-entry с уже рабочим FunPay
+    fp_ok = FakeFunPay()
+    result2 = await process_funpay_order(
+        _event(), settings=settings, ns_client=ns,
+        funpay_client=fp_ok, telegram=tg,
+    )
+    assert result2["status"] == "delivered"
+    # NS не должен быть вызван повторно
+    assert ns.created_calls == 1
+    assert ns.paid_calls == 1
+    # Клиенту в этот раз отправлено сообщение с кодом
+    assert any("XXXX-YYYY" in body for _, body in fp_ok.sent)
+
+
+@pytest.mark.asyncio
+async def test_reentry_on_delivered_is_noop(db_session_factory, settings):
+    await _make_mapping(db_session_factory)
+    ns = FakeNS(pay_pins=["ZZZZ"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    await process_funpay_order(
+        _event(), settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+    # Второй заход
+    ns.created_calls = 0
+    ns.paid_calls = 0
+    fp.sent.clear()
+    result = await process_funpay_order(
+        _event(), settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+    assert result["status"] == "delivered"
+    assert result["skipped"] is True
+    assert ns.created_calls == 0
+    assert ns.paid_calls == 0
+    assert fp.sent == []
+
+
+@pytest.mark.asyncio
+async def test_no_mapping_marks_failed(db_session_factory, settings):
+    ns = FakeNS()
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+    result = await process_funpay_order(
+        _event(lot_id=999999), settings=settings,
+        ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+    assert result["status"] == "failed"
+    assert ns.created_calls == 0
+    assert len(tg.failures) == 1
+
+
+@pytest.mark.asyncio
+async def test_parallel_calls_serialised_by_lock(db_session_factory, settings):
+    """Два параллельных process_funpay_order для одного и того же id
+    должны выполняться последовательно — NS-заказ создаётся ровно один раз."""
+    await _make_mapping(db_session_factory)
+    ns = FakeNS(pay_pins=["SAME-PIN"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    ev = _event()
+    results = await asyncio.gather(
+        process_funpay_order(
+            ev, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+        ),
+        process_funpay_order(
+            ev, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+        ),
+    )
+    statuses = sorted(r["status"] for r in results)
+    # Первый завершит «delivered», второй увидит «delivered» и пропустит
+    assert statuses == ["delivered", "delivered"]
+    # NS create_order ровно один раз
+    assert ns.created_calls == 1
+    assert ns.paid_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_dry_run_creates_but_not_pays(db_session_factory, settings):
+    await _make_mapping(db_session_factory)
+    ns = FakeNS()
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+    result = await process_funpay_order(
+        _event(), settings=settings, ns_client=ns, funpay_client=fp,
+        telegram=tg, dry_run=True,
+    )
+    assert result["status"] == "ns_created"
+    assert result["dry_run"] is True
+    assert ns.created_calls == 1
+    assert ns.paid_calls == 0
