@@ -229,7 +229,7 @@ async def sync_once(
     if dry_run is None:
         dry_run = not settings.enable_real_actions
 
-    logger.info(f"Sync run started (dry_run={dry_run})")
+    logger.debug(f"Sync run started (dry_run={dry_run})")
 
     async with session_factory()() as session:
         run = await start_sync_run(session)
@@ -255,7 +255,7 @@ async def sync_once(
             mappings = await list_mappings(session, only_enabled=True)
 
         if not mappings:
-            logger.info("Маппингов нет — нечего синхронизировать.")
+            logger.debug("Маппингов нет — нечего синхронизировать.")
             async with session_factory()() as session:
                 await finish_sync_run(
                     session, run, status="completed",
@@ -267,7 +267,7 @@ async def sync_once(
         stock = await ns_client.get_stock()
         services_index = _flatten_services(stock)
         fx_rate = await get_usd_rub_rate(settings)
-        logger.info(f"Маппингов: {len(mappings)}, USD/RUB: {fx_rate:.4f}")
+        logger.info(f"Sync: маппингов {len(mappings)}, USD/RUB {fx_rate:.4f}")
 
         decisions: list[LotSyncDecision] = []
         for mapping in mappings:
@@ -339,8 +339,14 @@ async def sync_once(
         )
         await session.commit()
 
-    logger.info(
-        f"Sync run done: checked={lots_checked}, "
-        f"updated={lots_updated}, skipped={lots_skipped}"
-    )
+    if lots_checked > 0 or error:
+        logger.info(
+            f"Sync done: checked={lots_checked}, "
+            f"updated={lots_updated}, skipped={lots_skipped}"
+        )
+    else:
+        logger.debug(
+            f"Sync done (empty): checked={lots_checked}, "
+            f"updated={lots_updated}, skipped={lots_skipped}"
+        )
     return {"checked": lots_checked, "updated": lots_updated, "skipped": lots_skipped}
