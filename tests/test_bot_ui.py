@@ -52,11 +52,25 @@ def test_main_menu_is_keyboard():
     kb = ui.main_menu()
     assert isinstance(kb, InlineKeyboardMarkup)
     assert len(kb.inline_keyboard) >= 4
-    # каждая кнопка несёт callback_data
     for row in kb.inline_keyboard:
         for btn in row:
             assert btn.callback_data is not None
-            assert btn.callback_data.startswith(("menu:", "close"))
+            assert btn.callback_data.startswith(("menu:", "close", "target:"))
+
+
+def test_main_menu_with_target_shows_clear_button():
+    kb = ui.main_menu(target_lot_label="USA 2 USD (#69300023)")
+    flat = [b for row in kb.inline_keyboard for b in row]
+    target_btns = [b for b in flat if b.callback_data == "target:clear"]
+    assert len(target_btns) == 1
+    # И обязательно строка с целью присутствует
+    assert any("USA 2 USD" in b.text for b in flat)
+
+
+def test_main_menu_without_target_has_no_clear_button():
+    kb = ui.main_menu(target_lot_label=None)
+    flat = [b for row in kb.inline_keyboard for b in row]
+    assert not any(b.callback_data == "target:clear" for b in flat)
 
 
 def test_pagination_row_when_single_page():
@@ -117,12 +131,24 @@ def test_format_ns_category_line():
     assert "stock 15" in out
 
 
-def test_format_funpay_lot_line():
-    lot = FakeLot(id=69300023, description="Apple Gift Card | USA 2 USD", price="500 ₽")
+def test_format_funpay_lot_line_rounds_price():
+    lot = FakeLot(id=69300023, description="Apple Gift Card | USA 2 USD", price=250.916497)
     out = ui.format_funpay_lot_line(lot)
     assert "69300023" in out
-    assert "500" in out
+    assert "251" in out  # округление к целому при цене >= 100
+    assert "250.916497" not in out
     assert "Apple Gift Card" in out
+
+
+def test_format_funpay_lot_line_strips_emoji_from_title():
+    lot = FakeLot(
+        id=1, description="🔑 Подарочная карта Apple 🔵 2 USD (США) 🔵, USD, 2 USD",
+        price="100",
+    )
+    out = ui.format_funpay_lot_line(lot)
+    assert "🔑" not in out
+    assert "🔵" not in out
+    assert "Подарочная карта" in out
 
 
 def test_format_mapping_line_enabled():
@@ -132,7 +158,7 @@ def test_format_mapping_line_enabled():
         enabled=True,
         markup_percent=15.0,
         stock_cap=50,
-        label="Apple",
+        label="Apple Gift Card | USA | 2 USD",
     )
     out = ui.format_mapping_line(m)
     assert "✅" in out
@@ -154,6 +180,77 @@ def test_format_mapping_line_disabled():
     out = ui.format_mapping_line(m)
     assert "⏸" in out
     assert "default" in out
+
+
+# ─────────────── label-хелперы для кнопок ───────────────
+
+
+def test_short_title_strips_emoji_and_truncates():
+    title = "🔑 Подарочная карта Apple 🔵 2 USD (США)"
+    out = ui.short_title(title, limit=20)
+    assert "🔑" not in out
+    assert "🔵" not in out
+    assert len(out) <= 20
+
+
+def test_short_title_keeps_short_intact():
+    out = ui.short_title("Apple 2 USD", limit=40)
+    assert out == "Apple 2 USD"
+
+
+def test_format_money_large_number_rounds_to_int():
+    assert ui.format_money(250.916497) == "251"
+
+
+def test_format_money_small_number_keeps_decimals():
+    assert ui.format_money(1.9261) == "1.93"
+
+
+def test_format_money_tiny_number():
+    assert ui.format_money(0.0042) == "0.0042"
+
+
+def test_format_money_with_suffix():
+    out = ui.format_money(4.8152, suffix="USD")
+    assert "USD" in out
+    assert "4.82" in out
+
+
+def test_format_money_non_numeric_returns_str():
+    assert ui.format_money("—") == "—"
+
+
+def test_ns_service_label_shows_name_and_price():
+    svc = FakeService(
+        service_id=20,
+        service_name="Apple Gift Card | USA | 2 USD",
+        price=1.9261,
+        currency="USD",
+        in_stock=1000,
+    )
+    out = ui.ns_service_label(svc)
+    assert "USD" in out
+    assert "1.93" in out or "2" in out
+    assert len(out) <= 36
+
+
+def test_funpay_lot_label_uses_title_not_id():
+    lot = FakeLot(id=69300023, description="Apple Gift Card | USA 2 USD", price="250")
+    out = ui.funpay_lot_label(lot, max_len=30)
+    assert "69300023" not in out
+    assert "Apple" in out
+
+
+def test_mapping_label_falls_back_to_id():
+    m = FakeMapping(
+        funpay_lot_id=42,
+        ns_service_id=1,
+        enabled=True,
+        markup_percent=None,
+        stock_cap=None,
+        label=None,
+    )
+    assert ui.mapping_label(m) == "#42"
 
 
 # ─────────────── render_list ───────────────

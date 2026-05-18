@@ -8,11 +8,13 @@
     menu:<action>                — главное меню
     pg:<kind>:<sid>:<page>       — пагинация
     act:<kind>:<sid>:<idx>       — действие над элементом страницы
+    target:clear                 — сбросить выбранный лот
     close                        — спрятать клавиатуру
     noop                         — заглушка (например, "X из Y")
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -32,8 +34,21 @@ MENU_KIND_RECONNECT = "fp_reconnect"
 MENU_KIND_HELP = "help"
 
 
-def main_menu() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = [
+def main_menu(target_lot_label: str | None = None) -> InlineKeyboardMarkup:
+    """
+    Главное меню. Если задан target_lot_label — добавляется верхняя строка
+    с информацией о выбранном целевом лоте и кнопкой сброса.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    if target_lot_label:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"🎯 Цель: {target_lot_label}",
+                callback_data="noop",
+            ),
+            InlineKeyboardButton(text="✖ Сбросить", callback_data="target:clear"),
+        ])
+    rows.extend([
         [
             InlineKeyboardButton(text="📊 Статус", callback_data=f"menu:{MENU_KIND_STATUS}"),
             InlineKeyboardButton(text="💰 Балансы", callback_data=f"menu:{MENU_KIND_BALANCE}"),
@@ -58,7 +73,7 @@ def main_menu() -> InlineKeyboardMarkup:
             ),
             InlineKeyboardButton(text="❓ Помощь", callback_data=f"menu:{MENU_KIND_HELP}"),
         ],
-    ]
+    ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -143,28 +158,118 @@ def single_close_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[_back_to_menu_btn(), _close_btn()]])
 
 
+# ─────────────── обрезка названий ───────────────
+
+# Эмодзи и спецсимволы из FunPay-названий: убираем для кнопок
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F300-\U0001F5FF"  # символы и пиктограммы
+    "\U0001F600-\U0001F64F"  # эмоции
+    "\U0001F680-\U0001F6FF"  # транспорт
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FA6F"
+    "\U0001FA70-\U0001FAFF"
+    "\U00002700-\U000027BF"
+    "\U00002600-\U000026FF"
+    "\u200d\ufe0f"  # ZWJ и variation selector
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _clean_title(text: str | None) -> str:
+    """Чистит название от эмодзи, повторяющихся разделителей и хвостов."""
+    if not text:
+        return ""
+    s = _EMOJI_PATTERN.sub(" ", str(text))
+    s = re.sub(r"\s+", " ", s).strip()
+    # частые мусорные хвосты в funpay-описаниях
+    s = re.sub(r"\s*[•·|]\s*$", "", s)
+    return s
+
+
+def short_title(text: str | None, limit: int = 40) -> str:
+    """Урезать название до limit символов, добавив многоточие."""
+    s = _clean_title(text)
+    if len(s) <= limit:
+        return s
+    return s[: limit - 1].rstrip() + "…"
+
+
+def format_money(value: Any, suffix: str = "") -> str:
+    """Деньги: показываем не больше 2 знаков, без хвостовых нулей."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value or "—")
+    if v >= 100:
+        text = f"{v:.0f}"
+    elif v >= 1:
+        text = f"{v:.2f}".rstrip("0").rstrip(".")
+    else:
+        text = f"{v:.4f}".rstrip("0").rstrip(".")
+    return f"{text}{suffix}" if suffix else text
+
+
+# ─────────────── label'ы для кнопок ───────────────
+
+
+def ns_service_label(svc: Any, max_len: int = 36) -> str:
+    """
+    Текст кнопки выбора NS-услуги. Стараемся вместить:
+    «<значимая часть имени> · <цена><валюта>».
+    """
+    name = short_title(svc.service_name, limit=max_len - 14)
+    price = format_money(svc.price, suffix=(svc.currency or "USD"))
+    label = f"{name} · {price}" if name else price
+    if len(label) > max_len:
+        label = label[: max_len - 1] + "…"
+    return label
+
+
+def funpay_lot_label(lot: Any, max_len: int = 30) -> str:
+    """Текст кнопки выбора FunPay-лота: только название, без ID."""
+    title = (
+        getattr(lot, "description", None)
+        or getattr(lot, "title", None)
+        or getattr(lot, "name", None)
+        or ""
+    )
+    return short_title(title, limit=max_len) or "—"
+
+
+def mapping_label(m: Any, max_len: int = 32) -> str:
+    """Текст для кнопки маппинга — берём label, если его нет — id."""
+    if getattr(m, "label", None):
+        return short_title(m.label, limit=max_len)
+    return f"#{m.funpay_lot_id}"
+
+
 # ─────────────── форматтеры карточек ───────────────
 
 
 def format_ns_service_line(svc: Any) -> str:
-    """Одна строка списка NS-услуг."""
-    name = (svc.service_name or "").strip()
-    name_short = name[:55] + "…" if len(name) > 56 else name
+    """Одна компактная строка в списке NS-услуг."""
+    name = short_title(svc.service_name, limit=60)
     stock = svc.in_stock if svc.in_stock is not None else "?"
     cur = (svc.currency or "USD").strip() or "USD"
+    price = format_money(svc.price)
     return (
-        f"<code>{svc.service_id:>5}</code> "
-        f"<b>{name_short}</b>\n"
-        f"   {svc.price:.4f} {cur} • stock: <b>{stock}</b>"
+        f"<code>#{svc.service_id}</code> "
+        f"<b>{name}</b>\n"
+        f"   {price} {cur} · stock: <b>{stock}</b>"
     )
 
 
 def format_ns_category_line(cat: Any) -> str:
     total = sum(s.in_stock for s in cat.services)
     return (
-        f"<code>{cat.category_id:>4}</code> "
-        f"<b>{cat.category_name}</b> — "
-        f"{len(cat.services)} услуг · stock {total}"
+        f"<code>#{cat.category_id}</code> "
+        f"<b>{cat.category_name}</b>\n"
+        f"   {len(cat.services)} услуг · stock {total}"
     )
 
 
@@ -175,35 +280,32 @@ def format_funpay_lot_line(lot: Any) -> str:
         or getattr(lot, "offer_id", None)
         or "?"
     )
-    title = (
+    title = short_title(
         getattr(lot, "description", None)
         or getattr(lot, "title", None)
         or getattr(lot, "name", None)
-        or ""
+        or "",
+        limit=60,
     )
     price = (
         getattr(lot, "price", None)
         or getattr(lot, "cost", None)
         or "—"
     )
-    title_short = str(title or "")
-    if len(title_short) > 60:
-        title_short = title_short[:60] + "…"
     return (
-        f"<code>{lot_id}</code> · <b>{price}</b>\n"
-        f"   {title_short}"
+        f"<code>{lot_id}</code> · <b>{format_money(price)}</b>\n"
+        f"   {title}"
     )
 
 
 def format_mapping_line(m: Any) -> str:
     status = "✅" if m.enabled else "⏸"
     markup = f"{m.markup_percent}%" if m.markup_percent is not None else "default"
-    cap = m.stock_cap if m.stock_cap is not None else "default"
-    label = (m.label or "").strip()
-    title = f" • {label}" if label else ""
+    label = short_title(getattr(m, "label", None), limit=60)
+    title = f" — {label}" if label else ""
     return (
-        f"{status} <code>{m.funpay_lot_id}</code> → NS#{m.ns_service_id}{title}\n"
-        f"   markup: {markup} · cap: {cap}"
+        f"{status} <code>{m.funpay_lot_id}</code> → "
+        f"NS#{m.ns_service_id}{title} · markup <b>{markup}</b>"
     )
 
 

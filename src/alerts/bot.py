@@ -181,6 +181,8 @@ class TelegramBot:
         self._sessions = PaginationStore()
         # chat_id -> funpay_lot_id, который выбран как target для маппинга
         self._target_lots: dict[int, int] = {}
+        # chat_id -> человеческая подпись лота для подсказок
+        self._target_labels: dict[int, str] = {}
         # кэш каталога NS на 60 секунд, чтобы не дёргать API на каждый клик
         self._stock_cache: tuple[float, StockResponse] | None = None
         self._stock_lock = asyncio.Lock()
@@ -332,7 +334,10 @@ class TelegramBot:
         async def cmd_menu(msg: Message) -> None:
             if not self._is_owner(msg):
                 return
-            await msg.answer(ui.MENU_GREETING, reply_markup=ui.main_menu())
+            await msg.answer(
+                self._menu_text(msg.chat.id),
+                reply_markup=ui.main_menu(self._target_label_for(msg.chat.id)),
+            )
 
         @dp.message(Command("status"))
         async def cmd_status(msg: Message) -> None:
@@ -428,6 +433,19 @@ class TelegramBot:
                     await cq.message.delete()
             await cq.answer()
 
+        @dp.callback_query(F.data == "target:clear")
+        async def cb_target_clear(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            self._target_lots.pop(cq.from_user.id, None)
+            self._target_labels.pop(cq.from_user.id, None)
+            await cq.answer("Цель сброшена", show_alert=False)
+            await self._edit_or_answer(
+                cq, self._menu_text(cq.from_user.id),
+                reply_markup=ui.main_menu(self._target_label_for(cq.from_user.id)),
+            )
+
         @dp.callback_query(F.data.startswith("menu:"))
         async def cb_menu(cq: CallbackQuery) -> None:
             if not self._is_owner(cq):
@@ -450,6 +468,25 @@ class TelegramBot:
             await self._on_action_click(cq)
 
     # ─────────────── общие хелперы ───────────────
+
+    def _target_label_for(self, chat_id: int) -> str | None:
+        lot_id = self._target_lots.get(chat_id)
+        if lot_id is None:
+            return None
+        label = self._target_labels.get(chat_id)
+        if label:
+            return f"{label} (#{lot_id})"
+        return f"#{lot_id}"
+
+    def _menu_text(self, chat_id: int) -> str:
+        target = self._target_label_for(chat_id)
+        if target:
+            return (
+                ui.MENU_GREETING
+                + f"\n\n🎯 <b>Целевой лот:</b> <code>{html.escape(target)}</code>\n"
+                + "<i>Выбери услугу в Каталоге NS или Поиске — замапим в один клик.</i>"
+            )
+        return ui.MENU_GREETING
 
     async def _get_stock(self, *, force: bool = False) -> StockResponse:
         """NS-каталог с кэшем 60 секунд."""
@@ -524,7 +561,10 @@ class TelegramBot:
         if msg.chat.id != owner:
             await msg.answer("Этот бот — личный, чужие команды я не выполняю.")
             return
-        await msg.answer(ui.MENU_GREETING, reply_markup=ui.main_menu())
+        await msg.answer(
+            self._menu_text(msg.chat.id),
+            reply_markup=ui.main_menu(self._target_label_for(msg.chat.id)),
+        )
 
     # ─────────────── меню (callback) ───────────────
 
@@ -533,7 +573,11 @@ class TelegramBot:
         action = (cq.data or "").split(":", 1)[1] if ":" in (cq.data or "") else ""
         await cq.answer()
         if action == "home":
-            await self._edit_or_answer(cq, ui.MENU_GREETING, reply_markup=ui.main_menu())
+            await self._edit_or_answer(
+                cq,
+                self._menu_text(cq.from_user.id),
+                reply_markup=ui.main_menu(self._target_label_for(cq.from_user.id)),
+            )
         elif action == ui.MENU_KIND_STATUS:
             await self._show_status_via_cq(cq)
         elif action == ui.MENU_KIND_BALANCE:
@@ -545,7 +589,13 @@ class TelegramBot:
         elif action == ui.MENU_KIND_NS_CATS:
             await self._show_ns_cats_via_cq(cq)
         elif action == ui.MENU_KIND_NS_SEARCH:
-            await self._edit_or_answer(cq, ui.HINT_NS_SEARCH, reply_markup=ui.single_close_kb())
+            text = ui.HINT_NS_SEARCH
+            target = self._target_label_for(cq.from_user.id)
+            if target:
+                text += (
+                    f"\n\n🎯 <b>Целевой лот:</b> <code>{html.escape(target)}</code>"
+                )
+            await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
         elif action == ui.MENU_KIND_ORDERS:
             await self._show_orders_via_cq(cq)
         elif action == ui.MENU_KIND_SYNC:
@@ -661,11 +711,24 @@ class TelegramBot:
 
     # ----- builder'ы страниц -----
 
+    def _target_hint(self, chat_id: int) -> str:
+        """Подсказка для заголовка списков NS: на какой лот мапим."""
+        lot_id = self._target_lots.get(chat_id)
+        if lot_id is None:
+            return (
+                "<i>Выбери лот в «🛒 Лоты FunPay», чтобы мапить одним кликом</i>"
+            )
+        label = self._target_labels.get(chat_id) or f"#{lot_id}"
+        return f"🎯 Цель: <b>{label}</b> (<code>{lot_id}</code>)"
+
     def _build_ns_search_page(self, sess, sid, page_items, page, total_pages):
+        target = ""
+        if sess.meta.get("chat_id") is not None:
+            target = "\n" + self._target_hint(sess.meta["chat_id"]) + "\n"
         text = ui.render_list(
             page_items=page_items,
             formatter=ui.format_ns_service_line,
-            title=f"🔍 NS-поиск: «{sess.title}»",
+            title=f"🔍 NS-поиск: «{sess.title}»{target}",
             page=page,
             total_pages=total_pages,
             total_items=len(sess.items),
@@ -677,7 +740,7 @@ class TelegramBot:
             global_idx = page * PAGE_SIZE + local_idx
             item_buttons.append([
                 InlineKeyboardButton(
-                    text=f"✅ Замапить NS#{svc.service_id}",
+                    text=f"✅ {ui.ns_service_label(svc)}",
                     callback_data=f"act:ns_map:{sid}:{global_idx}",
                 )
             ])
@@ -691,10 +754,13 @@ class TelegramBot:
         return text, kb
 
     def _build_ns_cats_page(self, sess, sid, page_items, page, total_pages):
+        target = ""
+        if sess.meta.get("chat_id") is not None:
+            target = "\n" + self._target_hint(sess.meta["chat_id"]) + "\n"
         text = ui.render_list(
             page_items=page_items,
             formatter=ui.format_ns_category_line,
-            title="🗂 Категории NS",
+            title=f"🗂 Категории NS{target}",
             page=page,
             total_pages=total_pages,
             total_items=len(sess.items),
@@ -704,9 +770,11 @@ class TelegramBot:
         item_buttons: list[list[InlineKeyboardButton]] = []
         for local_idx, cat in enumerate(page_items):
             global_idx = page * PAGE_SIZE + local_idx
+            name = ui.short_title(cat.category_name, limit=28)
+            stock_total = sum(s.in_stock for s in cat.services)
             item_buttons.append([
                 InlineKeyboardButton(
-                    text=f"📂 {cat.category_name}",
+                    text=f"📂 {name} · {len(cat.services)} · stock {stock_total}",
                     callback_data=f"act:cat_open:{sid}:{global_idx}",
                 )
             ])
@@ -721,10 +789,13 @@ class TelegramBot:
 
     def _build_ns_cat_services_page(self, sess, sid, page_items, page, total_pages):
         cat_name = sess.meta.get("category_name", "—")
+        target = ""
+        if sess.meta.get("chat_id") is not None:
+            target = "\n" + self._target_hint(sess.meta["chat_id"]) + "\n"
         text = ui.render_list(
             page_items=page_items,
             formatter=ui.format_ns_service_line,
-            title=f"📂 {cat_name}",
+            title=f"📂 {cat_name}{target}",
             page=page,
             total_pages=total_pages,
             total_items=len(sess.items),
@@ -736,7 +807,7 @@ class TelegramBot:
             global_idx = page * PAGE_SIZE + local_idx
             item_buttons.append([
                 InlineKeyboardButton(
-                    text=f"✅ Замапить NS#{svc.service_id}",
+                    text=f"✅ {ui.ns_service_label(svc)}",
                     callback_data=f"act:ns_map:{sid}:{global_idx}",
                 )
             ])
@@ -771,22 +842,24 @@ class TelegramBot:
         item_buttons: list[list[InlineKeyboardButton]] = []
         for local_idx, lot in enumerate(page_items):
             global_idx = page * PAGE_SIZE + local_idx
-            lot_id = _lot_id_of(lot)
-            row = [
+            row_top = [
                 InlineKeyboardButton(
-                    text=f"🎯 Выбрать #{lot_id}",
+                    text=f"🎯 {ui.funpay_lot_label(lot, max_len=28)}",
                     callback_data=f"act:fp_target:{sid}:{global_idx}",
                 ),
+            ]
+            row_bot = [
                 InlineKeyboardButton(
                     text="📊 Расчёт",
                     callback_data=f"act:lot_calc:{sid}:{global_idx}",
                 ),
                 InlineKeyboardButton(
-                    text="🔬",
+                    text="🔬 Inspect",
                     callback_data=f"act:lot_inspect:{sid}:{global_idx}",
                 ),
             ]
-            item_buttons.append(row)
+            item_buttons.append(row_top)
+            item_buttons.append(row_bot)
         kb = ui.list_keyboard(
             kind="lots",
             sid=sid,
@@ -804,16 +877,21 @@ class TelegramBot:
             page=page,
             total_pages=total_pages,
             total_items=len(sess.items),
-            empty_text="Маппингов нет. Через /lots выбери лот, потом из /ns_cats или /ns_search — услугу.",
+            empty_text=(
+                "Маппингов нет. Открой «🛒 Лоты FunPay», выбери лот кнопкой 🎯, "
+                "потом из «🗂 Каталог NS» или /ns_search нажми «✅ …» на услуге."
+            ),
         )
         from aiogram.types import InlineKeyboardButton
 
         item_buttons: list[list[InlineKeyboardButton]] = []
         for local_idx, m in enumerate(page_items):
             global_idx = page * PAGE_SIZE + local_idx
+            toggle_emoji = "⏸ Выкл" if m.enabled else "▶ Вкл"
+            label = ui.mapping_label(m, max_len=24)
             row = [
                 InlineKeyboardButton(
-                    text=("⏸" if m.enabled else "▶") + f" #{m.funpay_lot_id}",
+                    text=f"{toggle_emoji} · {label}",
                     callback_data=f"act:map_toggle:{sid}:{global_idx}",
                 ),
                 InlineKeyboardButton(
@@ -1072,7 +1150,11 @@ class TelegramBot:
         if not stock.categories:
             await msg.answer("Каталог NS пустой.", reply_markup=ui.single_close_kb())
             return
-        sid = self._sessions.put(stock.categories, title="NS categories")
+        sid = self._sessions.put(
+            stock.categories,
+            title="NS categories",
+            meta={"chat_id": msg.chat.id},
+        )
         await self._render_paginated_from_cmd(msg, kind="ns_cats", sid=sid, page=0)
 
     @_guard
@@ -1091,7 +1173,11 @@ class TelegramBot:
                 cq, "Каталог NS пустой.", reply_markup=ui.single_close_kb()
             )
             return
-        sid = self._sessions.put(stock.categories, title="NS categories")
+        sid = self._sessions.put(
+            stock.categories,
+            title="NS categories",
+            meta={"chat_id": cq.from_user.id},
+        )
         await self._render_paginated(cq, kind="ns_cats", sid=sid, page=0)
 
     @_guard
@@ -1115,7 +1201,7 @@ class TelegramBot:
                 reply_markup=ui.single_close_kb(),
             )
             return
-        sid = self._sessions.put(results, title=query)
+        sid = self._sessions.put(results, title=query, meta={"chat_id": msg.chat.id})
         await self._render_paginated_from_cmd(msg, kind="ns_search", sid=sid, page=0)
 
     @_guard
@@ -1346,9 +1432,12 @@ class TelegramBot:
             except (TypeError, ValueError):
                 await cq.answer("Не могу прочитать lot_id", show_alert=True)
                 return
+        label = ui.funpay_lot_label(lot, max_len=60)
         self._target_lots[cq.from_user.id] = lot_id
+        self._target_labels[cq.from_user.id] = label or f"#{lot_id}"
         await cq.answer(
-            f"🎯 Целевой лот: {lot_id}. Открой Каталог NS и выбери услугу.",
+            f"🎯 Цель: {label or '#' + str(lot_id)}\n"
+            f"Теперь открой «🗂 Каталог NS» или /ns_search и нажми ✅ на услуге.",
             show_alert=True,
         )
 
@@ -1357,7 +1446,7 @@ class TelegramBot:
         target = self._target_lots.get(cq.from_user.id)
         if target is None:
             await cq.answer(
-                "Сначала выбери FunPay-лот (🎯) в разделе «Лоты FunPay».",
+                "Сначала открой «🛒 Лоты FunPay» и выбери лот кнопкой 🎯.",
                 show_alert=True,
             )
             return
@@ -1372,7 +1461,11 @@ class TelegramBot:
         sid = self._sessions.put(
             services,
             title=cat.category_name,
-            meta={"category_id": cat.category_id, "category_name": cat.category_name},
+            meta={
+                "category_id": cat.category_id,
+                "category_name": cat.category_name,
+                "chat_id": cq.from_user.id,
+            },
         )
         await self._render_paginated(cq, kind="ns_cat_services", sid=sid, page=0)
 
@@ -1471,16 +1564,21 @@ class TelegramBot:
                 label=str(ns_service.service_name)[:80],
             )
             await session.commit()
+        svc_label = ui.short_title(ns_service.service_name, limit=40)
+        fp_label = self._target_labels.get(cq.from_user.id) or f"#{funpay_lot_id}"
         await cq.answer(
-            f"✅ Замаппил {funpay_lot_id} → NS#{obj.ns_service_id}",
+            f"✅ Замаппил «{fp_label}» → {svc_label}",
             show_alert=True,
         )
         if cq.message is not None:
             await cq.message.answer(
                 f"✅ <b>Маппинг сохранён</b>\n"
-                f"FunPay <code>{funpay_lot_id}</code> → NS#{obj.ns_service_id}\n"
-                f"<i>{html.escape(obj.label or '')}</i>\n"
-                f"Markup: default ({self._settings.markup_percent}%)\n\n"
+                f"FunPay <code>{funpay_lot_id}</code> · "
+                f"<i>{html.escape(fp_label)}</i>\n"
+                f"     ↓\n"
+                f"NS#{obj.ns_service_id} · "
+                f"<i>{html.escape(svc_label)}</i>\n\n"
+                f"Markup: default ({self._settings.markup_percent}%)\n"
                 f"Запусти 🔄 Синхронизация чтобы применить.",
                 reply_markup=ui.single_close_kb(),
             )
