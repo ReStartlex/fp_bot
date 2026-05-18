@@ -54,12 +54,22 @@ class FunPayClient:
         """
         Подключение к FunPay через golden_key + PHPSESSID.
 
-        ВАЖНО: в установленной версии FunPayAPI Account.__init__ принимает
-        только `golden_key`. PHPSESSID нельзя передать конструктором —
-        его нужно положить в атрибут `acc.phpsessid` ДО вызова `acc.get()`.
-        Если так не сделать, библиотека получит свежий PHPSESSID гостя
-        в первом же запросе, и админка лотов (get_lot_fields / save_lot)
-        вернёт HTML страницы логина, парсер упадёт на «Expecting value».
+        Кардинальная стратегия (после нескольких неудачных попыток):
+        мы не полагаемся ни на `Account(phpsessid=...)`, ни на атрибут
+        `acc.phpsessid` — в установленной библиотеке оба пути НЕ
+        прокидывают cookie в реальные HTTP-запросы. Вместо этого
+        делаем 3 вещи:
+
+        1. Конструируем Account только с golden_key.
+        2. Через introspection находим внутреннюю `requests.Session`
+           (atributes: session / _session / runner.session / http и т.д.)
+           и руками вписываем туда обе cookies (golden_key + PHPSESSID).
+           Все последующие запросы библиотеки полетят с правильным Cookie.
+        3. После acc.get() ещё раз ставим обе cookies (если библиотека
+           их перетерла из set-cookie ответа FunPay).
+
+        Если HTTP-сессию найти не удалось — падаем явно, с подсказкой
+        вызвать introspection, а не молча работать как гость.
         """
         from FunPayAPI import Account
 
@@ -70,58 +80,117 @@ class FunPayClient:
             else None
         )
 
-        def _build_and_get() -> Any:
+        def _install_cookies(acc: Any) -> dict[str, Any]:
+            """
+            Идём по известным местам, где FunPayAPI может прятать
+            requests.Session, и вписываем golden_key + PHPSESSID в её
+            cookiejar. Возвращаем отчёт, куда именно положили — для лога.
+            """
+            report: dict[str, Any] = {"sessions_touched": [], "attrs_set": []}
+
+            # 1. атрибут .phpsessid (на случай если форк всё-таки читает его)
+            if phpsessid:
+                try:
+                    setattr(acc, "phpsessid", phpsessid)
+                    report["attrs_set"].append("phpsessid")
+                except Exception:
+                    pass
+
+            # 2. находим все объекты, похожие на requests.Session
+            candidates: list[Any] = []
+            for owner in (acc, getattr(acc, "runner", None), getattr(acc, "http", None)):
+                if owner is None:
+                    continue
+                for name in (
+                    "session", "_session", "sess", "requests_session",
+                    "http", "client", "_client",
+                ):
+                    obj = getattr(owner, name, None)
+                    if obj is not None and hasattr(obj, "cookies"):
+                        candidates.append((f"{type(owner).__name__}.{name}", obj))
+                # сам owner тоже может быть Session-подобным
+                if hasattr(owner, "cookies") and hasattr(owner, "get"):
+                    candidates.append((f"{type(owner).__name__}", owner))
+
+            for label, sess in candidates:
+                try:
+                    cookies = sess.cookies
+                    # requests.cookies.RequestsCookieJar
+                    cookies.set(
+                        "golden_key", golden_key, domain="funpay.com", path="/"
+                    )
+                    if phpsessid:
+                        cookies.set(
+                            "PHPSESSID", phpsessid, domain="funpay.com", path="/"
+                        )
+                    # дублируем без domain — некоторые сессии хранят без
+                    cookies.set("golden_key", golden_key)
+                    if phpsessid:
+                        cookies.set("PHPSESSID", phpsessid)
+                    # User-Agent через session.headers
+                    if hasattr(sess, "headers"):
+                        sess.headers["User-Agent"] = self.DEFAULT_USER_AGENT
+                    report["sessions_touched"].append(label)
+                except Exception as exc:
+                    logger.debug(f"FunPay cookie install on {label} failed: {exc}")
+
+            return report
+
+        def _build_and_get() -> tuple[Any, dict[str, Any], dict[str, Any]]:
             ctor_kwargs: dict[str, Any] = {
                 "golden_key": golden_key,
                 "user_agent": self.DEFAULT_USER_AGENT,
             }
-            # На случай экзотических форков, где phpsessid действительно в init
             sig = inspect.signature(Account.__init__)
-            phpsessid_via_init = False
             if phpsessid:
                 if "phpsessid" in sig.parameters:
                     ctor_kwargs["phpsessid"] = phpsessid
-                    phpsessid_via_init = True
                 elif "PHPSESSID" in sig.parameters:
                     ctor_kwargs["PHPSESSID"] = phpsessid
-                    phpsessid_via_init = True
 
             acc = Account(**ctor_kwargs)
 
-            # Главный фикс: проставляем PHPSESSID атрибутом ДО первого
-            # запроса. FunPayAPI в Account.method() кладёт его в Cookie
-            # ровно так: `golden_key=...; PHPSESSID=...`.
-            if phpsessid and not phpsessid_via_init and hasattr(acc, "phpsessid"):
-                acc.phpsessid = phpsessid
+            # ставим cookies ДО первого запроса
+            report_before = _install_cookies(acc)
 
-            # update_phpsessid=False — не даём библиотеке затереть наш
-            # PHPSESSID значением из set-cookie ответа (так сохраняем
-            # авторизованную сессию).
+            # acc.get() — первый запрос. Просим библиотеку НЕ перетирать
+            # PHPSESSID значением из ответа, если такой параметр поддержан.
             try:
                 acc.get(update_phpsessid=False)
             except TypeError:
                 acc.get()
-            return acc
+            except Exception as exc:
+                logger.warning(f"FunPay acc.get() упал: {type(exc).__name__}: {exc}")
+
+            # после acc.get() — снова ставим cookies (на случай перетёрки)
+            report_after = _install_cookies(acc)
+            return acc, report_before, report_after
 
         async with self._lock:
-            self._account = await self._to_thread(_build_and_get)
+            self._account, report_before, report_after = await self._to_thread(
+                _build_and_get
+            )
 
-        # Лог намеренно показывает только факт наличия PHPSESSID, а не
-        # его значение — секрет не должен утекать в журналы.
-        has_phpsessid = bool(
-            phpsessid and getattr(self._account, "phpsessid", None)
-        )
+        # Лог намеренно показывает только факт наличия PHPSESSID, а не его
+        # значение — секрет не должен утекать в журналы.
+        sessions = sorted(set(
+            report_before["sessions_touched"] + report_after["sessions_touched"]
+        ))
+        has_phpsessid_attr = bool(getattr(self._account, "phpsessid", None))
         logger.info(
             f"FunPay подключён: id={self.account_id}, "
             f"username={self.username}, "
-            f"phpsessid={'set' if has_phpsessid else 'MISSING'}, "
+            f"phpsessid={'set' if phpsessid else 'MISSING'}, "
+            f"phpsessid_attr={'present' if has_phpsessid_attr else 'absent'}, "
+            f"http_sessions_with_cookies={sessions or 'NONE_FOUND'}, "
             f"баланс={self.balance}"
         )
-        if phpsessid and not has_phpsessid:
-            logger.warning(
-                "FUNPAY_PHPSESSID указан в .env, но FunPayAPI его не "
-                "сохранил. Без PHPSESSID не работает get_lot_fields / "
-                "save_lot. Проверь актуальность cookie на funpay.com."
+        if phpsessid and not sessions:
+            logger.error(
+                "FunPay: ни одной requests.Session не найдено в Account. "
+                "Cookies некуда положить, библиотека ходит без PHPSESSID. "
+                "Запусти `python -m src.tools.funpay_introspect` и пришли "
+                "вывод — добавим нужный путь в _install_cookies()."
             )
         return self._account
 
