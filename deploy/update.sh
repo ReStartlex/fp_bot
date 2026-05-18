@@ -32,15 +32,29 @@ fi
 # 2. Обновляем pip-зависимости (если изменились)
 "${APP_DIR}/.venv/bin/pip" install -q -r "${APP_DIR}/requirements.txt"
 
-# 3. Если systemd-сервис запущен — рестартуем
-if systemctl is-active --quiet funpay-ns-bot 2>/dev/null; then
+# 3. Чиним права ДО рестарта. Иначе сервис бежит от 'bot', получает
+# Permission denied на .env (положенный нами через mv от root) и падает
+# в auto-restart loop, не оставляя собственных логов.
+if getent passwd bot >/dev/null 2>&1; then
+    chown -R bot:bot "${APP_DIR}"
+fi
+chmod 600 "${APP_DIR}/.env" 2>/dev/null || true
+
+# 4. Только теперь — рестарт сервиса (если он управляется systemd)
+if systemctl is-active --quiet funpay-ns-bot 2>/dev/null \
+   || systemctl is-enabled --quiet funpay-ns-bot 2>/dev/null; then
     systemctl restart funpay-ns-bot
     echo "Сервис funpay-ns-bot перезапущен."
+    # Проверяем, поднялся ли он. Если нет — сразу показываем стектрейс,
+    # а не оставляем пользователя гадать.
+    sleep 4
+    if ! systemctl is-active --quiet funpay-ns-bot; then
+        echo
+        echo "── ВНИМАНИЕ: сервис не поднялся, последние 40 строк лога ──"
+        journalctl -u funpay-ns-bot -n 40 --no-pager
+        echo "──────────────────────────────────────────────────────────"
+    fi
 fi
-
-# 4. Чиним права (если что-то осталось от tarball)
-chown -R bot:bot "${APP_DIR}"
-chmod 600 "${APP_DIR}/.env" 2>/dev/null || true
 
 # 5. Печатаем версию, чтобы сразу было видно — фикс задеплоился?
 if [[ -f "${APP_DIR}/BUILD_INFO" ]]; then

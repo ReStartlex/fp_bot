@@ -67,6 +67,16 @@ if [[ -n "${PRESERVE_DATA}" ]]; then
     rm -rf "${PRESERVE_DATA}"
 fi
 
+# ВАЖНО: tar/mv из /tmp создают файлы от текущего юзера (обычно root).
+# Без этого systemd-сервис (бежит от 'bot') получает Permission denied
+# на чтение .env и падает с PermissionError ещё до собственных логов.
+# Поэтому всегда возвращаем владельца bot:bot, если такой юзер есть.
+if getent passwd bot >/dev/null 2>&1; then
+    chown -R bot:bot "${APP_DIR}"
+    chmod 600 "${APP_DIR}/.env" 2>/dev/null || true
+    echo "    chown bot:bot ${APP_DIR} — ОК"
+fi
+
 # Записываем BUILD_INFO для /version и update.sh. Тянем последний коммит
 # main через gh-proxy (тарбол сам по себе SHA не содержит). Парсим JSON
 # через python3 (он всегда есть на VPS), потому что grep на бинарных
