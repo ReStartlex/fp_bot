@@ -50,26 +50,89 @@ class FunPayClient:
         """Сахар над `asyncio.to_thread`."""
         return await asyncio.to_thread(fn, *args, **kwargs)
 
+    # Класс-level флаг: один раз monkeypatch на requests.Session.request.
+    # Хранит PHPSESSID/golden_key последнего connect() — этого достаточно,
+    # потому что в этом приложении единственный аккаунт FunPay.
+    _patch_installed: bool = False
+    _patched_golden_key: str | None = None
+    _patched_phpsessid: str | None = None
+
+    @classmethod
+    def _install_global_funpay_cookie_patch(cls) -> None:
+        """
+        Глобально патчит requests.Session.request так, что для любого
+        запроса к funpay.com автоматически добавляются cookies
+        golden_key и PHPSESSID. Это спасает в случае, когда библиотека
+        FunPayAPI (или её форк) держит requests.Session в каком-то
+        нестандартном атрибуте, до которого мы не дотягиваемся через
+        introspection.
+
+        Патч ставится один раз за жизнь процесса. PHPSESSID/golden_key
+        берутся из class-level переменных, которые обновляет connect().
+        """
+        if cls._patch_installed:
+            return
+
+        import requests
+
+        original_request = requests.Session.request
+
+        def patched_request(self, method, url, **kwargs):  # type: ignore[no-redef]
+            # Применяем cookies только к запросам FunPay, чтобы не
+            # просочиться в посторонние HTTP-вызовы (Telegram, NS, и т.д.).
+            try:
+                target_funpay = "funpay.com" in str(url).lower()
+            except Exception:
+                target_funpay = False
+
+            if target_funpay and (cls._patched_golden_key or cls._patched_phpsessid):
+                # 1. через kwargs['cookies'] — самый чистый способ
+                kw_cookies = kwargs.get("cookies") or {}
+                if isinstance(kw_cookies, dict):
+                    if cls._patched_golden_key:
+                        kw_cookies.setdefault("golden_key", cls._patched_golden_key)
+                    if cls._patched_phpsessid:
+                        kw_cookies.setdefault("PHPSESSID", cls._patched_phpsessid)
+                    kwargs["cookies"] = kw_cookies
+                # 2. дополнительно — в самой сессии (на случай GET без cookies kwarg)
+                try:
+                    if cls._patched_golden_key:
+                        self.cookies.set(
+                            "golden_key", cls._patched_golden_key,
+                            domain="funpay.com", path="/",
+                        )
+                    if cls._patched_phpsessid:
+                        self.cookies.set(
+                            "PHPSESSID", cls._patched_phpsessid,
+                            domain="funpay.com", path="/",
+                        )
+                except Exception:
+                    pass
+
+            return original_request(self, method, url, **kwargs)
+
+        requests.Session.request = patched_request  # type: ignore[assignment]
+        cls._patch_installed = True
+        logger.info(
+            "FunPay HTTP patch установлен (Session.request будет добавлять "
+            "golden_key и PHPSESSID во все запросы к funpay.com)"
+        )
+
     async def connect(self) -> Any:
         """
         Подключение к FunPay через golden_key + PHPSESSID.
 
         Кардинальная стратегия (после нескольких неудачных попыток):
         мы не полагаемся ни на `Account(phpsessid=...)`, ни на атрибут
-        `acc.phpsessid` — в установленной библиотеке оба пути НЕ
-        прокидывают cookie в реальные HTTP-запросы. Вместо этого
-        делаем 3 вещи:
+        `acc.phpsessid`, ни даже на то, что внутри Account найдётся
+        атрибут `session`. Вместо этого ставим **глобальный
+        monkey-patch на requests.Session.request**, который автоматом
+        добавляет cookies для всех запросов к funpay.com. Это работает
+        независимо от внутренней архитектуры FunPayAPI.
 
-        1. Конструируем Account только с golden_key.
-        2. Через introspection находим внутреннюю `requests.Session`
-           (atributes: session / _session / runner.session / http и т.д.)
-           и руками вписываем туда обе cookies (golden_key + PHPSESSID).
-           Все последующие запросы библиотеки полетят с правильным Cookie.
-        3. После acc.get() ещё раз ставим обе cookies (если библиотека
-           их перетерла из set-cookie ответа FunPay).
-
-        Если HTTP-сессию найти не удалось — падаем явно, с подсказкой
-        вызвать introspection, а не молча работать как гость.
+        Дополнительно вписываем cookies во все найденные `.cookies`
+        атрибуты (на случай, если библиотека форсит их при каждом
+        запросе) и пробуем acc.phpsessid (некоторые форки читают его).
         """
         from FunPayAPI import Account
 
@@ -79,6 +142,11 @@ class FunPayClient:
             if self._settings.funpay_phpsessid
             else None
         )
+
+        # Глобальный патч (один раз) + обновляем актуальные значения
+        FunPayClient._patched_golden_key = golden_key
+        FunPayClient._patched_phpsessid = phpsessid
+        FunPayClient._install_global_funpay_cookie_patch()
 
         def _install_cookies(acc: Any) -> dict[str, Any]:
             """
