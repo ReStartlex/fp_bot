@@ -62,6 +62,11 @@ class App:
             f"NS↔FunPay Bridge запускается "
             f"(real_actions={self.settings.enable_real_actions})"
         )
+        logger.info(
+            f"Telegram: enabled={self.settings.telegram_enabled}, "
+            f"chat_id={'set' if self.settings.telegram_chat_id else 'NOT SET'}, "
+            f"token={'set' if self.settings.telegram_bot_token else 'NOT SET'}"
+        )
         logger.info("=" * 60)
 
         await init_db()

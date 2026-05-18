@@ -118,6 +118,8 @@ class TelegramBot:
         "/inspect_lot &lt;funpay_lot_id&gt; — заглянуть в LotFields\n"
         "\n"
         "<b>Прочее</b>\n"
+        "/ping — проверка связи (всегда работает)\n"
+        "/version — версия + chat_id\n"
         "/whoami — твой chat_id\n"
         "/help — это сообщение"
     )
@@ -220,9 +222,43 @@ class TelegramBot:
         async def cmd_whoami(msg: Message) -> None:
             await msg.answer(f"chat_id = <code>{msg.chat.id}</code>")
 
+        @dp.message(Command("ping"))
+        async def cmd_ping(msg: Message) -> None:
+            await msg.answer(
+                f"🏓 pong (chat_id=<code>{msg.chat.id}</code>)\n"
+                f"Если бот ответил — long-polling работает."
+            )
+
+        @dp.message(Command("version"))
+        async def cmd_version(msg: Message) -> None:
+            owner = self._settings.telegram_chat_id
+            owner_text = (
+                "<i>не задан в .env</i>" if owner is None else f"<code>{owner}</code>"
+            )
+            your_text = f"<code>{msg.chat.id}</code>"
+            access = "✅ ты владелец" if self._is_owner(msg) else (
+                "❌ ты НЕ владелец — команды кроме /start, /ping, /version, /whoami "
+                "проигнорирую"
+            )
+            await msg.answer(
+                f"🤖 NS↔FunPay Bridge\n"
+                f"real_actions: <b>{self._settings.enable_real_actions}</b>\n"
+                f"timezone: <b>{self._settings.timezone}</b>\n"
+                f"TELEGRAM_CHAT_ID: {owner_text}\n"
+                f"твой chat_id: {your_text}\n"
+                f"{access}"
+            )
+
         @dp.message(Command("help"))
         async def cmd_help(msg: Message) -> None:
             if not self._is_owner(msg):
+                await msg.answer(
+                    "Я отвечаю на команды только своему владельцу.\n"
+                    f"Твой chat_id: <code>{msg.chat.id}</code>. "
+                    f"Чтобы стать владельцем — впиши его в .env как "
+                    f"<code>TELEGRAM_CHAT_ID</code> и перезапусти сервис.\n\n"
+                    "Команды без авторизации: /ping, /version, /whoami, /start."
+                )
                 return
             await msg.answer(self.HELP_TEXT)
 
