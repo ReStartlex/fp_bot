@@ -68,14 +68,26 @@ if [[ -n "${PRESERVE_DATA}" ]]; then
 fi
 
 # Записываем BUILD_INFO для /version и update.sh. Тянем последний коммит
-# main через gh-proxy (тарбол сам по себе SHA не содержит). Если запрос
-# упал — оставляем то, что лежало до этого.
-COMMITS_URL="${GH_PROXY}/https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/commits/${BRANCH}"
-if BUILD_JSON=$(curl -fsSL --max-time 30 "${COMMITS_URL}" 2>/dev/null); then
-    SHA=$(echo "${BUILD_JSON}" | grep -o '"sha":[[:space:]]*"[a-f0-9]\{40\}"' | head -n1 | grep -o '[a-f0-9]\{40\}')
-    DATE=$(echo "${BUILD_JSON}" | grep -o '"date":[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*"date":[[:space:]]*"\([^"]*\)".*/\1/')
-    SUBJECT=$(echo "${BUILD_JSON}" | grep -o '"message":[[:space:]]*"[^"]*"' | head -n1 | sed 's/.*"message":[[:space:]]*"\([^"]*\)".*/\1/' | head -c 160)
-    if [[ -n "${SHA}" ]]; then
+# main через gh-proxy (тарбол сам по себе SHA не содержит). Парсим JSON
+# через python3 (он всегда есть на VPS), потому что grep на бинарных
+# полях msg/title капризничает с многострочными значениями и юникодом.
+COMMITS_URL="${GH_PROXY}/https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/commits/${BRANCH}?nocache=$(date +%s)"
+if BUILD_JSON=$(curl -fsSL --max-time 30 "${COMMITS_URL}" 2>&1); then
+    PARSED=$(printf '%s' "${BUILD_JSON}" | python3 - <<'PY' 2>&1
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception as e:
+    sys.stderr.write(f"json error: {e}\n")
+    sys.exit(1)
+sha = data.get("sha", "")
+date = (data.get("commit") or {}).get("author", {}).get("date", "")
+msg = ((data.get("commit") or {}).get("message") or "").splitlines()[0][:160]
+print(f"{sha}|{date}|{msg}")
+PY
+    ) || PARSED=""
+    IFS='|' read -r SHA DATE SUBJECT <<< "${PARSED}"
+    if [[ -n "${SHA}" && "${SHA}" != *"error"* && "${SHA}" != *"Traceback"* ]]; then
         {
             echo "sha=${SHA}"
             echo "branch=${BRANCH}"
@@ -84,7 +96,12 @@ if BUILD_JSON=$(curl -fsSL --max-time 30 "${COMMITS_URL}" 2>/dev/null); then
             echo "fetched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         } > "${APP_DIR}/BUILD_INFO"
         echo "    BUILD_INFO: ${SHA:0:12}  ${DATE}  ${SUBJECT}"
+    else
+        echo "    WARN: BUILD_INFO не записан. Ответ python3: ${PARSED:0:200}"
+        echo "    WARN: первые 200 байт ответа GitHub: ${BUILD_JSON:0:200}"
     fi
+else
+    echo "    WARN: BUILD_INFO не записан (curl к api.github.com упал): ${BUILD_JSON:0:200}"
 fi
 
 echo "    Готово через gh-proxy."
