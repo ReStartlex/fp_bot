@@ -278,8 +278,62 @@ class FunPayClient:
         return await self._to_thread(_get)
 
     async def get_lot_fields(self, lot_id: int) -> Any:
-        """Поля лота для редактирования (LotFields)."""
-        return await self._to_thread(self.account.get_lot_fields, lot_id)
+        """
+        Поля лота для редактирования (LotFields).
+
+        Распространённая ошибка — `Expecting value: line 1 column 1 (char 0)`:
+        это значит, что FunPay вместо JSON отдал HTML страницы логина
+        (PHPSESSID протух или golden_key больше не валиден).
+        Делаем один reconnect и пробуем снова.
+        """
+        try:
+            return await self._to_thread(self.account.get_lot_fields, lot_id)
+        except Exception as exc:
+            if not self._looks_like_session_expired(exc):
+                raise
+            logger.warning(
+                f"FunPay get_lot_fields({lot_id}) упал ({type(exc).__name__}: "
+                f"{exc}). Похоже, сессия протухла — пробую переподключиться."
+            )
+            try:
+                await self.connect()
+            except Exception as exc2:
+                logger.error(
+                    f"FunPay reconnect упал: {exc2}. Обнови FUNPAY_GOLDEN_KEY "
+                    f"и FUNPAY_PHPSESSID в .env и перезапусти сервис."
+                )
+                raise
+            try:
+                return await self._to_thread(self.account.get_lot_fields, lot_id)
+            except Exception as exc3:
+                logger.error(
+                    f"FunPay get_lot_fields({lot_id}) и после reconnect упал: "
+                    f"{type(exc3).__name__}: {exc3}. Чаще всего это означает, "
+                    f"что протух FUNPAY_PHPSESSID. Обнови его в .env (см. "
+                    f"deploy/README.md → 'Где взять PHPSESSID') и "
+                    f"перезапусти сервис."
+                )
+                raise
+
+    @staticmethod
+    def _looks_like_session_expired(exc: BaseException) -> bool:
+        """
+        Эвристика: какое из исключений похоже на «сессия FunPay протухла».
+        FunPayAPI пытается парсить ответ как JSON, и если получает HTML
+        страницы логина — кидает json.decoder.JSONDecodeError или
+        ValueError с сообщением «Expecting value: line 1 column 1 (char 0)».
+        """
+        import json as _json
+        if isinstance(exc, _json.JSONDecodeError):
+            return True
+        text = str(exc).lower()
+        return any(p in text for p in (
+            "expecting value: line 1 column 1",
+            "expecting value: line 1",
+            "unauthorized",
+            "401",
+            "403",
+        ))
 
     async def get_lot_summary(self, lot_id: int) -> dict[str, Any]:
         """

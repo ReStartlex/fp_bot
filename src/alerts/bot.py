@@ -177,6 +177,7 @@ class TelegramBot:
         "/setdefault premium &lt;%|default&gt; — премия к курсу USD\n"
         "/setdefault stockcap &lt;N|default&gt; — лимит остатков на FunPay\n"
         "/force_sync &lt;funpay_lot_id&gt; — диагностика одного лота\n"
+        "/funpay_check — проверить FunPay-сессию (cookies)\n"
         "\n"
         "<b>Сервисные</b>\n"
         "/ping — проверка связи\n"
@@ -283,6 +284,7 @@ class TelegramBot:
             BotCommand(command="setdefault", description="🎚 Глобальные настройки (markup/premium/stock)"),
             BotCommand(command="settings", description="🔧 Показать текущие настройки"),
             BotCommand(command="force_sync", description="🔬 Прогнать один лот с деталями"),
+            BotCommand(command="funpay_check", description="🩺 Проверить FunPay-сессию"),
             BotCommand(command="funpay_reconnect", description="🔌 FunPay reconnect"),
             BotCommand(command="ping", description="🏓 Проверка связи"),
             BotCommand(command="help", description="❓ Помощь"),
@@ -479,6 +481,12 @@ class TelegramBot:
             if not self._is_owner(msg):
                 return
             await self._do_force_sync(msg)
+
+        @dp.message(Command("funpay_check"))
+        async def cmd_funpay_check(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_funpay_check(msg)
 
         @dp.message(Command("clear_target"))
         async def cmd_clear_target(msg: Message) -> None:
@@ -2178,6 +2186,117 @@ class TelegramBot:
             + f"\n\n<b>Режим:</b> {mode}\n{applied_line}"
         )
         await msg.answer(text, reply_markup=ui.single_close_kb())
+
+    @_guard
+    async def _do_funpay_check(self, msg: Message) -> None:
+        """
+        Диагностика FunPay-сессии: проверяет 3 уровня — golden_key,
+        список лотов и админку одного лота. Подсказывает, что починить.
+        """
+        if self._funpay_client is None:
+            await msg.answer(
+                "❌ FunPay-клиент не подключён в этот процесс.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        await msg.answer("🩺 Проверяю FunPay-сессию...", reply_markup=None)
+
+        lines: list[str] = ["🩺 <b>Диагностика FunPay-сессии</b>", ""]
+        all_ok = True
+
+        try:
+            acc_id = self._funpay_client.account_id
+            uname = self._funpay_client.username
+            if acc_id and uname:
+                lines.append(
+                    f"1️⃣ golden_key: ✅ id=<code>{acc_id}</code>, "
+                    f"<code>{uname}</code>"
+                )
+            else:
+                lines.append(
+                    "1️⃣ golden_key: ⚠ account.id или username пустые — "
+                    "<b>обнови FUNPAY_GOLDEN_KEY в .env</b>."
+                )
+                all_ok = False
+        except Exception as exc:
+            lines.append(
+                f"1️⃣ golden_key: ❌ <code>{html.escape(str(exc))[:120]}</code>"
+            )
+            all_ok = False
+
+        any_lot_id: int | None = None
+        try:
+            lots = await asyncio.wait_for(
+                self._funpay_client.get_my_lots(), timeout=FP_TIMEOUT_SECONDS,
+            )
+            if lots:
+                lines.append(f"2️⃣ get_my_lots: ✅ найдено лотов: <b>{len(lots)}</b>")
+                first = lots[0]
+                for attr in ("id", "lot_id"):
+                    v = getattr(first, attr, None)
+                    if v is not None:
+                        try:
+                            any_lot_id = int(v)
+                            break
+                        except (TypeError, ValueError):
+                            continue
+            else:
+                lines.append(
+                    "2️⃣ get_my_lots: ⚠ <b>пусто</b>. Возможно, лоты не "
+                    "опубликованы или сессия неполная."
+                )
+                all_ok = False
+        except Exception as exc:
+            lines.append(
+                f"2️⃣ get_my_lots: ❌ <code>{html.escape(str(exc))[:180]}</code>"
+            )
+            all_ok = False
+
+        if any_lot_id is not None:
+            try:
+                fields = await asyncio.wait_for(
+                    self._funpay_client.get_lot_fields(any_lot_id),
+                    timeout=FP_TIMEOUT_SECONDS,
+                )
+                price_attr = getattr(fields, "price", None)
+                lines.append(
+                    f"3️⃣ get_lot_fields(<code>{any_lot_id}</code>): ✅ "
+                    f"price={price_attr}"
+                )
+            except Exception as exc:
+                text = str(exc)
+                hint = ""
+                if "expecting value" in text.lower():
+                    hint = (
+                        "\n     <b>→ Это и есть та самая ошибка.</b> "
+                        "PHPSESSID протух или не совпадает с golden_key.\n"
+                        "     Открой funpay.com в браузере (там, где ты "
+                        "вошёл), достань свежий PHPSESSID и golden_key из "
+                        "cookies, замени в <code>/opt/funpay-ns-bot/.env</code>, "
+                        "потом <code>systemctl restart funpay-ns-bot</code>."
+                    )
+                lines.append(
+                    f"3️⃣ get_lot_fields(<code>{any_lot_id}</code>): ❌ "
+                    f"<code>{html.escape(text)[:180]}</code>{hint}"
+                )
+                all_ok = False
+        else:
+            lines.append(
+                "3️⃣ get_lot_fields: пропустил (нет ни одного lot_id из шага 2)"
+            )
+
+        lines.append("")
+        if all_ok:
+            lines.append(
+                "✅ <b>Всё в порядке</b>. Бот сможет читать и записывать лоты."
+            )
+        else:
+            lines.append(
+                "❗ <b>Найдены проблемы.</b> Пока они не починены, sync не "
+                "сможет обновлять лоты на FunPay (будет только считать цены)."
+            )
+        await msg.answer("\n".join(lines), reply_markup=ui.single_close_kb())
 
     @_guard
     async def _do_inspect_lot(self, msg: Message) -> None:

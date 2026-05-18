@@ -91,6 +91,14 @@ async def _decide_for_one(
     try:
         lot_fields = await funpay_client.get_lot_fields(mapping.funpay_lot_id)
     except Exception as exc:
+        text = str(exc)
+        # Подсказка по самой частой проблеме
+        hint = ""
+        if "expecting value" in text.lower():
+            hint = (
+                " (вероятно протух FUNPAY_PHPSESSID — обнови в .env и "
+                "перезапусти сервис)"
+            )
         return LotSyncDecision(
             funpay_lot_id=mapping.funpay_lot_id,
             ns_service_id=mapping.ns_service_id,
@@ -101,7 +109,7 @@ async def _decide_for_one(
             will_update_stock=False,
             will_activate=False,
             will_deactivate=False,
-            skip_reason=f"FunPay get_lot_fields упал: {exc}",
+            skip_reason=f"FunPay get_lot_fields упал: {exc}{hint}",
         )
 
     current_price = _extract_price(lot_fields)
