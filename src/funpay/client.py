@@ -56,6 +56,7 @@ class FunPayClient:
     _patch_installed: bool = False
     _patched_golden_key: str | None = None
     _patched_phpsessid: str | None = None
+    _first_request_logged: bool = False
 
     @classmethod
     def _install_global_funpay_cookie_patch(cls) -> None:
@@ -86,15 +87,52 @@ class FunPayClient:
                 target_funpay = False
 
             if target_funpay and (cls._patched_golden_key or cls._patched_phpsessid):
-                # 1. через kwargs['cookies'] — самый чистый способ
-                kw_cookies = kwargs.get("cookies") or {}
-                if isinstance(kw_cookies, dict):
+                # 1. headers["Cookie"] — САМЫЙ важный путь.
+                # FunPayAPI в установленной версии формирует Cookie вручную
+                # и кладёт его в headers={"Cookie": "golden_key=..."}.
+                # Когда у requests есть и cookies=, и headers["Cookie"] —
+                # она использует headers. Поэтому если просто положить
+                # PHPSESSID в kwargs["cookies"], он будет проигнорирован.
+                # Решение: распарсить существующий Cookie-header,
+                # дописать/перезаписать нужные ключи, склеить обратно.
+                headers = kwargs.get("headers")
+                if headers is None:
+                    headers = {}
+                elif not isinstance(headers, dict):
+                    headers = dict(headers)
+                # case-insensitive поиск Cookie
+                cookie_key = next(
+                    (k for k in headers if k.lower() == "cookie"), "Cookie"
+                )
+                existing_cookie = headers.get(cookie_key, "") or ""
+                parts: dict[str, str] = {}
+                for piece in existing_cookie.split(";"):
+                    piece = piece.strip()
+                    if not piece or "=" not in piece:
+                        continue
+                    k, _, v = piece.partition("=")
+                    parts[k.strip()] = v.strip()
+                if cls._patched_golden_key:
+                    parts["golden_key"] = cls._patched_golden_key
+                if cls._patched_phpsessid:
+                    parts["PHPSESSID"] = cls._patched_phpsessid
+                headers[cookie_key] = "; ".join(
+                    f"{k}={v}" for k, v in parts.items()
+                )
+                kwargs["headers"] = headers
+
+                # 2. kwargs["cookies"] — дублируем (на случай, если форк
+                # библиотеки переключился на cookies kwarg).
+                kw_cookies = kwargs.get("cookies")
+                if isinstance(kw_cookies, dict) or kw_cookies is None:
+                    kw_cookies = dict(kw_cookies or {})
                     if cls._patched_golden_key:
                         kw_cookies.setdefault("golden_key", cls._patched_golden_key)
                     if cls._patched_phpsessid:
                         kw_cookies.setdefault("PHPSESSID", cls._patched_phpsessid)
                     kwargs["cookies"] = kw_cookies
-                # 2. дополнительно — в самой сессии (на случай GET без cookies kwarg)
+
+                # 3. self.cookies — на случай нескольких запросов в одной Session
                 try:
                     if cls._patched_golden_key:
                         self.cookies.set(
@@ -108,6 +146,20 @@ class FunPayClient:
                         )
                 except Exception:
                     pass
+
+                # 4. диагностика — один раз залогируем первый запрос,
+                # чтобы можно было убедиться, что PHPSESSID реально ушёл.
+                if not cls._first_request_logged:
+                    cls._first_request_logged = True
+                    masked = headers[cookie_key]
+                    # маскируем значения, оставляем только имена и длину
+                    masked_summary = "; ".join(
+                        f"{k}=<{len(v)} chars>" for k, v in parts.items()
+                    )
+                    logger.info(
+                        f"FunPay HTTP patch: первый запрос к {url} — "
+                        f"Cookie header содержит [{masked_summary}]"
+                    )
 
             return original_request(self, method, url, **kwargs)
 
