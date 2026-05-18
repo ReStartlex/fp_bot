@@ -177,6 +177,11 @@ python -m pytest tests/ -q
 /reset_markups       обнулить все индивидуальные наценки (использовать global)
 /clear_target        сбросить выбранный целевой лот
 
+/settings            показать активные runtime-настройки
+/setdefault markup <%|default>    глобальная наценка без рестарта
+/setdefault premium <%|default>   премия к курсу USD
+/setdefault stockcap <N|default>  лимит остатков на FunPay
+
 /ping               проверка long-polling (отвечает всем)
 /version            версия + chat_id + статус владения
 /whoami             свой chat_id

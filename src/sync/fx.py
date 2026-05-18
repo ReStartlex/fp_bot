@@ -56,21 +56,24 @@ async def _fetch_cbr_rate() -> float:
         return float(data["Valute"]["USD"]["Value"])
 
 
-def _apply_premium(base: float, settings: Settings) -> float:
-    """База + premium → эффективный курс."""
-    if settings.usd_rub_rate_mode == RateMode.MANUAL:
+def _apply_premium(base: float, mode: RateMode, premium_percent: float) -> float:
+    """База + premium → эффективный курс. В MANUAL premium игнорируется."""
+    if mode == RateMode.MANUAL:
         return base
-    return base * (1.0 + settings.usd_rub_premium_percent / 100.0)
+    return base * (1.0 + premium_percent / 100.0)
 
 
 async def get_rate_breakdown(settings: Settings | None = None) -> RateBreakdown:
     """
     Получить детализированный курс: базовый + premium + эффективный.
-    Используется в /calc и логах для прозрачности.
+    Премия читается с учётом runtime-оверрайда из БД.
     """
     settings = settings or get_settings()
+    # Лениво подтягиваем premium из runtime-override; fallback на .env
+    from src.config_runtime import get_premium_percent
+
     premium = (
-        settings.usd_rub_premium_percent
+        await get_premium_percent(settings)
         if settings.usd_rub_rate_mode == RateMode.AUTO
         else 0.0
     )
@@ -90,13 +93,14 @@ async def get_rate_breakdown(settings: Settings | None = None) -> RateBreakdown:
         base = _cache[1]
         return RateBreakdown(
             base=base, premium_percent=premium,
-            effective=_apply_premium(base, settings), source="cache_mem",
+            effective=_apply_premium(base, settings.usd_rub_rate_mode, premium),
+            source="cache_mem",
         )
 
     try:
         base = await _fetch_cbr_rate()
         _cache = (now, base)
-        effective = _apply_premium(base, settings)
+        effective = _apply_premium(base, settings.usd_rub_rate_mode, premium)
         logger.info(
             f"USD/RUB ЦБ={base:.4f}, +{premium:.1f}% = "
             f"{effective:.4f} (эффективный)"
@@ -119,7 +123,8 @@ async def get_rate_breakdown(settings: Settings | None = None) -> RateBreakdown:
         base = _cache[1]
         return RateBreakdown(
             base=base, premium_percent=premium,
-            effective=_apply_premium(base, settings), source="cache_mem",
+            effective=_apply_premium(base, settings.usd_rub_rate_mode, premium),
+            source="cache_mem",
         )
 
     try:
@@ -129,7 +134,9 @@ async def get_rate_breakdown(settings: Settings | None = None) -> RateBreakdown:
                 logger.info(f"Беру кэш из БД: USD/RUB={db_rate.rate:.4f}")
                 return RateBreakdown(
                     base=db_rate.rate, premium_percent=premium,
-                    effective=_apply_premium(db_rate.rate, settings),
+                    effective=_apply_premium(
+                        db_rate.rate, settings.usd_rub_rate_mode, premium
+                    ),
                     source="cache_db",
                 )
     except Exception as exc:
@@ -138,7 +145,9 @@ async def get_rate_breakdown(settings: Settings | None = None) -> RateBreakdown:
     logger.warning(f"Использую fallback курс из .env: USD/RUB={settings.usd_rub_rate}")
     return RateBreakdown(
         base=settings.usd_rub_rate, premium_percent=premium,
-        effective=_apply_premium(settings.usd_rub_rate, settings),
+        effective=_apply_premium(
+            settings.usd_rub_rate, settings.usd_rub_rate_mode, premium
+        ),
         source="fallback",
     )
 

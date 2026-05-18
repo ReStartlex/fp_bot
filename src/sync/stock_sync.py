@@ -20,6 +20,7 @@ from typing import Any
 from loguru import logger
 
 from src.config import Settings, get_settings
+from src.config_runtime import get_global_markup_percent, get_stock_cap
 from src.db.repo import finish_sync_run, list_mappings, start_sync_run
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
@@ -58,6 +59,9 @@ async def _decide_for_one(
     settings: Settings,
     fx_rate: float,
     funpay_client: FunPayClient,
+    *,
+    effective_markup: float | None = None,
+    effective_stock_cap: int | None = None,
 ) -> LotSyncDecision | None:
     """Решить что делать с конкретным лотом."""
     if ns_service is None:
@@ -79,6 +83,8 @@ async def _decide_for_one(
         mapping=mapping,
         settings=settings,
         fx_rate_usd_to_target=fx_rate,
+        default_markup=effective_markup,
+        default_stock_cap=effective_stock_cap,
     )
 
     # Читаем текущее состояние лота на FunPay
@@ -267,13 +273,21 @@ async def sync_once(
         stock = await ns_client.get_stock()
         services_index = _flatten_services(stock)
         fx_rate = await get_usd_rub_rate(settings)
-        logger.info(f"Sync: маппингов {len(mappings)}, USD/RUB {fx_rate:.4f}")
+        effective_markup = await get_global_markup_percent(settings)
+        effective_stock_cap = await get_stock_cap(settings)
+        logger.info(
+            f"Sync: маппингов {len(mappings)}, USD/RUB {fx_rate:.4f}, "
+            f"markup default {effective_markup:.2f}%, "
+            f"stock_cap default {effective_stock_cap}"
+        )
 
         decisions: list[LotSyncDecision] = []
         for mapping in mappings:
             ns_service = services_index.get(mapping.ns_service_id)
             decision = await _decide_for_one(
-                ns_service, mapping, settings, fx_rate, funpay_client
+                ns_service, mapping, settings, fx_rate, funpay_client,
+                effective_markup=effective_markup,
+                effective_stock_cap=effective_stock_cap,
             )
             if decision is not None:
                 decisions.append(decision)

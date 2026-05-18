@@ -75,6 +75,26 @@ class ChatState(Base):
     help_requests_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
+class RuntimeSetting(Base):
+    """
+    Runtime-override для глобальных параметров. Если ключ есть в этой
+    таблице — берётся он, иначе fallback к Settings (из .env).
+    Хранится как строка, парсится на стороне читателя.
+
+    Ключи в использовании:
+        global_markup_percent
+        usd_rub_premium_percent
+        funpay_stock_cap
+    """
+    __tablename__ = "runtime_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[str] = mapped_column(String(255), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class KnownLot(Base):
     """
     FunPay-лоты, которые мы уже видели у нашего аккаунта. Сравнивая

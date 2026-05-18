@@ -38,15 +38,32 @@ def compute_pricing(
     mapping: Mapping,
     settings: Settings,
     fx_rate_usd_to_target: float,
+    default_markup: float | None = None,
+    default_stock_cap: int | None = None,
 ) -> PricingResult:
     """
     Рассчитать что нужно выставить на FunPay для данного NS service + mapping.
 
-    - markup берётся из mapping (если задан) или глобальный из settings
-    - stock_cap из mapping (если задан) или глобальный
+    Приоритет наценки:
+        1) mapping.markup_percent (если не NULL — явная индивидуальная)
+        2) default_markup (runtime override, переданный сверху)
+        3) settings.markup_percent (из .env)
+
+    То же самое для stock_cap.
     """
-    markup = mapping.markup_percent if mapping.markup_percent is not None else settings.markup_percent
-    stock_cap = mapping.stock_cap if mapping.stock_cap is not None else settings.funpay_stock_cap
+    if mapping.markup_percent is not None:
+        markup = mapping.markup_percent
+    elif default_markup is not None:
+        markup = default_markup
+    else:
+        markup = settings.markup_percent
+
+    if mapping.stock_cap is not None:
+        stock_cap = mapping.stock_cap
+    elif default_stock_cap is not None:
+        stock_cap = default_stock_cap
+    else:
+        stock_cap = settings.funpay_stock_cap
 
     ns_price = ns_service.price  # USD
     # Конверсия + наценка

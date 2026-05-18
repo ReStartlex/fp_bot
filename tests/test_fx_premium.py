@@ -24,19 +24,16 @@ def _settings(*, mode: RateMode, premium: float, manual: float = 90.0) -> Settin
 
 
 def test_apply_premium_auto_mode_adds_percent():
-    s = _settings(mode=RateMode.AUTO, premium=2.0)
-    assert _apply_premium(100.0, s) == pytest.approx(102.0)
+    assert _apply_premium(100.0, RateMode.AUTO, 2.0) == pytest.approx(102.0)
 
 
 def test_apply_premium_zero_premium_keeps_base():
-    s = _settings(mode=RateMode.AUTO, premium=0.0)
-    assert _apply_premium(100.0, s) == pytest.approx(100.0)
+    assert _apply_premium(100.0, RateMode.AUTO, 0.0) == pytest.approx(100.0)
 
 
 def test_apply_premium_manual_mode_ignores_premium():
     """В manual-режиме оператор сам выставил итоговый курс — премия не нужна."""
-    s = _settings(mode=RateMode.MANUAL, premium=5.0)
-    assert _apply_premium(100.0, s) == pytest.approx(100.0)
+    assert _apply_premium(100.0, RateMode.MANUAL, 5.0) == pytest.approx(100.0)
 
 
 def test_rate_breakdown_dataclass_has_premium_flag():
@@ -46,8 +43,17 @@ def test_rate_breakdown_dataclass_has_premium_flag():
     assert no_prem.has_premium is False
 
 
+def _patch_premium(monkeypatch, value: float) -> None:
+    """Подменить runtime-чтение premium (которое лезет в БД)."""
+    async def fake_premium(settings=None):
+        return value
+    import src.config_runtime as cr
+    monkeypatch.setattr(cr, "get_premium_percent", fake_premium)
+
+
 @pytest.mark.asyncio
-async def test_get_rate_breakdown_manual_mode_returns_user_rate():
+async def test_get_rate_breakdown_manual_mode_returns_user_rate(monkeypatch):
+    _patch_premium(monkeypatch, 0.0)  # в MANUAL не должно использоваться, но на всякий
     s = _settings(mode=RateMode.MANUAL, premium=49.0, manual=85.0)
     rb = await get_rate_breakdown(s)
     assert rb.source == "manual"
@@ -59,8 +65,8 @@ async def test_get_rate_breakdown_manual_mode_returns_user_rate():
 @pytest.mark.asyncio
 async def test_get_rate_breakdown_auto_uses_premium(monkeypatch):
     """При успешном fetch from CBR — premium прибавляется."""
+    _patch_premium(monkeypatch, 2.0)
     s = _settings(mode=RateMode.AUTO, premium=2.0)
-    # сбрасываем module-level cache
     monkeypatch.setattr(fx, "_cache", None)
 
     async def fake_fetch():
@@ -68,7 +74,6 @@ async def test_get_rate_breakdown_auto_uses_premium(monkeypatch):
 
     monkeypatch.setattr(fx, "_fetch_cbr_rate", fake_fetch)
 
-    # Подменяем session_factory, чтобы не дёргать БД
     class _NullCtx:
         async def __aenter__(self): return self
         async def __aexit__(self, *a): return None
@@ -86,6 +91,7 @@ async def test_get_rate_breakdown_auto_uses_premium(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_rate_breakdown_uses_cache_on_second_call(monkeypatch):
+    _patch_premium(monkeypatch, 2.0)
     s = _settings(mode=RateMode.AUTO, premium=2.0)
     monkeypatch.setattr(fx, "_cache", (time.time(), 70.0))
 
@@ -93,6 +99,21 @@ async def test_get_rate_breakdown_uses_cache_on_second_call(monkeypatch):
     assert rb.source == "cache_mem"
     assert rb.base == pytest.approx(70.0)
     assert rb.effective == pytest.approx(70.0 * 1.02)
+
+
+@pytest.mark.asyncio
+async def test_get_rate_breakdown_runtime_override_used(monkeypatch):
+    """
+    Главное свойство runtime-override: даже если в .env premium=2%,
+    но в БД лежит 4% — берём 4%.
+    """
+    _patch_premium(monkeypatch, 4.0)  # эмулируем override в БД
+    s = _settings(mode=RateMode.AUTO, premium=2.0)
+    monkeypatch.setattr(fx, "_cache", (time.time(), 100.0))
+
+    rb = await get_rate_breakdown(s)
+    assert rb.premium_percent == pytest.approx(4.0)
+    assert rb.effective == pytest.approx(104.0)
 
 
 async def _async_noop(*args, **kwargs):

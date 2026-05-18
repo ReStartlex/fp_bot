@@ -156,9 +156,16 @@ class TelegramBot:
         "/map &lt;funpay_lot_id&gt; &lt;ns_service_id&gt; [markup%] [label]\n"
         "/unmap &lt;funpay_lot_id&gt;\n"
         "/setmarkup &lt;funpay_lot_id&gt; &lt;percent|default&gt;\n"
+        "/reset_markups — обнулить индивидуальные наценки\n"
         "/clear_target — забыть выбранный целевой лот\n"
         "/calc &lt;funpay_lot_id&gt; — посчитать цены по маппингу\n"
         "/inspect_lot &lt;funpay_lot_id&gt; — заглянуть в LotFields\n"
+        "\n"
+        "<b>Глобальные настройки (без рестарта)</b>\n"
+        "/settings — показать активные значения\n"
+        "/setdefault markup &lt;%|default&gt; — глобальная наценка\n"
+        "/setdefault premium &lt;%|default&gt; — премия к курсу USD\n"
+        "/setdefault stockcap &lt;N|default&gt; — лимит остатков на FunPay\n"
         "\n"
         "<b>Сервисные</b>\n"
         "/ping — проверка связи\n"
@@ -260,8 +267,10 @@ class TelegramBot:
             BotCommand(command="ns_search", description="🔍 Поиск NS"),
             BotCommand(command="sync", description="🔄 Синхронизация"),
             BotCommand(command="orders", description="📦 Последние заказы"),
-            BotCommand(command="setmarkup", description="✏ Изменить наценку"),
+            BotCommand(command="setmarkup", description="✏ Наценка одного маппинга"),
             BotCommand(command="reset_markups", description="♻ Сбросить наценку у всех маппингов"),
+            BotCommand(command="setdefault", description="🎚 Глобальные настройки (markup/premium/stock)"),
+            BotCommand(command="settings", description="🔧 Показать текущие настройки"),
             BotCommand(command="funpay_reconnect", description="🔌 FunPay reconnect"),
             BotCommand(command="ping", description="🏓 Проверка связи"),
             BotCommand(command="help", description="❓ Помощь"),
@@ -441,6 +450,18 @@ class TelegramBot:
                 return
             await self._do_reset_markups(msg)
 
+        @dp.message(Command("setdefault"))
+        async def cmd_setdefault(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_setdefault(msg)
+
+        @dp.message(Command("settings"))
+        async def cmd_settings(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_show_settings(msg)
+
         @dp.message(Command("clear_target"))
         async def cmd_clear_target(msg: Message) -> None:
             if not self._is_owner(msg):
@@ -512,6 +533,13 @@ class TelegramBot:
                 await cq.answer()
                 return
             await self._on_newlot_click(cq)
+
+        @dp.callback_query(F.data.startswith("settings:"))
+        async def cb_settings(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await self._on_settings_click(cq)
 
     # ─────────────── общие хелперы ───────────────
 
@@ -1449,11 +1477,16 @@ class TelegramBot:
             )
 
         rate = await get_rate_breakdown(self._settings)
+        from src.config_runtime import get_global_markup_percent, get_stock_cap
+        eff_markup = await get_global_markup_percent(self._settings)
+        eff_stock_cap = await get_stock_cap(self._settings)
         pricing = compute_pricing(
             ns_service=svc,
             mapping=mapping,
             settings=self._settings,
             fx_rate_usd_to_target=rate.effective,
+            default_markup=eff_markup,
+            default_stock_cap=eff_stock_cap,
         )
         current_seller: float | None = None
         if self._funpay_client is not None:
@@ -1483,18 +1516,26 @@ class TelegramBot:
         else:
             rate_line = f"Курс USD→{cur}: <b>{rate.effective:.4f}</b>\n"
 
-        # Источник наценки: из маппинга или глобальная
+        # Источник наценки
         if mapping.markup_percent is not None:
             markup_source = (
                 f"<b>{pricing.markup_percent}%</b> "
                 f"(зашита в маппинге, глобально сейчас "
-                f"{self._settings.markup_percent}%)"
+                f"{eff_markup:.2f}%)"
             )
         else:
-            markup_source = (
-                f"<b>{pricing.markup_percent}%</b> "
-                f"(глобально из <code>MARKUP_PERCENT</code>)"
-            )
+            env_default = self._settings.markup_percent
+            if abs(eff_markup - env_default) > 1e-9:
+                markup_source = (
+                    f"<b>{pricing.markup_percent}%</b> "
+                    f"(глобально, runtime-override "
+                    f"<code>/setdefault markup</code>; в .env {env_default}%)"
+                )
+            else:
+                markup_source = (
+                    f"<b>{pricing.markup_percent}%</b> "
+                    f"(глобально из <code>MARKUP_PERCENT</code>)"
+                )
 
         text = (
             f"📊 <b>Расчёт цены для лота {funpay_lot_id}</b>\n\n"
@@ -1627,6 +1668,62 @@ class TelegramBot:
 
         await cq.answer(f"Неизвестное newlot-действие: {action}", show_alert=True)
 
+    async def _on_settings_click(self, cq: CallbackQuery) -> None:
+        """
+        settings:<param>:<delta>
+            settings:markup:+0.5  →  бамп текущего эффективного markup на +0.5%
+            settings:premium:-1   →  ...
+        """
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            await cq.answer("Некорректный callback", show_alert=True)
+            return
+        param = parts[1]
+        try:
+            delta = float(parts[2].replace(",", "."))
+        except ValueError:
+            await cq.answer("Некорректное число", show_alert=True)
+            return
+
+        from src.config_runtime import (
+            get_global_markup_percent,
+            get_premium_percent,
+            set_global_markup_percent,
+            set_premium_percent,
+        )
+        try:
+            if param == "markup":
+                cur = await get_global_markup_percent(self._settings)
+                new_val = round(cur + delta, 4)
+                await set_global_markup_percent(new_val)
+                await cq.answer(
+                    f"Markup: {cur:.2f}% → {new_val:.2f}%", show_alert=False
+                )
+            elif param == "premium":
+                cur = await get_premium_percent(self._settings)
+                new_val = round(cur + delta, 4)
+                await set_premium_percent(new_val)
+                await cq.answer(
+                    f"Premium: {cur:.2f}% → {new_val:.2f}%", show_alert=False
+                )
+            else:
+                await cq.answer(
+                    f"Неизвестный settings-param: {param}", show_alert=True
+                )
+                return
+        except ValueError as exc:
+            await cq.answer(f"Не принято: {exc}", show_alert=True)
+            return
+
+        # Перерисуем то же сообщение свежими настройками
+        if cq.message is not None:
+            try:
+                await self._do_show_settings(cq.message)  # type: ignore[arg-type]
+                with suppress_telegram():
+                    await cq.message.delete()
+            except Exception:
+                pass
+
     @_guard
     async def _do_setmarkup(self, msg: Message) -> None:
         """
@@ -1697,19 +1794,178 @@ class TelegramBot:
             if affected > 0:
                 await session.commit()
 
+        from src.config_runtime import get_global_markup_percent
+        eff = await get_global_markup_percent(self._settings)
         await msg.answer(
             (
                 f"♻ Сброшено наценок: <b>{affected}</b> "
                 f"(из {len(rows)} маппингов).\n"
-                f"Теперь все используют глобальную "
-                f"<b>{self._settings.markup_percent}%</b>.\n\n"
+                f"Теперь все используют глобальную <b>{eff:.2f}%</b>.\n\n"
                 "Запусти 🔄 Синхронизация или /sync, чтобы новые цены применились."
             ) if affected > 0 else (
                 f"Все {len(rows)} маппингов уже используют глобальную "
-                f"наценку <b>{self._settings.markup_percent}%</b> — менять нечего."
+                f"наценку <b>{eff:.2f}%</b> — менять нечего."
             ),
             reply_markup=ui.single_close_kb(),
         )
+
+    @_guard
+    async def _do_setdefault(self, msg: Message) -> None:
+        """
+        /setdefault <markup|premium|stockcap> <value|default>
+
+        Меняет один из глобальных параметров на лету, без перезапуска.
+        Перекрывает соответствующий .env-параметр.
+        """
+        parts = (msg.text or "").strip().split()
+        if len(parts) < 3:
+            await msg.answer(
+                "Использование: <code>/setdefault &lt;param&gt; &lt;value|default&gt;</code>\n\n"
+                "Параметры:\n"
+                "  <b>markup</b> — глобальная наценка, % (0..200)\n"
+                "  <b>premium</b> — премия к курсу USD, % (0..50)\n"
+                "  <b>stockcap</b> — лимит остатков на FunPay (1..100000)\n\n"
+                "Примеры:\n"
+                "<code>/setdefault markup 5</code>\n"
+                "<code>/setdefault premium 2.5</code>\n"
+                "<code>/setdefault stockcap 50</code>\n"
+                "<code>/setdefault markup default</code> — вернуть к .env",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        param = parts[1].lower()
+        raw = parts[2].lower().replace(",", ".").rstrip("%")
+        from src.config_runtime import (
+            set_global_markup_percent,
+            set_premium_percent,
+            set_stock_cap,
+            get_global_markup_percent,
+            get_premium_percent,
+            get_stock_cap,
+        )
+
+        try:
+            if param == "markup":
+                if raw in ("default", "none", "-", ""):
+                    await set_global_markup_percent(None)
+                else:
+                    await set_global_markup_percent(float(raw))
+                eff = await get_global_markup_percent(self._settings)
+                env_v = self._settings.markup_percent
+                shown = (
+                    f"<b>{eff:.2f}%</b> "
+                    + ("(runtime override)" if abs(eff - env_v) > 1e-9 else "(из .env)")
+                )
+                hint = (
+                    "Это default для всех маппингов с markup=NULL. "
+                    "У маппингов с зашитой индивидуальной наценкой ничего не меняется."
+                )
+            elif param == "premium":
+                if raw in ("default", "none", "-", ""):
+                    await set_premium_percent(None)
+                else:
+                    await set_premium_percent(float(raw))
+                eff = await get_premium_percent(self._settings)
+                env_v = self._settings.usd_rub_premium_percent
+                shown = (
+                    f"<b>{eff:.2f}%</b> "
+                    + ("(runtime override)" if abs(eff - env_v) > 1e-9 else "(из .env)")
+                )
+                hint = "Применяется только в режиме AUTO курса USD/RUB."
+            elif param in ("stockcap", "stock_cap", "stock"):
+                if raw in ("default", "none", "-", ""):
+                    await set_stock_cap(None)
+                else:
+                    await set_stock_cap(int(float(raw)))
+                eff = await get_stock_cap(self._settings)
+                env_v = self._settings.funpay_stock_cap
+                shown = (
+                    f"<b>{eff}</b> "
+                    + ("(runtime override)" if eff != env_v else "(из .env)")
+                )
+                hint = "Лимит остатков для маппингов с stock_cap=NULL."
+            else:
+                await msg.answer(
+                    f"Неизвестный параметр «{param}». "
+                    "Доступные: markup, premium, stockcap.",
+                    reply_markup=ui.single_close_kb(),
+                )
+                return
+        except (ValueError, TypeError) as exc:
+            await msg.answer(
+                f"Ошибка валидации: <code>{html.escape(str(exc))}</code>",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        await msg.answer(
+            f"✅ <b>{param}</b> = {shown}\n\n<i>{hint}</i>\n\n"
+            "Применится при следующем sync (~30 c) или нажми 🔄 Синхронизация.",
+            reply_markup=ui.single_close_kb(),
+        )
+
+    @_guard
+    async def _do_show_settings(self, msg: Message) -> None:
+        """Показать активные runtime-настройки и .env-исходники."""
+        from src.config_runtime import (
+            get_global_markup_percent, get_premium_percent, get_stock_cap,
+            get_overrides_snapshot,
+        )
+        eff_markup = await get_global_markup_percent(self._settings)
+        eff_premium = await get_premium_percent(self._settings)
+        eff_stock = await get_stock_cap(self._settings)
+        overrides = await get_overrides_snapshot()
+
+        def src(env_val, override_val):
+            return "<i>override</i>" if override_val is not None else "<i>из .env</i>"
+
+        text = (
+            "🔧 <b>Текущие настройки</b>\n\n"
+            f"📈 Наценка: <b>{eff_markup:.2f}%</b> {src(self._settings.markup_percent, overrides['global_markup_percent'])}\n"
+            f"     в .env: {self._settings.markup_percent}%\n"
+            f"💱 Премия к USD: <b>{eff_premium:.2f}%</b> {src(self._settings.usd_rub_premium_percent, overrides['usd_rub_premium_percent'])}\n"
+            f"     в .env: {self._settings.usd_rub_premium_percent}%\n"
+            f"📦 Лимит остатков: <b>{eff_stock}</b> {src(self._settings.funpay_stock_cap, overrides['funpay_stock_cap'])}\n"
+            f"     в .env: {self._settings.funpay_stock_cap}\n\n"
+            f"⏱ Sync каждые: <b>{self._settings.sync_interval_seconds}с</b>\n"
+            f"🔁 Discovery новых лотов: <b>{self._settings.new_lots_check_interval_seconds}с</b>\n\n"
+            "Меняй на лету:\n"
+            "<code>/setdefault markup 5</code>\n"
+            "<code>/setdefault premium 2.5</code>\n"
+            "<code>/setdefault stockcap 50</code>\n"
+            "<code>/setdefault &lt;param&gt; default</code> — сбросить override"
+        )
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        delta_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📈 −0.5%", callback_data="settings:markup:-0.5"
+                ),
+                InlineKeyboardButton(
+                    text="📈 +0.5%", callback_data="settings:markup:+0.5"
+                ),
+                InlineKeyboardButton(
+                    text="📈 −1%", callback_data="settings:markup:-1"
+                ),
+                InlineKeyboardButton(
+                    text="📈 +1%", callback_data="settings:markup:+1"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💱 −0.5%", callback_data="settings:premium:-0.5"
+                ),
+                InlineKeyboardButton(
+                    text="💱 +0.5%", callback_data="settings:premium:+0.5"
+                ),
+                InlineKeyboardButton(
+                    text="🔄 Sync", callback_data=f"menu:{ui.MENU_KIND_SYNC}"
+                ),
+                InlineKeyboardButton(text="✖ Закрыть", callback_data="close"),
+            ],
+        ])
+        await msg.answer(text, reply_markup=delta_kb)
 
     @_guard
     async def _do_inspect_lot(self, msg: Message) -> None:
