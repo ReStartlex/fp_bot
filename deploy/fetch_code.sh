@@ -83,19 +83,17 @@ fi
 # полях msg/title капризничает с многострочными значениями и юникодом.
 COMMITS_URL="${GH_PROXY}/https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/commits/${BRANCH}?nocache=$(date +%s)"
 if BUILD_JSON=$(curl -fsSL --max-time 30 "${COMMITS_URL}" 2>&1); then
-    PARSED=$(printf '%s' "${BUILD_JSON}" | python3 - <<'PY' 2>&1
-import json, sys
-try:
-    data = json.load(sys.stdin)
-except Exception as e:
-    sys.stderr.write(f"json error: {e}\n")
-    sys.exit(1)
+    # ВАЖНО: НЕ используем heredoc одновременно с pipe — bash отдаст
+    # python3 в stdin одно из двух, и парсер развалится. Передаём JSON
+    # через переменную окружения, а скрипт даём флагом -c.
+    PARSED=$(BUILD_JSON="${BUILD_JSON}" python3 -c '
+import json, os
+data = json.loads(os.environ["BUILD_JSON"])
 sha = data.get("sha", "")
 date = (data.get("commit") or {}).get("author", {}).get("date", "")
 msg = ((data.get("commit") or {}).get("message") or "").splitlines()[0][:160]
 print(f"{sha}|{date}|{msg}")
-PY
-    ) || PARSED=""
+' 2>&1) || PARSED=""
     IFS='|' read -r SHA DATE SUBJECT <<< "${PARSED}"
     if [[ -n "${SHA}" && "${SHA}" != *"error"* && "${SHA}" != *"Traceback"* ]]; then
         {
