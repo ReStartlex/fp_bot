@@ -108,38 +108,75 @@ class FunPayClient:
     @property
     def balance(self) -> Any:
         """
-        В разных версиях FunPayAPI имя поля баланса различается. Пробуем все
-        известные варианты по очереди.
+        Лёгкое свойство для логов на старте. В свежей версии FunPayAPI это
+        просто атрибут `account.balance` (если он есть) — иначе вернёт None.
+        Для боевого получения баланса см. `get_funpay_balance()`.
         """
-        for attr in (
-            "total_balance",
-            "balance",
-            "funds",
-            "wallet",
-            "money",
-            "active_sales",
-        ):
+        for attr in ("total_balance", "balance"):
             value = getattr(self.account, attr, None)
-            if value is None:
+            if value is None or callable(value):
                 continue
-            # Если это сложный объект (например Balance с .total) — пробуем raw value
             if hasattr(value, "total"):
                 return getattr(value, "total")
             if hasattr(value, "rub"):
                 return getattr(value, "rub")
             return value
-        for method in ("get_balance", "get_funds", "get_wallet"):
-            getter = getattr(self.account, method, None)
-            if callable(getter):
-                try:
-                    result = getter()
-                except Exception:
-                    continue
-                if result is not None:
-                    if hasattr(result, "total"):
-                        return getattr(result, "total")
-                    return result
         return None
+
+    async def get_funpay_balance(self, lot_id: int | None = None) -> dict[str, Any]:
+        """
+        Возвращает данные баланса FunPay в виде словаря с привычными полями.
+
+        Account.get_balance(lot_id) в свежей FunPayAPI делает реальный
+        HTTP-запрос на страницу указанного лота и парсит блок баланса оттуда.
+        Если lot_id не задан — пытаемся взять один из своих лотов.
+        """
+
+        def _resolve_lot_id() -> int | None:
+            if lot_id is not None:
+                return lot_id
+            try:
+                profile = self.account.get_user(self.account.id)
+            except Exception:
+                return None
+            try:
+                lots = profile.get_lots() or []
+            except Exception:
+                return None
+            for lot in lots:
+                candidate = getattr(lot, "id", None) or getattr(lot, "lot_id", None)
+                if candidate:
+                    try:
+                        return int(candidate)
+                    except (TypeError, ValueError):
+                        continue
+            return None
+
+        def _call() -> dict[str, Any]:
+            target_lot = _resolve_lot_id()
+            getter = getattr(self.account, "get_balance", None)
+            if not callable(getter):
+                return {"error": "Account.get_balance не существует"}
+            try:
+                if target_lot is None:
+                    bal = getter()
+                else:
+                    bal = getter(target_lot)
+            except Exception as exc:
+                return {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "used_lot_id": target_lot,
+                }
+
+            data: dict[str, Any] = {"used_lot_id": target_lot}
+            for attr in ("total", "available", "currency", "rub", "usd", "eur"):
+                value = getattr(bal, attr, None)
+                if value is not None:
+                    data[attr] = value
+            data["raw_repr"] = repr(bal)
+            return data
+
+        return await self._to_thread(_call)
 
     # ----- Лоты -----
 
@@ -243,6 +280,62 @@ class FunPayClient:
     async def get_lot_fields(self, lot_id: int) -> Any:
         """Поля лота для редактирования (LotFields)."""
         return await self._to_thread(self.account.get_lot_fields, lot_id)
+
+    async def get_lot_summary(self, lot_id: int) -> dict[str, Any]:
+        """
+        Удобный нормализованный взгляд на лот: id, описание, цена продавца,
+        цена клиента, остаток, активность. Делает 2 запроса (LotShortcut + LotFields),
+        чтобы понять обе цены (с комиссией и без).
+        """
+
+        def _collect() -> dict[str, Any]:
+            data: dict[str, Any] = {"lot_id": lot_id}
+            # LotShortcut (видит покупатель) — через мой профиль
+            try:
+                profile = self.account.get_user(self.account.id)
+                for lot in (profile.get_lots() or []):
+                    if int(getattr(lot, "id", -1)) == int(lot_id):
+                        data["client_price"] = getattr(lot, "price", None)
+                        data["description"] = getattr(lot, "description", None)
+                        data["title"] = getattr(lot, "title", None)
+                        data["public_link"] = getattr(lot, "public_link", None)
+                        subcat = getattr(lot, "subcategory", None)
+                        if subcat is not None:
+                            data["subcategory_id"] = getattr(subcat, "id", None)
+                            data["subcategory_name"] = getattr(subcat, "fullname", None) or getattr(
+                                subcat, "name", None
+                            )
+                        break
+            except Exception as exc:
+                data["shortcut_error"] = str(exc)
+
+            # LotFields (то что я редактирую)
+            try:
+                fields = self.account.get_lot_fields(lot_id)
+                for name in (
+                    "price",
+                    "amount",
+                    "active",
+                    "is_active",
+                    "deactivate_after_sale",
+                    "renewal_days",
+                    "stock",
+                ):
+                    value = getattr(fields, name, None)
+                    if value is not None:
+                        data[f"fields.{name}"] = value
+                # Часть атрибутов лежит в .fields как dict
+                inner = getattr(fields, "fields", None)
+                if isinstance(inner, dict):
+                    data["fields.raw"] = {
+                        k: (v[:80] if isinstance(v, str) else v) for k, v in inner.items()
+                    }
+            except Exception as exc:
+                data["fields_error"] = str(exc)
+
+            return data
+
+        return await self._to_thread(_collect)
 
     async def save_lot(self, lot_fields: Any) -> None:
         """Сохранить изменения лота (после правки полей)."""

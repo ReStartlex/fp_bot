@@ -14,15 +14,22 @@ class PricingResult:
     ns_price_usd: float
     fx_rate: float                  # курс USD -> целевая валюта
     markup_percent: float
-    price_target: float             # итоговая цена в валюте FunPay
+    price_target: float             # цена продавца (то что мы получим), в валюте FunPay
     stock: int                      # сколько шт показывать на FunPay
     currency: Currency
+    commission_percent: float = 0.0
+    client_price: float = 0.0       # оценка цены клиента с комиссией FunPay
 
     def round_price(self) -> float:
-        """Округление цены: для RUB до целого, для USD/EUR до .01."""
+        """Округление цены продавца: для RUB до целого, для USD/EUR до .01."""
         if self.currency == Currency.RUB:
             return round(self.price_target)
         return round(self.price_target, 2)
+
+    def round_client_price(self) -> float:
+        if self.currency == Currency.RUB:
+            return round(self.client_price)
+        return round(self.client_price, 2)
 
 
 def compute_pricing(
@@ -52,6 +59,13 @@ def compute_pricing(
 
     stock = max(0, min(ns_service.in_stock, stock_cap))
 
+    commission = settings.funpay_commission_percent
+    # client_price = seller_price / (1 - commission/100): FunPay добавляет комиссию сверху
+    if commission >= 99.0:
+        client_price = price_target
+    else:
+        client_price = price_target / (1.0 - commission / 100.0)
+
     return PricingResult(
         ns_price_usd=ns_price,
         fx_rate=fx,
@@ -59,6 +73,8 @@ def compute_pricing(
         price_target=price_target,
         stock=stock,
         currency=settings.funpay_currency,
+        commission_percent=commission,
+        client_price=client_price,
     )
 
 

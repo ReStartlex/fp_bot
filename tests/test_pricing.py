@@ -14,6 +14,7 @@ class _S:
     markup_percent = 15.0
     funpay_currency = Currency.RUB
     funpay_stock_cap = 50
+    funpay_commission_percent = 12.5
 
 
 def _svc(price: float = 2.0, in_stock: int = 100) -> Service:
@@ -91,6 +92,35 @@ def test_pricing_usd_target_skips_fx():
     )
     assert res.price_target == pytest.approx(2.0 * 1.15)
     assert res.fx_rate == 1.0
+
+
+def test_pricing_client_price_with_commission():
+    """Цена клиента = цена продавца / (1 - commission/100)."""
+    class S(_S):
+        funpay_commission_percent = 12.5
+
+    res = compute_pricing(
+        ns_service=_svc(price=2.0),
+        mapping=_map(),
+        settings=S(),  # type: ignore[arg-type]
+        fx_rate_usd_to_target=90.0,
+    )
+    # seller = 207, client = 207 / 0.875 ≈ 236.57
+    assert res.price_target == pytest.approx(207.0)
+    assert res.client_price == pytest.approx(207.0 / 0.875)
+
+
+def test_pricing_zero_commission_means_equal():
+    class S(_S):
+        funpay_commission_percent = 0.0
+
+    res = compute_pricing(
+        ns_service=_svc(price=2.0),
+        mapping=_map(),
+        settings=S(),  # type: ignore[arg-type]
+        fx_rate_usd_to_target=90.0,
+    )
+    assert res.client_price == pytest.approx(res.price_target)
 
 
 def test_should_update_price_first_time():

@@ -33,8 +33,10 @@ from src.db.models import Mapping, Order, SyncRun
 from src.db.repo import upsert_mapping
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
+from src.mapping.rules import compute_pricing
 from src.ns import NSClient
 from src.ns.models import StockResponse
+from src.sync.fx import get_usd_rub_rate
 
 
 SyncTrigger = Callable[[], Awaitable[dict]]
@@ -98,7 +100,7 @@ class TelegramBot:
     HELP_TEXT = (
         "<b>Состояние</b>\n"
         "/status — общий обзор\n"
-        "/balance — баланс NS\n"
+        "/balance — баланс NS и FunPay\n"
         "/orders — последние 10 заказов\n"
         "/sync — запустить синхронизацию\n"
         "/funpay_reconnect — переподключить FunPay\n"
@@ -112,6 +114,8 @@ class TelegramBot:
         "/mappings — текущие маппинги\n"
         "/map &lt;funpay_lot_id&gt; &lt;ns_service_id&gt; [markup%] [label]\n"
         "/unmap &lt;funpay_lot_id&gt;\n"
+        "/calc &lt;funpay_lot_id&gt; — посчитать цены по маппингу\n"
+        "/inspect_lot &lt;funpay_lot_id&gt; — заглянуть в LotFields\n"
         "\n"
         "<b>Прочее</b>\n"
         "/whoami — твой chat_id\n"
@@ -288,6 +292,18 @@ class TelegramBot:
                 return
             await self._do_funpay_reconnect(msg)
 
+        @dp.message(Command("calc"))
+        async def cmd_calc(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_calc(msg)
+
+        @dp.message(Command("inspect_lot"))
+        async def cmd_inspect_lot(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_inspect_lot(msg)
+
     # ---------- Реализации команд ----------
 
     async def _do_status(self, msg: Message) -> None:
@@ -318,12 +334,31 @@ class TelegramBot:
         await msg.answer(text)
 
     async def _do_balance(self, msg: Message) -> None:
+        lines: list[str] = []
         try:
             async with NSClient() as ns:
                 bal = await ns.check_balance()
-            await msg.answer(f"💰 Баланс NS: <b>{bal.balance}</b>")
+            lines.append(f"💰 NS: <b>{bal.balance}</b>")
         except Exception as exc:
-            await msg.answer(f"Не удалось получить баланс: <code>{exc}</code>")
+            lines.append(f"💰 NS: <i>ошибка ({exc})</i>")
+
+        if self._funpay_client is not None:
+            try:
+                fp_bal = await self._funpay_client.get_funpay_balance()
+                if fp_bal.get("error"):
+                    lines.append(f"💳 FunPay: <i>ошибка ({fp_bal['error']})</i>")
+                else:
+                    rub = fp_bal.get("rub") or fp_bal.get("total") or fp_bal.get("available")
+                    if rub is not None:
+                        lines.append(f"💳 FunPay: <b>{rub}</b>")
+                    else:
+                        lines.append(f"💳 FunPay (raw): <code>{fp_bal.get('raw_repr', '?')}</code>")
+            except Exception as exc:
+                lines.append(f"💳 FunPay: <i>{exc}</i>")
+        else:
+            lines.append("💳 FunPay: не подключён")
+
+        await msg.answer("\n".join(lines))
 
     async def _do_orders(self, msg: Message) -> None:
         async with session_factory()() as session:
@@ -522,6 +557,126 @@ class TelegramBot:
         if total_found > 40:
             header += " (показываю первые 40)"
         await msg.answer(header + "\n\n" + "\n".join(lines))
+
+    async def _do_calc(self, msg: Message) -> None:
+        parts = (msg.text or "").split()
+        if len(parts) < 2:
+            await msg.answer(
+                "Использование: <code>/calc &lt;funpay_lot_id&gt;</code>\n\n"
+                "Покажет какой ценой бот выставит лот: цена тебе (продавцу) "
+                "и расчётная цена клиенту с учётом комиссии FunPay."
+            )
+            return
+        try:
+            funpay_lot_id = int(parts[1])
+        except ValueError:
+            await msg.answer("funpay_lot_id должен быть числом")
+            return
+
+        async with session_factory()() as session:
+            stmt = select(Mapping).where(Mapping.funpay_lot_id == funpay_lot_id)
+            mapping = (await session.execute(stmt)).scalar_one_or_none()
+        if mapping is None:
+            await msg.answer(
+                f"Маппинга для лота <code>{funpay_lot_id}</code> нет.\n"
+                "Сначала сделай <code>/map ...</code>"
+            )
+            return
+
+        try:
+            async with NSClient() as ns:
+                stock = await ns.get_stock()
+        except Exception as exc:
+            await msg.answer(f"NS get_stock упал: <code>{exc}</code>")
+            return
+
+        svc = None
+        for cat in stock.categories:
+            for s in cat.services:
+                if s.service_id == mapping.ns_service_id:
+                    svc = s
+                    break
+            if svc is not None:
+                break
+
+        if svc is None:
+            await msg.answer(
+                f"NS service_id <code>{mapping.ns_service_id}</code> не найден в каталоге."
+            )
+            return
+
+        fx_rate = await get_usd_rub_rate(self._settings)
+        pricing = compute_pricing(
+            ns_service=svc,
+            mapping=mapping,
+            settings=self._settings,
+            fx_rate_usd_to_target=fx_rate,
+        )
+
+        current_seller: float | None = None
+        if self._funpay_client is not None:
+            try:
+                summary = await self._funpay_client.get_lot_summary(funpay_lot_id)
+                cs = summary.get("fields.price")
+                current_seller = float(cs) if cs is not None else None
+            except Exception:
+                pass
+
+        threshold = self._settings.price_update_threshold_percent
+        if current_seller is None or current_seller <= 0:
+            will_update = True
+        else:
+            diff = abs(pricing.round_price() - current_seller) / current_seller * 100
+            will_update = diff >= threshold
+
+        cur = self._settings.funpay_currency.value
+        text = (
+            f"📊 <b>Расчёт цены для лота {funpay_lot_id}</b>\n\n"
+            f"NS: <b>{pricing.ns_price_usd:.4f}</b> USD ({svc.service_name[:50]})\n"
+            f"Курс USD→{cur}: <b>{pricing.fx_rate:.4f}</b>\n"
+            f"Наценка: <b>{pricing.markup_percent}%</b>\n"
+            f"Комиссия FunPay (справочно): <b>{pricing.commission_percent}%</b>\n"
+            f"\n"
+            f"➡️ Цена продавцу (мы получим): <b>{pricing.round_price()} {cur}</b>\n"
+            f"➡️ Цена клиенту (примерно): <b>{pricing.round_client_price()} {cur}</b>\n"
+            f"➡️ Сток на FunPay: <b>{pricing.stock}</b>\n"
+        )
+        if current_seller is not None:
+            text += (
+                f"\nТекущая цена продавца на FunPay: <b>{current_seller}</b>\n"
+                f"Обновлять? <b>{'да' if will_update else 'нет (в пределах порога)'}</b>"
+            )
+        await msg.answer(text)
+
+    async def _do_inspect_lot(self, msg: Message) -> None:
+        parts = (msg.text or "").split()
+        if len(parts) < 2:
+            await msg.answer("Использование: <code>/inspect_lot &lt;funpay_lot_id&gt;</code>")
+            return
+        try:
+            funpay_lot_id = int(parts[1])
+        except ValueError:
+            await msg.answer("funpay_lot_id должен быть числом")
+            return
+        if self._funpay_client is None:
+            await msg.answer("FunPay не подключён")
+            return
+
+        try:
+            summary = await self._funpay_client.get_lot_summary(funpay_lot_id)
+        except Exception as exc:
+            await msg.answer(f"Ошибка: <code>{exc}</code>")
+            return
+
+        lines = [f"🔍 <b>Лот {funpay_lot_id}</b>"]
+        for key, value in summary.items():
+            if key == "fields.raw" and isinstance(value, dict):
+                lines.append(f"<b>{key}</b>:")
+                for k, v in value.items():
+                    lines.append(f"  <code>{k}</code> = {v}")
+                continue
+            lines.append(f"<b>{key}</b>: <code>{str(value)[:200]}</code>")
+        await msg.answer("\n".join(lines))
 
     async def _do_funpay_reconnect(self, msg: Message) -> None:
         if self._funpay_reconnect is None:

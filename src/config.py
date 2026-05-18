@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     usd_rub_rate: float = Field(default=90.0, gt=0)
     price_update_threshold_percent: float = Field(default=2.0, ge=0)
     funpay_stock_cap: int = Field(default=100, ge=1)
+    # Комиссия FunPay для оценки цены клиента: чисто справочно для /calc.
+    # Не влияет на то, какую цену мы записываем (мы пишем цену продавца, FunPay
+    # сам добавит комиссию). Реальная комиссия зависит от категории.
+    funpay_commission_percent: float = Field(default=12.5, ge=0, le=50)
 
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: int | None = None
