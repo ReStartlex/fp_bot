@@ -131,9 +131,22 @@ class App:
             max_instances=1,
             coalesce=True,
         )
+        if self.settings.new_lots_notify_enabled:
+            self.scheduler.add_job(
+                self._safe_discover_new_lots,
+                "interval",
+                seconds=self.settings.new_lots_check_interval_seconds,
+                id="new_lots",
+                next_run_time=datetime.now() + timedelta(seconds=15),
+                max_instances=1,
+                coalesce=True,
+            )
         self.scheduler.start()
         logger.info(
-            f"Планировщик запущен: sync каждые {self.settings.sync_interval_seconds}с, "
+            f"Планировщик запущен: sync каждые "
+            f"{self.settings.sync_interval_seconds}с, "
+            f"discovery новых лотов каждые "
+            f"{self.settings.new_lots_check_interval_seconds}с, "
             f"heartbeat каждые {HEARTBEAT_HOURS}ч"
         )
 
@@ -272,6 +285,14 @@ class App:
         """Вручную из Telegram-бота. Не запустится параллельно с scheduler-sync."""
         async with self._sync_lock:
             return await sync_once(funpay_client=self.fp, ns_client=self.ns)
+
+    async def _safe_discover_new_lots(self) -> None:
+        """Периодический поиск новых FunPay-лотов с алертом в Telegram."""
+        try:
+            from src.sync.new_lots import discover_new_lots
+            await discover_new_lots(self.fp, self.tg)
+        except Exception as exc:
+            logger.exception(f"discover_new_lots упал: {exc}")
 
     # ---------- FunPay events ----------
 

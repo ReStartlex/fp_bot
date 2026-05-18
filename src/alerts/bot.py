@@ -261,6 +261,7 @@ class TelegramBot:
             BotCommand(command="sync", description="🔄 Синхронизация"),
             BotCommand(command="orders", description="📦 Последние заказы"),
             BotCommand(command="setmarkup", description="✏ Изменить наценку"),
+            BotCommand(command="reset_markups", description="♻ Сбросить наценку у всех маппингов"),
             BotCommand(command="funpay_reconnect", description="🔌 FunPay reconnect"),
             BotCommand(command="ping", description="🏓 Проверка связи"),
             BotCommand(command="help", description="❓ Помощь"),
@@ -434,6 +435,12 @@ class TelegramBot:
                 return
             await self._do_setmarkup(msg)
 
+        @dp.message(Command("reset_markups"))
+        async def cmd_reset_markups(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_reset_markups(msg)
+
         @dp.message(Command("clear_target"))
         async def cmd_clear_target(msg: Message) -> None:
             if not self._is_owner(msg):
@@ -491,6 +498,20 @@ class TelegramBot:
                 await cq.answer()
                 return
             await self._on_action_click(cq)
+
+        @dp.callback_query(F.data.startswith("calc:"))
+        async def cb_calc(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await self._on_calc_click(cq)
+
+        @dp.callback_query(F.data.startswith("newlot:"))
+        async def cb_newlot(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await self._on_newlot_click(cq)
 
     # ─────────────── общие хелперы ───────────────
 
@@ -1382,22 +1403,35 @@ class TelegramBot:
         except ValueError:
             await msg.answer("funpay_lot_id должен быть числом")
             return
-        text = await self._render_calc_text(funpay_lot_id)
-        await msg.answer(text, reply_markup=ui.single_close_kb())
+        text, kb = await self._render_calc(funpay_lot_id)
+        await msg.answer(text, reply_markup=kb)
 
     async def _render_calc_text(self, funpay_lot_id: int) -> str:
+        """Совместимая обёртка: возвращает только текст (используется в тестах)."""
+        text, _ = await self._render_calc(funpay_lot_id)
+        return text
+
+    async def _render_calc(self, funpay_lot_id: int):
+        """
+        Полный расчёт цены + клавиатура.
+        Возвращает (text, reply_markup).
+        """
         async with session_factory()() as session:
             stmt = select(Mapping).where(Mapping.funpay_lot_id == funpay_lot_id)
             mapping = (await session.execute(stmt)).scalar_one_or_none()
         if mapping is None:
             return (
                 f"Маппинга для лота <code>{funpay_lot_id}</code> нет.\n"
-                "Сначала сделай маппинг через меню или <code>/map ...</code>."
+                "Сначала сделай маппинг через меню или <code>/map ...</code>.",
+                ui.single_close_kb(),
             )
         try:
             stock = await self._get_stock()
         except Exception as exc:
-            return f"NS get_stock упал: <code>{html.escape(str(exc))}</code>"
+            return (
+                f"NS get_stock упал: <code>{html.escape(str(exc))}</code>",
+                ui.single_close_kb(),
+            )
 
         svc = None
         for cat in stock.categories:
@@ -1408,7 +1442,11 @@ class TelegramBot:
             if svc is not None:
                 break
         if svc is None:
-            return f"NS service_id <code>{mapping.ns_service_id}</code> не найден в каталоге."
+            return (
+                f"NS service_id <code>{mapping.ns_service_id}</code> "
+                "не найден в каталоге.",
+                ui.single_close_kb(),
+            )
 
         rate = await get_rate_breakdown(self._settings)
         pricing = compute_pricing(
@@ -1437,7 +1475,6 @@ class TelegramBot:
             will_update = diff >= threshold
 
         cur = self._settings.funpay_currency.value
-        # Курс: если есть премия, показываем разложение
         if rate.has_premium:
             rate_line = (
                 f"Курс USD→{cur}: <b>{rate.effective:.4f}</b> "
@@ -1445,12 +1482,26 @@ class TelegramBot:
             )
         else:
             rate_line = f"Курс USD→{cur}: <b>{rate.effective:.4f}</b>\n"
+
+        # Источник наценки: из маппинга или глобальная
+        if mapping.markup_percent is not None:
+            markup_source = (
+                f"<b>{pricing.markup_percent}%</b> "
+                f"(зашита в маппинге, глобально сейчас "
+                f"{self._settings.markup_percent}%)"
+            )
+        else:
+            markup_source = (
+                f"<b>{pricing.markup_percent}%</b> "
+                f"(глобально из <code>MARKUP_PERCENT</code>)"
+            )
+
         text = (
             f"📊 <b>Расчёт цены для лота {funpay_lot_id}</b>\n\n"
             f"NS: <b>{pricing.ns_price_usd:.4f}</b> USD\n"
             f"<i>{svc.service_name[:60]}</i>\n\n"
             f"{rate_line}"
-            f"Наценка: <b>{pricing.markup_percent}%</b>\n"
+            f"Наценка: {markup_source}\n"
             f"Комиссия FunPay (справочно): <b>{pricing.commission_percent}%</b>\n\n"
             f"➡ Цена продавцу: <b>{pricing.round_price()} {cur}</b>\n"
             f"➡ Цена клиенту: <b>{pricing.round_client_price()} {cur}</b>\n"
@@ -1459,9 +1510,122 @@ class TelegramBot:
         if current_seller is not None:
             text += (
                 f"\n\nТекущая цена продавца: <b>{current_seller}</b>\n"
-                f"Обновлять? <b>{'да' if will_update else 'нет (в пределах порога)'}</b>"
+                f"Обновлять при следующем sync? "
+                f"<b>{'да' if will_update else 'нет (в пределах порога)'}</b>"
             )
-        return text
+
+        # Клавиатура: «сбросить наценку» появляется только если она зашита
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        rows: list[list[InlineKeyboardButton]] = []
+        if mapping.markup_percent is not None:
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"♻ Сбросить наценку → {self._settings.markup_percent}%",
+                    callback_data=f"calc:reset_markup:{funpay_lot_id}",
+                ),
+            ])
+        rows.append([
+            InlineKeyboardButton(
+                text="🔄 Sync сейчас",
+                callback_data=f"menu:{ui.MENU_KIND_SYNC}",
+            ),
+            InlineKeyboardButton(
+                text="✖ Закрыть",
+                callback_data="close",
+            ),
+        ])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def _on_calc_click(self, cq: CallbackQuery) -> None:
+        """
+        calc:reset_markup:<funpay_lot_id> — обнулить markup_percent в маппинге,
+        чтобы он начал использовать глобальный default.
+        """
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3 or parts[1] != "reset_markup":
+            await cq.answer("Неизвестная команда расчёта", show_alert=True)
+            return
+        try:
+            funpay_lot_id = int(parts[2])
+        except ValueError:
+            await cq.answer("Некорректный lot_id", show_alert=True)
+            return
+
+        async with session_factory()() as session:
+            stmt = select(Mapping).where(Mapping.funpay_lot_id == funpay_lot_id)
+            obj = (await session.execute(stmt)).scalar_one_or_none()
+            if obj is None:
+                await cq.answer("Маппинг не найден", show_alert=True)
+                return
+            obj.markup_percent = None
+            await session.commit()
+
+        await cq.answer(
+            f"♻ Маппинг лота {funpay_lot_id} теперь использует "
+            f"глобальную наценку {self._settings.markup_percent}%",
+            show_alert=True,
+        )
+        # Перерисуем то же сообщение со свежим расчётом
+        text, kb = await self._render_calc(funpay_lot_id)
+        await self._edit_or_answer(cq, text, reply_markup=kb)
+
+    async def _on_newlot_click(self, cq: CallbackQuery) -> None:
+        """
+        Обработка кнопок под Telegram-уведомлением о новом лоте.
+
+        newlot:target:<lot_id>  — выставить лот целью (две-кликовый маппинг)
+        newlot:inspect:<lot_id> — показать карточку Inspect лота
+        """
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            await cq.answer("Некорректный callback", show_alert=True)
+            return
+        action = parts[1]
+        try:
+            lot_id = int(parts[2])
+        except ValueError:
+            await cq.answer("Некорректный lot_id", show_alert=True)
+            return
+
+        if action == "target":
+            # Пытаемся достать человекочитаемое имя из БД (KnownLot)
+            label = f"#{lot_id}"
+            try:
+                from src.db.models import KnownLot
+                async with session_factory()() as session:
+                    row = await session.get(KnownLot, lot_id)
+                    if row is not None and row.title:
+                        label = row.title[:60]
+            except Exception:
+                pass
+            self._target_lots[cq.from_user.id] = lot_id
+            self._target_labels[cq.from_user.id] = label
+            await cq.answer(
+                f"🎯 Цель: {label}\nТеперь открой 🗂 Каталог NS или /ns_search "
+                "и нажми ✅ на нужной услуге.",
+                show_alert=True,
+            )
+            return
+
+        if action == "inspect":
+            if self._funpay_client is None:
+                await cq.answer("FunPay не подключён", show_alert=True)
+                return
+            try:
+                summary = await asyncio.wait_for(
+                    self._funpay_client.get_lot_summary(lot_id),
+                    timeout=FP_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                await cq.answer(
+                    f"Ошибка: {str(exc)[:120]}", show_alert=True
+                )
+                return
+            text = _format_inspect(lot_id, summary)
+            await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
+            return
+
+        await cq.answer(f"Неизвестное newlot-действие: {action}", show_alert=True)
 
     @_guard
     async def _do_setmarkup(self, msg: Message) -> None:
@@ -1512,6 +1676,38 @@ class TelegramBot:
         await msg.answer(
             f"✏ Markup для лота <code>{funpay_lot_id}</code>: <b>{shown}</b>\n\n"
             f"Запусти 🔄 Синхронизация или /sync, чтобы новая цена применилась.",
+            reply_markup=ui.single_close_kb(),
+        )
+
+    @_guard
+    async def _do_reset_markups(self, msg: Message) -> None:
+        """
+        /reset_markups — обнулить markup_percent у всех маппингов, чтобы они
+        начали использовать глобальный default из .env. Полезно если ты
+        поменял MARKUP_PERCENT и хочешь, чтобы это сразу применилось ко всем.
+        """
+        async with session_factory()() as session:
+            stmt = select(Mapping)
+            rows = list((await session.execute(stmt)).scalars().all())
+            affected = 0
+            for obj in rows:
+                if obj.markup_percent is not None:
+                    obj.markup_percent = None
+                    affected += 1
+            if affected > 0:
+                await session.commit()
+
+        await msg.answer(
+            (
+                f"♻ Сброшено наценок: <b>{affected}</b> "
+                f"(из {len(rows)} маппингов).\n"
+                f"Теперь все используют глобальную "
+                f"<b>{self._settings.markup_percent}%</b>.\n\n"
+                "Запусти 🔄 Синхронизация или /sync, чтобы новые цены применились."
+            ) if affected > 0 else (
+                f"Все {len(rows)} маппингов уже используют глобальную "
+                f"наценку <b>{self._settings.markup_percent}%</b> — менять нечего."
+            ),
             reply_markup=ui.single_close_kb(),
         )
 

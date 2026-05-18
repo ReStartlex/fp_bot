@@ -38,6 +38,10 @@ class Settings(BaseSettings):
 
     enable_real_actions: bool = False
     sync_interval_seconds: int = Field(default=30, ge=10)
+    # Интервал поиска новых FunPay-лотов и пуша алертов про них.
+    # Лоты обнаруживаются и пушатся только один раз каждому ID.
+    new_lots_check_interval_seconds: int = Field(default=180, ge=30)
+    new_lots_notify_enabled: bool = True
     timezone: str = "Europe/Moscow"
     ns_use_playground: bool = False
 

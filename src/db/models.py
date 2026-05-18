@@ -75,6 +75,27 @@ class ChatState(Base):
     help_requests_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
+class KnownLot(Base):
+    """
+    FunPay-лоты, которые мы уже видели у нашего аккаунта. Сравнивая
+    свежий список из FunPay со списком в этой таблице, ловим
+    появившиеся «новые» лоты и шлём про них алерт.
+    """
+    __tablename__ = "known_lots"
+
+    funpay_lot_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+    # Помечается True один раз, после первого пуша в Telegram —
+    # чтобы не шуметь повторно.
+    notified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class Order(Base):
     """Заказ с FunPay -> NS pipeline."""
     __tablename__ = "orders"

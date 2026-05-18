@@ -50,19 +50,27 @@ class TelegramNotifier:
             await self._client.aclose()
             self._client = None
 
-    async def send(self, text: str, *, parse_mode: str = "HTML") -> bool:
+    async def send(
+        self,
+        text: str,
+        *,
+        parse_mode: str = "HTML",
+        reply_markup: dict | None = None,
+    ) -> bool:
         """Отправить сообщение. Если выключено — silently no-op."""
         if not self.enabled or self._client is None:
             return False
         s = self._settings
         token = s.telegram_bot_token.get_secret_value()  # type: ignore[union-attr]
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {
+        payload: dict = {
             "chat_id": s.telegram_chat_id,
             "text": text,
             "parse_mode": parse_mode,
             "disable_web_page_preview": True,
         }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         async with self._lock:
             try:
                 r = await self._client.post(url, json=payload)
@@ -126,3 +134,41 @@ class TelegramNotifier:
             f"Порог: {threshold:.2f}$"
         )
         await self.send(text)
+
+    async def new_lot_discovered(
+        self, funpay_lot_id: int, title: str | None
+    ) -> None:
+        """Уведомление о новом FunPay-лоте, у которого ещё нет маппинга."""
+        from html import escape
+
+        title_line = (
+            f"\n<i>{escape(title)[:160]}</i>" if title else ""
+        )
+        text = (
+            f"🆕 <b>Новый лот на FunPay</b>\n"
+            f"ID: <code>{funpay_lot_id}</code>"
+            f"{title_line}\n\n"
+            f"Маппинга ещё нет — товар <b>не будет</b> выкупаться "
+            f"автоматически, пока ты его не привяжешь к NS-сервису."
+        )
+        markup = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "🎯 Выбрать целью",
+                        "callback_data": f"newlot:target:{funpay_lot_id}",
+                    },
+                ],
+                [
+                    {
+                        "text": "🔬 Inspect",
+                        "callback_data": f"newlot:inspect:{funpay_lot_id}",
+                    },
+                    {
+                        "text": "✖ Скрыть",
+                        "callback_data": "close",
+                    },
+                ],
+            ]
+        }
+        await self.send(text, reply_markup=markup)
