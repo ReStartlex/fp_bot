@@ -116,6 +116,10 @@ class FunPayWatcher:
         event_type = self._extract_event_type(event)
         type_str = str(event_type).upper() if event_type is not None else ""
 
+        # Лог любого типа на INFO — иначе при LOG_LEVEL=INFO не видно,
+        # доходят ли вообще события до watcher.
+        logger.info(f"FunPay event: type={type_str or 'UNKNOWN'!r}")
+
         if "NEW_ORDER" in type_str or "ORDER_NEW" in type_str:
             order = self._normalize_order(event)
             if order is not None and self._on_new_order is not None:
@@ -126,15 +130,30 @@ class FunPayWatcher:
                 self._dispatch_async(self._on_new_order(order))
             return
 
-        if "NEW_MESSAGE" in type_str or "MESSAGE_NEW" in type_str or "MESSAGE" == type_str:
+        if (
+            "NEW_MESSAGE" in type_str
+            or "MESSAGE_NEW" in type_str
+            or "CHAT_MESSAGE" in type_str
+            or type_str == "MESSAGE"
+        ):
             msg = self._normalize_message(event)
-            if msg is not None and self._on_new_message is not None:
-                logger.debug(
-                    f"FunPay NEW_MESSAGE: chat={msg.chat_id}, "
-                    f"author={msg.author_username}, my={msg.is_my_message}, "
-                    f"text={msg.text[:60]!r}"
+            if msg is None:
+                logger.warning(
+                    f"FunPay {type_str}: не смог нормализовать сообщение: "
+                    f"{event!r}"
                 )
-                self._dispatch_async(self._on_new_message(msg))
+                return
+            if self._on_new_message is None:
+                logger.debug(
+                    "FunPay сообщение пришло, но on_new_message callback не задан"
+                )
+                return
+            logger.info(
+                f"FunPay NEW_MESSAGE: chat={msg.chat_id}, "
+                f"author={msg.author_username}, my={msg.is_my_message}, "
+                f"text={msg.text[:80]!r}"
+            )
+            self._dispatch_async(self._on_new_message(msg))
             return
 
     def _dispatch_async(self, coro) -> None:

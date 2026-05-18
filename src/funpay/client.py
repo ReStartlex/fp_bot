@@ -52,10 +52,16 @@ class FunPayClient:
 
     async def connect(self) -> Any:
         """
-        Подключение к FunPay через golden_key.
-        Возвращает объект Account (синхронный).
+        Подключение к FunPay через golden_key + PHPSESSID.
+
+        ВАЖНО: в установленной версии FunPayAPI Account.__init__ принимает
+        только `golden_key`. PHPSESSID нельзя передать конструктором —
+        его нужно положить в атрибут `acc.phpsessid` ДО вызова `acc.get()`.
+        Если так не сделать, библиотека получит свежий PHPSESSID гостя
+        в первом же запросе, и админка лотов (get_lot_fields / save_lot)
+        вернёт HTML страницы логина, парсер упадёт на «Expecting value».
         """
-        from FunPayAPI import Account  # импорт здесь, чтобы import-time не падал
+        from FunPayAPI import Account
 
         golden_key = self._settings.funpay_golden_key.get_secret_value()
         phpsessid = (
@@ -65,28 +71,58 @@ class FunPayClient:
         )
 
         def _build_and_get() -> Any:
-            kwargs: dict[str, Any] = {
+            ctor_kwargs: dict[str, Any] = {
                 "golden_key": golden_key,
                 "user_agent": self.DEFAULT_USER_AGENT,
             }
+            # На случай экзотических форков, где phpsessid действительно в init
+            sig = inspect.signature(Account.__init__)
+            phpsessid_via_init = False
             if phpsessid:
-                # PHPSESSID параметр может называться по-разному в разных версиях
-                sig = inspect.signature(Account.__init__)
                 if "phpsessid" in sig.parameters:
-                    kwargs["phpsessid"] = phpsessid
+                    ctor_kwargs["phpsessid"] = phpsessid
+                    phpsessid_via_init = True
                 elif "PHPSESSID" in sig.parameters:
-                    kwargs["PHPSESSID"] = phpsessid
-            acc = Account(**kwargs)
-            acc.get()
+                    ctor_kwargs["PHPSESSID"] = phpsessid
+                    phpsessid_via_init = True
+
+            acc = Account(**ctor_kwargs)
+
+            # Главный фикс: проставляем PHPSESSID атрибутом ДО первого
+            # запроса. FunPayAPI в Account.method() кладёт его в Cookie
+            # ровно так: `golden_key=...; PHPSESSID=...`.
+            if phpsessid and not phpsessid_via_init and hasattr(acc, "phpsessid"):
+                acc.phpsessid = phpsessid
+
+            # update_phpsessid=False — не даём библиотеке затереть наш
+            # PHPSESSID значением из set-cookie ответа (так сохраняем
+            # авторизованную сессию).
+            try:
+                acc.get(update_phpsessid=False)
+            except TypeError:
+                acc.get()
             return acc
 
         async with self._lock:
             self._account = await self._to_thread(_build_and_get)
+
+        # Лог намеренно показывает только факт наличия PHPSESSID, а не
+        # его значение — секрет не должен утекать в журналы.
+        has_phpsessid = bool(
+            phpsessid and getattr(self._account, "phpsessid", None)
+        )
         logger.info(
             f"FunPay подключён: id={self.account_id}, "
             f"username={self.username}, "
+            f"phpsessid={'set' if has_phpsessid else 'MISSING'}, "
             f"баланс={self.balance}"
         )
+        if phpsessid and not has_phpsessid:
+            logger.warning(
+                "FUNPAY_PHPSESSID указан в .env, но FunPayAPI его не "
+                "сохранил. Без PHPSESSID не работает get_lot_fields / "
+                "save_lot. Проверь актуальность cookie на funpay.com."
+            )
         return self._account
 
     @property

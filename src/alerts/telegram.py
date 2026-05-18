@@ -81,7 +81,10 @@ class TelegramNotifier:
                     return False
                 return True
             except Exception as exc:
-                logger.warning(f"Telegram sendMessage failed: {exc}")
+                logger.warning(
+                    f"Telegram sendMessage failed: "
+                    f"{type(exc).__name__}: {exc!r}"
+                )
                 return False
 
     # ----- Шорткаты для разных типов событий -----
