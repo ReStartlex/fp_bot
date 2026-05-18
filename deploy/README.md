@@ -1,32 +1,12 @@
-# Deploy на VPS (через Git)
+# Развёртывание на VPS
 
-Так как у нас провайдер режет TCP к Timeweb (ping проходит, TCP — нет),
-работаем через **Git + веб-консоль Timeweb**.
+Сервер — Timeweb VPS, выход в интернет к `ns.gifts` через whitelisted IP.
+SSH с локальной машины может быть недоступен из-за блокировок провайдера;
+все шаги выполняются в веб-консоли Timeweb или через Tailscale (опционально).
 
-Сервер: Timeweb VPS (IP смотри в ЛК хостинга или в `.env`)
-Репо: `https://github.com/ReStartlex/fp_bot.git`
+## Первичная установка
 
----
-
-## Одноразовая первичная установка
-
-### 1. Локально: запушить проект на GitHub
-
-```powershell
-cd D:\money
-git init -b main
-git add .
-git commit -m "Initial commit: F0 (NS client + structure)"
-git remote add origin https://github.com/ReStartlex/fp_bot.git
-git push -u origin main
-```
-
-Если git попросит логин/пароль — нужен **Personal Access Token** GitHub:
-GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic) →
-Generate new token → дай ему scope `repo` → скопируй (показывается один раз).
-Логин = твой github-логин, пароль = этот токен.
-
-### 2. На сервере: открыть веб-консоль Timeweb → залогиниться как root → вставить:
+В веб-консоли как root:
 
 ```bash
 apt update -qq && apt install -y -qq git
@@ -34,144 +14,117 @@ git clone https://github.com/ReStartlex/fp_bot.git /opt/funpay-ns-bot
 bash /opt/funpay-ns-bot/deploy/bootstrap.sh
 ```
 
-Скрипт развернёт всё за 3-5 минут. В конце напомнит создать `.env`.
+`bootstrap.sh` ставит python, venv, зависимости, создаёт пользователя `bot`,
+настраивает `ufw` (22/tcp, 443/tcp) и `fail2ban`, регистрирует systemd-unit.
 
-### 3. На сервере: создать `.env` (одной командой через heredoc)
+### `.env` на сервере
 
-Скопируй из локального `D:\money\.env` своё содержимое и вставь между `'EOF'`:
+Скопируй содержимое локального `.env` в файл на сервере, через heredoc:
 
 ```bash
 cat > /opt/funpay-ns-bot/.env <<'EOF'
-<сюда вставить ВСЁ содержимое локального .env как есть>
+<сюда — содержимое локального .env как есть>
 EOF
 chown bot:bot /opt/funpay-ns-bot/.env
 chmod 600 /opt/funpay-ns-bot/.env
 ```
 
-⚠️ Важно: `'EOF'` именно в одинарных кавычках, чтобы шелл не пытался
-интерпретировать `$` внутри пароля как переменную.
+Одинарные кавычки вокруг `EOF` обязательны, иначе `$` внутри пароля будут
+интерпретированы как переменная.
 
-### 4. На сервере: проверить NS API
+### Проверки
 
 ```bash
-sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.check_ns
+cd /opt/funpay-ns-bot
+sudo -u bot .venv/bin/python -m src.tools.check_ns
+sudo -u bot .venv/bin/python -m src.tools.check_funpay
+sudo -u bot .venv/bin/python -m src.tools.check_telegram
 ```
 
-Ожидаем: `Все проверки пройдены. NS API работает.`
+Если `check_funpay` падает с `UnauthorizedError`, см. раздел «Обновление
+cookies FunPay» ниже.
 
----
+## Запуск 24/7
+
+```bash
+systemctl daemon-reload
+systemctl enable --now funpay-ns-bot
+systemctl status funpay-ns-bot --no-pager
+journalctl -u funpay-ns-bot -f
+```
+
+В Telegram должно прийти сообщение `Бот запущен ✅`. После этого писать боту
+`/help` — он отвечает справкой.
 
 ## Обновление кода
-
-**Локально:**
-
-```powershell
-git add .
-git commit -m "..."
-git push
-```
-
-**На сервере (одна команда):**
 
 ```bash
 bash /opt/funpay-ns-bot/deploy/update.sh
 ```
 
-Скрипт скачает свежий код через `gh-proxy`, обновит зависимости и
-перезапустит systemd-сервис (если он включён).
+Скрипт скачивает свежий tarball через `gh-proxy.com` (обход блокировки
+GitHub с Timeweb), обновляет зависимости, перезапускает systemd-сервис.
 
----
+## Обновление cookies FunPay
 
-## Запуск бота
+`golden_key` и `phpsessid` живут пока ты не вышел и пока FunPay не
+инвалидировал сессию (например после блокировки/разблокировки или после
+смены IP). Если в логах `UnauthorizedError` — значения протухли.
 
-### Telegram: первый запуск (определить chat_id)
-
-1. В `.env` укажи `TELEGRAM_BOT_TOKEN`, оставь `TELEGRAM_CHAT_ID` пустым.
-2. На сервере запусти discovery (он будет ждать твоего сообщения):
-
-```bash
-sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.discover_chat_id
-```
-
-3. Открой Telegram, найди своего бота, напиши ему `/start`.
-4. Скрипт распечатает твой `chat_id`. Скопируй в `.env`:
+1. Открой `funpay.com` в своём браузере, залогинься.
+2. F12 → вкладка `Application` (Chrome/Edge) или `Storage` (Firefox) →
+   `Cookies` → `https://funpay.com`.
+3. Скопируй значения `golden_key` и `PHPSESSID`.
+4. Положи в `.env` на сервере:
 
 ```bash
 nano /opt/funpay-ns-bot/.env
-# TELEGRAM_CHAT_ID=123456789
+# обнови:
+# FUNPAY_GOLDEN_KEY=...
+# FUNPAY_PHPSESSID=...
 ```
 
-5. Проверь, что нотификации отправляются:
+5. Перезапусти:
 
 ```bash
-sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.check_telegram
-```
-
-### Включить systemd-сервис (24/7)
-
-```bash
-systemctl enable --now funpay-ns-bot
-systemctl status funpay-ns-bot
-journalctl -u funpay-ns-bot -f
-```
-
-В Telegram придёт сообщение «Бот запущен ✅». В чате с ботом командой
-`/status` можно увидеть состояние, `/help` — список команд.
-
-### Остановить / перезапустить
-
-```bash
-systemctl stop funpay-ns-bot
 systemctl restart funpay-ns-bot
-systemctl status funpay-ns-bot
+journalctl -u funpay-ns-bot -n 30 --no-pager
 ```
 
----
+В Telegram должно прийти `FunPay подключён: id=..., username=...`.
 
-## (Опционально) Tailscale — чтобы вернуть нормальный SSH
+## Tailscale (опционально)
 
-После первичной установки можно поднять Tailscale — это бесплатная P2P-VPN,
-которая обходит любые блокировки провайдеров (включая твою). После установки
-ты сможешь подключаться к серверу обычным `ssh` с локального ПК.
-
-**На сервере (веб-консоль):**
+После первичной установки можно поднять Tailscale — это вернёт нормальный
+SSH мимо блокировок:
 
 ```bash
 curl -fsSL https://tailscale.com/install.sh | sh
 tailscale up --ssh
 ```
 
-Скрипт даст ссылку — открой её в браузере на ПК, залогинься через
-Google/Microsoft/GitHub. Сервер привяжется к твоему Tailscale-аккаунту.
-
-**На локальном ПК:**
-
-Качай и ставь Tailscale: https://tailscale.com/download/windows
-Логинься тем же аккаунтом.
-
-После этого:
-
-```powershell
-ssh root@funpay-ns-bot    # имя берётся из Tailscale, или его внутренний IP
-```
-
-И всё работает напрямую — SSH, scp, что угодно.
-
----
+После авторизации в браузере и установки Tailscale на локальную машину
+сервер доступен по короткому имени или внутреннему IP.
 
 ## Безопасность
 
-После первого входа в веб-консоли смени root-пароль:
+- Смени пароль root в первый же заход: `passwd`.
+- После настройки Tailscale можно отключить вход по паролю:
+  ```bash
+  sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+  systemctl restart ssh
+  ```
+- `.env` должен быть `chmod 600` и принадлежать пользователю `bot`.
+- Контроль: `ENABLE_REAL_ACTIONS=false` пока не закончил тесты.
+
+## Откат
+
+Если что-то сломалось после обновления:
 
 ```bash
-passwd
+systemctl stop funpay-ns-bot
+cd /opt/funpay-ns-bot
+git log --oneline -10                  # подсмотреть нужный коммит
+# либо вручную поставить нужный tarball
+systemctl start funpay-ns-bot
 ```
-
-И, когда настроишь Tailscale, отключи пароли в SSH:
-
-```bash
-sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
-systemctl restart ssh
-```
-
-Тогда вход только по ключам через Tailscale — максимально безопасно.

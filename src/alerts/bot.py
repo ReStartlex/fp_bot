@@ -34,6 +34,7 @@ from src.db.repo import upsert_mapping
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
 from src.ns import NSClient
+from src.ns.models import StockResponse
 
 
 SyncTrigger = Callable[[], Awaitable[dict]]
@@ -94,19 +95,23 @@ class TelegramBot:
     """
 
     HELP_TEXT = (
-        "<b>Команды:</b>\n"
-        "/status — состояние бота, последний sync, баланс\n"
+        "<b>Состояние</b>\n"
+        "/status — общий обзор\n"
         "/balance — баланс NS\n"
         "/orders — последние 10 заказов\n"
-        "/sync — запустить синхронизацию прямо сейчас\n"
+        "/sync — запустить синхронизацию\n"
         "\n"
-        "<b>Маппинги (NS↔FunPay):</b>\n"
-        "/lots — мои лоты на FunPay (для поиска funpay_lot_id)\n"
-        "/mappings — список текущих маппингов\n"
-        "/map &lt;funpay_lot_id&gt; &lt;ns_service_id&gt; [markup%] — добавить/обновить\n"
-        "/unmap &lt;funpay_lot_id&gt; — выключить маппинг\n"
+        "<b>Каталог NS</b>\n"
+        "/ns_search &lt;слово&gt; — поиск по названию услуги\n"
+        "/ns_cats — список категорий NS\n"
         "\n"
-        "<b>Прочее:</b>\n"
+        "<b>Маппинги</b>\n"
+        "/lots — мои лоты на FunPay\n"
+        "/mappings — текущие маппинги\n"
+        "/map &lt;funpay_lot_id&gt; &lt;ns_service_id&gt; [markup%] [label]\n"
+        "/unmap &lt;funpay_lot_id&gt;\n"
+        "\n"
+        "<b>Прочее</b>\n"
         "/whoami — твой chat_id\n"
         "/help — это сообщение"
     )
@@ -256,6 +261,18 @@ class TelegramBot:
             if not self._is_owner(msg):
                 return
             await self._do_unmap(msg)
+
+        @dp.message(Command("ns_search"))
+        async def cmd_ns_search(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_ns_search(msg)
+
+        @dp.message(Command("ns_cats"))
+        async def cmd_ns_cats(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_ns_cats(msg)
 
     # ---------- Реализации команд ----------
 
@@ -429,6 +446,78 @@ class TelegramBot:
             f"Label: {obj.label or '—'}\n\n"
             f"Запусти /sync чтобы применить."
         )
+
+    async def _fetch_stock(self) -> StockResponse:
+        async with NSClient() as ns:
+            return await ns.get_stock()
+
+    async def _do_ns_search(self, msg: Message) -> None:
+        text = (msg.text or "").strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await msg.answer(
+                "Использование: <code>/ns_search apple</code>\n"
+                "Можно несколько слов — найдёт строку с любым из них."
+            )
+            return
+        query = parts[1].strip().lower()
+        terms = [t for t in query.split() if t]
+
+        try:
+            stock = await self._fetch_stock()
+        except Exception as exc:
+            await msg.answer(f"NS get_stock упал: <code>{exc}</code>")
+            return
+
+        lines: list[str] = []
+        total_found = 0
+        for cat in stock.categories:
+            cat_match = any(t in cat.category_name.lower() for t in terms)
+            for svc in cat.services:
+                svc_match = any(t in svc.service_name.lower() for t in terms)
+                if not (cat_match or svc_match):
+                    continue
+                total_found += 1
+                if len(lines) >= 40:
+                    continue
+                lines.append(
+                    f"<code>{svc.service_id:5d}</code> "
+                    f"{svc.service_name[:50]} | {svc.price:.4f} {svc.currency} | "
+                    f"stock={svc.in_stock}"
+                )
+
+        if not lines:
+            await msg.answer(
+                f"По запросу «{query}» ничего не нашёл.\n"
+                "Попробуй /ns_cats и посмотри по категориям."
+            )
+            return
+        header = f"<b>Найдено: {total_found}</b>"
+        if total_found > 40:
+            header += " (показываю первые 40)"
+        await msg.answer(header + "\n\n" + "\n".join(lines))
+
+    async def _do_ns_cats(self, msg: Message) -> None:
+        try:
+            stock = await self._fetch_stock()
+        except Exception as exc:
+            await msg.answer(f"NS get_stock упал: <code>{exc}</code>")
+            return
+
+        if not stock.categories:
+            await msg.answer("Каталог NS пустой.")
+            return
+
+        lines = [f"<b>Категории NS ({len(stock.categories)}):</b>"]
+        for cat in stock.categories[:60]:
+            total_stock = sum(s.in_stock for s in cat.services)
+            lines.append(
+                f"<code>{cat.category_id:4d}</code> {cat.category_name} — "
+                f"{len(cat.services)} услуг, stock={total_stock}"
+            )
+        if len(stock.categories) > 60:
+            lines.append(f"... и ещё {len(stock.categories) - 60}")
+        await msg.answer("\n".join(lines))
 
     async def _do_unmap(self, msg: Message) -> None:
         text = (msg.text or "").strip()

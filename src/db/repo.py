@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import FxRate, Mapping, Order, SyncRun
+from src.db.models import ChatState, FxRate, Mapping, Order, SyncRun
 
 
 # ---------- Mappings ----------
@@ -139,3 +139,38 @@ async def update_order(session: AsyncSession, order: Order, **fields: Any) -> Or
             setattr(order, key, value)
     await session.flush()
     return order
+
+
+# ---------- Chat state ----------
+
+async def get_or_create_chat_state(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    buyer_username: str | None,
+) -> ChatState:
+    stmt = select(ChatState).where(ChatState.chat_id == chat_id)
+    state = (await session.execute(stmt)).scalar_one_or_none()
+    if state is None:
+        state = ChatState(chat_id=chat_id, buyer_username=buyer_username)
+        session.add(state)
+        await session.flush()
+    elif buyer_username and state.buyer_username != buyer_username:
+        state.buyer_username = buyer_username
+        await session.flush()
+    return state
+
+
+async def mark_greeted(session: AsyncSession, state: ChatState) -> None:
+    from datetime import datetime
+
+    state.greeted_at = datetime.utcnow()
+    await session.flush()
+
+
+async def mark_help_requested(session: AsyncSession, state: ChatState) -> None:
+    from datetime import datetime
+
+    state.last_help_request_at = datetime.utcnow()
+    state.help_requests_count = (state.help_requests_count or 0) + 1
+    await session.flush()

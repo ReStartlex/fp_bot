@@ -80,6 +80,13 @@ class Settings(BaseSettings):
     ns_order_poll_interval_seconds: float = Field(default=5.0, gt=0)
     ns_order_timeout_seconds: float = Field(default=600.0, gt=0)
 
+    chat_autogreeting_enabled: bool = True
+    chat_greeting_cooldown_hours: int = Field(default=24, ge=1)
+    chat_help_triggers: str = "!help,!помощь,!support,!оператор,!sos,!админ"
+    work_hours_start: int = Field(default=12, ge=0, le=23)
+    work_hours_end: int = Field(default=23, ge=1, le=24)
+    seller_display_name: str = "продавец"
+
     @field_validator("ns_api_secret")
     @classmethod
     def _check_secret_base64(cls, v: SecretStr) -> SecretStr:
@@ -120,6 +127,15 @@ class Settings(BaseSettings):
     @property
     def data_path(self) -> Path:
         return PROJECT_ROOT / "data"
+
+    @property
+    def help_trigger_set(self) -> set[str]:
+        """Список help-триггеров, нормализованных (нижний регистр)."""
+        return {
+            token.strip().lower()
+            for token in self.chat_help_triggers.split(",")
+            if token.strip()
+        }
 
     @property
     def telegram_proxy_url(self) -> str | None:

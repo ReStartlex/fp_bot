@@ -62,6 +62,19 @@ class SyncRun(Base):
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
+class ChatState(Base):
+    """Состояние чата с покупателем: когда здоровались, когда просили помощь."""
+    __tablename__ = "chat_states"
+
+    chat_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    buyer_username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+    greeted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_help_request_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    help_requests_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
 class Order(Base):
     """Заказ с FunPay -> NS pipeline."""
     __tablename__ = "orders"

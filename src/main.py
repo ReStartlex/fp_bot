@@ -23,9 +23,11 @@ from loguru import logger
 
 from src.alerts.bot import TelegramBot
 from src.alerts.telegram import TelegramNotifier
+from src.chat.handler import ChatHandler
 from src.config import get_settings
 from src.db.session import close_db, init_db
 from src.funpay.client import FunPayClient
+from src.funpay.events import FunPayMessageEvent
 from src.funpay.watcher import FunPayWatcher
 from src.logging_setup import setup_logging
 from src.ns import NSClient
@@ -46,6 +48,7 @@ class App:
         self.watcher: FunPayWatcher | None = None
         self.bot: TelegramBot | None = None
         self.tg: TelegramNotifier | None = None
+        self.chat_handler: ChatHandler | None = None
         self._stop_evt = asyncio.Event()
         self._last_low_balance_alert: datetime | None = None
 
@@ -93,7 +96,12 @@ class App:
             self.fp = None  # помечаем что FunPay недоступен
 
         if self.fp is not None:
-            self.watcher = FunPayWatcher(self.fp, self._on_new_order)
+            self.chat_handler = ChatHandler(self.fp, telegram=self.tg, settings=self.settings)
+            self.watcher = FunPayWatcher(
+                self.fp,
+                on_new_order=self._on_new_order,
+                on_new_message=self._on_new_message,
+            )
             try:
                 self.watcher.start()
             except Exception as exc:
@@ -188,6 +196,14 @@ class App:
         return await sync_once(funpay_client=self.fp, ns_client=self.ns)
 
     # ---------- FunPay events ----------
+
+    async def _on_new_message(self, event: FunPayMessageEvent) -> None:
+        if self.chat_handler is None:
+            return
+        try:
+            await self.chat_handler.on_message(event)
+        except Exception as exc:
+            logger.exception(f"ChatHandler упал на сообщении {event!r}: {exc}")
 
     async def _on_new_order(self, event: FunPayOrderEvent) -> None:
         try:
