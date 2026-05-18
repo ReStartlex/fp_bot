@@ -72,14 +72,24 @@ def _format_status_text(
     lines = [
         "📊 <b>NS↔FunPay Bridge — статус</b>",
         "",
-        f"⚙ Real actions: <b>{'ON' if settings.enable_real_actions else 'OFF (dry-run)'}</b>",
+    ]
+    if settings.enable_real_actions:
+        lines.append("⚙ Real actions: <b>🟢 ON</b>")
+    else:
+        lines.append(
+            "⚙ Real actions: <b>🔴 OFF (dry-run)</b>\n"
+            "❗ <b>Цены НЕ обновляются на FunPay</b>. "
+            "Поставь <code>ENABLE_REAL_ACTIONS=true</code> в .env и "
+            "<code>systemctl restart funpay-ns-bot</code>."
+        )
+    lines.extend([
         f"⏱ Sync каждые: <b>{settings.sync_interval_seconds}c</b>",
         f"💱 Валюта FunPay: <b>{settings.funpay_currency.value}</b>",
         f"📈 Наценка по умолчанию: <b>{settings.markup_percent}%</b>",
         rate_line,
         f"💰 Баланс NS: <b>{ns_balance}</b>",
         f"🔌 FunPay: <b>{fp_status}</b>",
-    ]
+    ])
     if last_run is not None:
         lines.extend([
             "",
@@ -166,6 +176,7 @@ class TelegramBot:
         "/setdefault markup &lt;%|default&gt; — глобальная наценка\n"
         "/setdefault premium &lt;%|default&gt; — премия к курсу USD\n"
         "/setdefault stockcap &lt;N|default&gt; — лимит остатков на FunPay\n"
+        "/force_sync &lt;funpay_lot_id&gt; — диагностика одного лота\n"
         "\n"
         "<b>Сервисные</b>\n"
         "/ping — проверка связи\n"
@@ -271,6 +282,7 @@ class TelegramBot:
             BotCommand(command="reset_markups", description="♻ Сбросить наценку у всех маппингов"),
             BotCommand(command="setdefault", description="🎚 Глобальные настройки (markup/premium/stock)"),
             BotCommand(command="settings", description="🔧 Показать текущие настройки"),
+            BotCommand(command="force_sync", description="🔬 Прогнать один лот с деталями"),
             BotCommand(command="funpay_reconnect", description="🔌 FunPay reconnect"),
             BotCommand(command="ping", description="🏓 Проверка связи"),
             BotCommand(command="help", description="❓ Помощь"),
@@ -461,6 +473,12 @@ class TelegramBot:
             if not self._is_owner(msg):
                 return
             await self._do_show_settings(msg)
+
+        @dp.message(Command("force_sync"))
+        async def cmd_force_sync(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_force_sync(msg)
 
         @dp.message(Command("clear_target"))
         async def cmd_clear_target(msg: Message) -> None:
@@ -1182,13 +1200,30 @@ class TelegramBot:
         await self._edit_or_answer(cq, "⏳ Запускаю sync...", reply_markup=None)
         try:
             result = await self._sync_trigger()
-            await self._edit_or_answer(
-                cq,
+            real = self._settings.enable_real_actions
+            mode_line = (
+                "🟢 Режим: <b>REAL</b> (изменения уходят на FunPay)"
+                if real
+                else "🟡 Режим: <b>DRY-RUN</b> "
+                "(<code>ENABLE_REAL_ACTIONS=false</code>) — "
+                "цены НЕ меняются на FunPay"
+            )
+            text = (
                 f"✅ <b>Sync завершён</b>\n"
-                f"  checked: {result.get('checked', 0)}\n"
-                f"  updated: {result.get('updated', 0)}\n"
-                f"  skipped: {result.get('skipped', 0)}",
-                reply_markup=ui.single_close_kb(),
+                f"{mode_line}\n\n"
+                f"  checked: <b>{result.get('checked', 0)}</b>\n"
+                f"  updated: <b>{result.get('updated', 0)}</b>\n"
+                f"  skipped: <b>{result.get('skipped', 0)}</b>"
+            )
+            if not real:
+                text += (
+                    "\n\nЧтобы цены реально обновлялись:\n"
+                    "1) в <code>.env</code> поставь "
+                    "<code>ENABLE_REAL_ACTIONS=true</code>\n"
+                    "2) <code>systemctl restart funpay-ns-bot</code>"
+                )
+            await self._edit_or_answer(
+                cq, text, reply_markup=ui.single_close_kb(),
             )
         except Exception as exc:
             await self._edit_or_answer(
@@ -1899,9 +1934,16 @@ class TelegramBot:
             )
             return
 
+        warn = ""
+        if not self._settings.enable_real_actions:
+            warn = (
+                "\n\n🔴 <b>ENABLE_REAL_ACTIONS=false</b> — sync будет считать "
+                "новые цены, но <b>не запишет</b> их на FunPay. "
+                "Поставь true и рестартни сервис, чтобы цена реально менялась."
+            )
         await msg.answer(
             f"✅ <b>{param}</b> = {shown}\n\n<i>{hint}</i>\n\n"
-            "Применится при следующем sync (~30 c) или нажми 🔄 Синхронизация.",
+            "Применится при следующем sync (~30 c) или нажми 🔄 Синхронизация." + warn,
             reply_markup=ui.single_close_kb(),
         )
 
@@ -1966,6 +2008,176 @@ class TelegramBot:
             ],
         ])
         await msg.answer(text, reply_markup=delta_kb)
+
+    @_guard
+    async def _do_force_sync(self, msg: Message) -> None:
+        """
+        /force_sync <funpay_lot_id>
+
+        Полный одношаговый прогон по одному маппингу — для отладки, когда
+        не понятно «почему цена не меняется». Печатает каждый шаг:
+            1. маппинг найден
+            2. NS-сервис найден
+            3. курс и наценка
+            4. целевая цена/сток
+            5. текущая цена/сток на FunPay
+            6. что будет сделано
+            7. mode (REAL / DRY-RUN) и применил ли реально
+        """
+        parts = (msg.text or "").strip().split()
+        if len(parts) < 2:
+            await msg.answer(
+                "Использование: <code>/force_sync &lt;funpay_lot_id&gt;</code>\n\n"
+                "Команда сделает развёрнутый прогон одного лота и покажет, "
+                "почему цена обновится или не обновится.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        try:
+            lot_id = int(parts[1])
+        except ValueError:
+            await msg.answer("funpay_lot_id должен быть числом")
+            return
+
+        from src.config_runtime import (
+            get_global_markup_percent, get_stock_cap,
+        )
+        from src.mapping.rules import compute_pricing
+        from src.sync.fx import get_rate_breakdown
+        from src.sync.stock_sync import (
+            _decide_for_one, _apply_decision, _flatten_services,
+        )
+
+        # 1. маппинг
+        async with session_factory()() as session:
+            mapping = (await session.execute(
+                select(Mapping).where(Mapping.funpay_lot_id == lot_id)
+            )).scalar_one_or_none()
+
+        if mapping is None:
+            await msg.answer(
+                f"❌ Маппинга для лота <code>{lot_id}</code> нет.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        if not mapping.enabled:
+            await msg.answer(
+                f"⏸ Маппинг есть, но <b>enabled=False</b>. "
+                "Включи в /mappings или /map ещё раз.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        if self._funpay_client is None:
+            await msg.answer(
+                "❌ FunPay-клиент не подключён. /funpay_reconnect.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        await msg.answer(
+            f"⏳ Прогоняю force_sync для лота <code>{lot_id}</code> ...",
+            reply_markup=None,
+        )
+
+        try:
+            stock = await self._get_stock(force=True)
+        except Exception as exc:
+            await msg.answer(
+                f"❌ NS get_stock упал: <code>{html.escape(str(exc))}</code>",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        services = _flatten_services(stock)
+        ns_svc = services.get(mapping.ns_service_id)
+
+        rate = await get_rate_breakdown(self._settings)
+        eff_markup = await get_global_markup_percent(self._settings)
+        eff_stock_cap = await get_stock_cap(self._settings)
+
+        decision = await _decide_for_one(
+            ns_svc, mapping, self._settings, rate.effective,
+            self._funpay_client,
+            effective_markup=eff_markup,
+            effective_stock_cap=eff_stock_cap,
+        )
+        if decision is None:
+            await msg.answer(
+                "❌ _decide_for_one вернул None (неожиданная ошибка)",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        if decision.skip_reason:
+            await msg.answer(
+                f"⚠ <b>Skip:</b> <code>{html.escape(decision.skip_reason)}</code>\n"
+                f"Лот не будет обновлён, см. подробности в логе сервера.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        actions: list[str] = []
+        if decision.will_update_price:
+            actions.append(
+                f"price <b>{decision.current_price}</b> → "
+                f"<b>{decision.target.round_price()}</b> "
+                f"{decision.target.currency.value}"
+            )
+        if decision.will_update_stock:
+            actions.append(f"stock → <b>{decision.target.stock}</b>")
+        if decision.will_activate:
+            actions.append("activate")
+        if decision.will_deactivate:
+            actions.append("deactivate")
+
+        real = self._settings.enable_real_actions
+        mode = "🟢 REAL" if real else "🔴 DRY-RUN"
+
+        applied_line = ""
+        if actions and real:
+            try:
+                await _apply_decision(decision, self._funpay_client, self._settings)
+                applied_line = "✅ <b>Изменения отправлены на FunPay</b>"
+            except Exception as exc:
+                applied_line = (
+                    f"❌ save_lot упал: <code>{html.escape(str(exc))[:200]}</code>"
+                )
+        elif actions and not real:
+            applied_line = (
+                "🟡 <b>DRY-RUN</b> — изменения НЕ отправлены на FunPay.\n"
+                "В <code>.env</code> поставь <code>ENABLE_REAL_ACTIONS=true</code> "
+                "и перезапусти сервис."
+            )
+        else:
+            applied_line = "ℹ Цена/сток уже в пределах порога — обновлять нечего."
+
+        ns_line = (
+            f"🛒 NS: <b>{ns_svc.service_name[:60]}</b> "
+            f"(${ns_svc.price:.4f}, stock {ns_svc.in_stock})"
+            if ns_svc is not None
+            else "🛒 NS: <b>сервис не найден в каталоге!</b>"
+        )
+
+        text = (
+            f"🔬 <b>force_sync для лота {lot_id}</b>\n\n"
+            f"📌 Маппинг: ns_service_id=<code>{mapping.ns_service_id}</code>, "
+            f"markup={'mapping ' + str(mapping.markup_percent) + '%' if mapping.markup_percent is not None else 'global'}\n"
+            f"{ns_line}\n"
+            f"💱 Курс: <b>{rate.effective:.4f}</b> "
+            f"(база {rate.base:.4f} + {rate.premium_percent:.1f}%)\n"
+            f"📈 Эффективная наценка: <b>{decision.target.markup_percent:.2f}%</b>\n\n"
+            f"<b>Цель:</b>\n"
+            f"  price (продавцу): <b>{decision.target.round_price()} "
+            f"{decision.target.currency.value}</b>\n"
+            f"  stock: <b>{decision.target.stock}</b>\n\n"
+            f"<b>Сейчас на FunPay:</b>\n"
+            f"  price: <b>{decision.current_price}</b>\n\n"
+            f"<b>Решение sync:</b>\n  "
+            + (", ".join(actions) if actions else "ничего не меняем")
+            + f"\n\n<b>Режим:</b> {mode}\n{applied_line}"
+        )
+        await msg.answer(text, reply_markup=ui.single_close_kb())
 
     @_guard
     async def _do_inspect_lot(self, msg: Message) -> None:
