@@ -502,43 +502,55 @@ class FunPayClient:
 
         return await self._to_thread(_get)
 
-    async def get_lot_fields(self, lot_id: int) -> Any:
+    @property
+    def _admin(self) -> Any:
+        """
+        Ленивая инициализация нашего собственного HTTP-клиента для
+        админ-операций. Используется вместо сломанных FunPayAPI методов
+        get_lot_fields / save_lot, которые ожидают JSON, а FunPay
+        отдаёт HTML.
+        """
+        cached = getattr(self, "_admin_client_cache", None)
+        if cached is not None:
+            return cached
+        from src.funpay.admin_http import FunPayAdminClient
+        gk = self._settings.funpay_golden_key.get_secret_value()
+        ps = (
+            self._settings.funpay_phpsessid.get_secret_value()
+            if self._settings.funpay_phpsessid
+            else None
+        )
+        client = FunPayAdminClient(
+            golden_key=gk,
+            phpsessid=ps,
+            user_agent=self.DEFAULT_USER_AGENT,
+        )
+        self._admin_client_cache = client
+        return client
+
+    async def get_lot_fields(self, lot_id: int, node_id: int | None = None) -> Any:
         """
         Поля лота для редактирования (LotFields).
 
-        Распространённая ошибка — `Expecting value: line 1 column 1 (char 0)`:
-        это значит, что FunPay вместо JSON отдал HTML страницы логина
-        (PHPSESSID протух или golden_key больше не валиден).
-        Делаем один reconnect и пробуем снова.
+        Идём через собственный HTTP-клиент (admin_http.FunPayAdminClient),
+        который парсит HTML формы /lots/offerEdit. Установленный
+        FunPayAPI для этой операции непригоден — он ждёт JSON, а
+        FunPay отдаёт HTML, отсюда вечная JSONDecodeError.
         """
+        from src.funpay.admin_http import FunPayAuthError, FunPayParseError
         try:
-            return await self._to_thread(self.account.get_lot_fields, lot_id)
-        except Exception as exc:
-            if not self._looks_like_session_expired(exc):
-                raise
-            logger.warning(
-                f"FunPay get_lot_fields({lot_id}) упал ({type(exc).__name__}: "
-                f"{exc}). Похоже, сессия протухла — пробую переподключиться."
+            return await self._admin.get_lot_fields(lot_id, node_id=node_id)
+        except FunPayAuthError as exc:
+            logger.error(
+                f"FunPay get_lot_fields({lot_id}) auth-error: {exc}. "
+                f"Обнови FUNPAY_GOLDEN_KEY в .env."
             )
-            try:
-                await self.connect()
-            except Exception as exc2:
-                logger.error(
-                    f"FunPay reconnect упал: {exc2}. Обнови FUNPAY_GOLDEN_KEY "
-                    f"и FUNPAY_PHPSESSID в .env и перезапусти сервис."
-                )
-                raise
-            try:
-                return await self._to_thread(self.account.get_lot_fields, lot_id)
-            except Exception as exc3:
-                logger.error(
-                    f"FunPay get_lot_fields({lot_id}) и после reconnect упал: "
-                    f"{type(exc3).__name__}: {exc3}. Чаще всего это означает, "
-                    f"что протух FUNPAY_PHPSESSID. Обнови его в .env (см. "
-                    f"deploy/README.md → 'Где взять PHPSESSID') и "
-                    f"перезапусти сервис."
-                )
-                raise
+            raise
+        except FunPayParseError as exc:
+            logger.error(
+                f"FunPay get_lot_fields({lot_id}) HTML parse-error: {exc}."
+            )
+            raise
 
     @staticmethod
     def _looks_like_session_expired(exc: BaseException) -> bool:
@@ -616,9 +628,33 @@ class FunPayClient:
 
         return await self._to_thread(_collect)
 
-    async def save_lot(self, lot_fields: Any) -> None:
-        """Сохранить изменения лота (после правки полей)."""
+    async def save_lot(self, lot_fields: Any) -> dict[str, Any]:
+        """
+        Сохранить изменения лота.
+
+        Если lot_fields — это наш LotFields (admin_http), идём через
+        собственный POST /lots/offerSave. Иначе (для совместимости)
+        пробуем FunPayAPI.save_lot.
+        """
+        from src.funpay.admin_http import LotFields as AdminLotFields
+        if isinstance(lot_fields, AdminLotFields):
+            result = await self._admin.save_lot(lot_fields)
+            if not result.get("ok"):
+                logger.error(
+                    f"FunPay save_lot({lot_fields.lot_id}) NOT OK: "
+                    f"http={result.get('http_status')}, "
+                    f"err={result.get('funpay_error')}, "
+                    f"preview={result.get('body_preview', '')[:120]}"
+                )
+            else:
+                logger.info(
+                    f"FunPay save_lot({lot_fields.lot_id}) OK "
+                    f"(price={lot_fields.price}, amount={lot_fields.amount})"
+                )
+            return result
+        # Fallback на FunPayAPI (вряд ли понадобится)
         await self._to_thread(self.account.save_lot, lot_fields)
+        return {"ok": True, "source": "FunPayAPI.save_lot"}
 
     async def send_message(self, chat_id: int, text: str) -> Any:
         """Отправить сообщение в чат с покупателем."""
