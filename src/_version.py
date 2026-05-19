@@ -4,6 +4,6 @@ deploy/stamp_version.py перед каждым push'ем.
 
 ВАЖНО: НЕ редактируй вручную — твои изменения будут перезаписаны.
 """
-SHA = "90c6207513ed1b7e533a5644b4d6557e24d735a7"
-DATE = "2026-05-19T16:07:03+03:00"
-SUBJECT = "fix(deploy,funpay): bust gh-proxy cache + admin_http send retries + silence FunPayAPI noise"
+SHA = "6b7d78e9b69f25ddd32d9d73d76bc15f1c531a77"
+DATE = "2026-05-19T16:13:21+03:00"
+SUBJECT = "fix(deploy,smoke): triple-fallback SHA lookup + fix smoke format string"
