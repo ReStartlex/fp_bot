@@ -187,6 +187,119 @@ class FunPayAdminClient:
             "authenticated": bool(user_id),
         }
 
+    async def get_chats_snapshot(self) -> list[dict[str, Any]]:
+        """
+        Тянет страницу /chat/ и парсит список чатов из левой панели.
+
+        FunPay UI на /chat/ показывает список из ~50 последних чатов с
+        собеседниками. Каждая карточка — <a class="contact-item"> с
+        атрибутами:
+            - data-id (или href ?node=NODE_ID) — chat_id
+            - .media-user-name — username собеседника
+            - .contact-item-message — текст последнего сообщения (превью)
+            - .contact-item-time — время или подпись «нет сообщений»
+
+        Возвращает list[dict] с полями:
+            chat_id (int), username (str|None), preview (str), node (int)
+        """
+        r = await asyncio.to_thread(self._sync_get, f"{self.BASE}/chat/")
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        items: list[dict[str, Any]] = []
+        # FunPay рендерит карточки через <a class="contact-item"> или
+        # <a class="contact-item js-contact-item">; data-id содержит id чата.
+        for a in soup.select("a.contact-item, a.js-contact-item"):
+            data_id = a.get("data-id") or ""
+            href = a.get("href") or ""
+            chat_id: int | None = None
+            # 1. data-id
+            try:
+                chat_id = int(data_id) if data_id else None
+            except (TypeError, ValueError):
+                chat_id = None
+            # 2. href ?node=...
+            if chat_id is None and "node=" in href:
+                m = re.search(r"node=(\d+)", href)
+                if m:
+                    try:
+                        chat_id = int(m.group(1))
+                    except (TypeError, ValueError):
+                        pass
+            if chat_id is None:
+                continue
+
+            username_el = a.select_one(".media-user-name, .contact-item-name")
+            username = username_el.get_text(strip=True) if username_el else None
+
+            preview_el = a.select_one(
+                ".contact-item-message, .contact-item-text, .contact-item-msg"
+            )
+            preview = preview_el.get_text(strip=True) if preview_el else ""
+
+            unread = bool(a.find(class_=re.compile(r"unread")))
+
+            items.append(
+                {
+                    "chat_id": chat_id,
+                    "username": username,
+                    "preview": preview,
+                    "unread": unread,
+                }
+            )
+        return items
+
+    async def get_chat_messages(
+        self, chat_id: int, *, last_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        """
+        Парсит сообщения из чата /chat/?node=CHAT_ID.
+
+        Возвращает список словарей вида:
+            {message_id, author_id, author_username, text, is_my, when}
+        Самое свежее — в конце списка (по порядку на странице FunPay).
+        """
+        url = f"{self.BASE}/chat/?node={int(chat_id)}"
+        r = await asyncio.to_thread(self._sync_get, url)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # FunPay рендерит сообщения как <div class="chat-msg-item"
+        # data-id="123" data-author="456">
+        out: list[dict[str, Any]] = []
+        for el in soup.select(".chat-msg-item, .chat-msg, .chat-message"):
+            mid_raw = el.get("data-id") or el.get("id") or ""
+            try:
+                mid = int(re.sub(r"\D", "", mid_raw)) if mid_raw else None
+            except (TypeError, ValueError):
+                mid = None
+            if last_id is not None and mid is not None and mid <= last_id:
+                continue
+
+            author_raw = el.get("data-author") or el.get("data-user-id") or ""
+            try:
+                author_id = int(author_raw) if author_raw else None
+            except (TypeError, ValueError):
+                author_id = None
+
+            user_link = el.select_one(".chat-msg-author-link, a.media-user-name")
+            author_username = (
+                user_link.get_text(strip=True) if user_link else None
+            )
+
+            body_el = el.select_one(".chat-msg-text, .message-text, .chat-msg-body")
+            text = body_el.get_text(separator=" ", strip=True) if body_el else ""
+            if not text:
+                continue
+
+            out.append(
+                {
+                    "message_id": mid,
+                    "author_id": author_id,
+                    "author_username": author_username,
+                    "text": text,
+                }
+            )
+        return out
+
     async def get_lot_fields(
         self, lot_id: int, node_id: int | None = None
     ) -> LotFields:

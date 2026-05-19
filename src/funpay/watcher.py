@@ -223,164 +223,110 @@ class FunPayWatcher:
                 return
 
     def _poll_once(self) -> None:
-        chats = self._fetch_chats_snapshot()
-        my_id = getattr(self._fp.account, "id", None)
+        """
+        Тянет страницу /chat/ через свой HTTP-клиент (admin_http),
+        диффает превью сообщений с предыдущим снимком.
 
-        # Первый снимок — просто baseline.
+        Почему ходим напрямую, а не через FunPayAPI: `account.get_chats()`
+        в этой версии библиотеки возвращает кэшированный INITIAL_CHAT
+        снимок и не обновляется. Только прямой HTTP к /chat/ даёт
+        свежие данные. Это **гарантированный** путь — браузер FunPay
+        работает так же.
+        """
+        try:
+            items = asyncio.run(self._fp._admin.get_chats_snapshot())  # type: ignore[attr-defined]
+        except Exception as exc:
+            logger.debug(f"FunPay poll: get_chats_snapshot упал: {exc}")
+            return
+
+        my_id = getattr(self._fp.account, "id", None)
         is_baseline = not self._baseline_ready.is_set()
 
         new_snapshot: dict[int, str] = {}
-        for chat in chats:
-            chat_id = self._g(chat, "id", "chat_id", "node_id")
-            if chat_id is None:
-                continue
-            try:
-                chat_id_int = int(chat_id)
-            except (TypeError, ValueError):
-                continue
-
-            last = self._extract_last_message(chat)
-            if last is None:
-                # У чата ещё нет сообщений — пропускаем.
-                continue
-            signature = self._message_signature(last)
-            new_snapshot[chat_id_int] = signature
-
+        changes: list[tuple[int, str, str | None]] = []  # (chat_id, preview, username)
+        for item in items:
+            chat_id = item["chat_id"]
+            preview = item.get("preview", "")
+            username = item.get("username")
+            new_snapshot[chat_id] = preview
             if is_baseline:
                 continue
-
-            prev_signature = self._poll_snapshot.get(chat_id_int)
-            if prev_signature == signature:
+            prev = self._poll_snapshot.get(chat_id)
+            if prev == preview:
                 continue
-
-            # Сообщение изменилось — кто автор?
-            msg = self._normalize_message_from_chat(chat, last, my_id)
-            if msg is None or msg.is_my_message:
-                continue
-            if not self._dedup_register("msg", msg):
-                # Уже видели это сообщение через listen.
-                continue
-            logger.info(
-                f"FunPay poll: новое сообщение в чате {msg.chat_id} от "
-                f"@{msg.author_username}: {msg.text[:80]!r}"
-            )
-            if self._on_new_message is not None:
-                self._dispatch_async(self._on_new_message(msg))
+            changes.append((chat_id, preview, username))
 
         self._poll_snapshot = new_snapshot
+
         if is_baseline:
             self._baseline_ready.set()
             logger.info(
                 f"FunPay poll: baseline зафиксирован "
                 f"({len(new_snapshot)} чатов)"
             )
+            return
 
-    def _fetch_chats_snapshot(self) -> list[Any]:
-        """Получает список чатов из FunPayAPI (метод варьируется)."""
-        account = self._fp.account
-        # FunPayAPI 1.1.0: account.get_chats()
-        getter = getattr(account, "get_chats", None)
-        if callable(getter):
+        if not changes:
+            return
+
+        # Для каждого изменившегося чата — забираем актуальную историю
+        # и берём сообщения, которых ещё не видели (по message_id).
+        for chat_id, preview, username in changes:
             try:
-                value = getter()
-                return self._flatten_chats(value)
+                messages = asyncio.run(
+                    self._fp._admin.get_chat_messages(chat_id)  # type: ignore[attr-defined]
+                )
             except Exception as exc:
-                logger.debug(f"account.get_chats() упал: {exc}")
+                logger.debug(
+                    f"FunPay poll: get_chat_messages({chat_id}) упал: {exc}"
+                )
+                # Фолбэк: конструируем events на основе превью.
+                msg = FunPayMessageEvent(
+                    chat_id=chat_id,
+                    chat_username=username,
+                    author_id=None,
+                    author_username=username,
+                    text=preview,
+                    is_my_message=False,
+                )
+                if self._dedup_register("msg", msg):
+                    logger.info(
+                        f"FunPay poll: новое сообщение (preview) в чате "
+                        f"{chat_id} от @{username}: {preview[:80]!r}"
+                    )
+                    if self._on_new_message is not None:
+                        self._dispatch_async(self._on_new_message(msg))
+                continue
 
-        # Старые версии: account.chats атрибут
-        chats = getattr(account, "chats", None)
-        if chats is not None:
-            return self._flatten_chats(chats)
-
-        return []
-
-    @staticmethod
-    def _flatten_chats(value: Any) -> list[Any]:
-        if isinstance(value, list):
-            return value
-        if isinstance(value, dict):
-            return list(value.values())
-        return []
-
-    def _extract_last_message(self, chat: Any) -> Any:
-        """Возвращает последнее сообщение в чате (или None)."""
-        # FunPayAPI 1.1.0: chat.last_message — Message object
-        for attr in (
-            "last_message",
-            "last_msg",
-            "last_by_id",
-        ):
-            value = getattr(chat, attr, None)
-            if value is not None:
-                return value
-        # некоторые форки кладут last_message_text + last_message_author напрямую
-        text = getattr(chat, "last_message_text", None)
-        if text is not None:
-            return chat  # сам chat несёт last_message_* атрибуты
-        return None
-
-    def _message_signature(self, last: Any) -> str:
-        """Стабильная сигнатура для дедупа: msg_id + author_id + первые
-        80 символов текста. Если msg_id нет — текст + author."""
-        msg_id = self._g(last, "id", "message_id")
-        author_id = self._g(last, "author_id", "user_id")
-        if author_id is None:
-            author = self._g(last, "author", "from_user")
-            if author is not None and not isinstance(author, (int, str)):
-                author_id = getattr(author, "id", None)
-        text = self._g(last, "text", "content", "body") or ""
-        if msg_id is not None:
-            return f"{msg_id}|{author_id}|{str(text)[:80]}"
-        return f"{author_id}|{str(text)[:200]}"
-
-    def _normalize_message_from_chat(
-        self, chat: Any, last: Any, my_id: Any
-    ) -> Optional[FunPayMessageEvent]:
-        chat_id_raw = self._g(chat, "id", "chat_id", "node_id")
-        try:
-            chat_id = int(chat_id_raw) if chat_id_raw is not None else None
-        except (TypeError, ValueError):
-            chat_id = None
-        if chat_id is None:
-            return None
-
-        chat_username = self._g(
-            chat, "name", "interlocutor", "chat_name", "chat_username"
-        )
-
-        text_raw = self._g(last, "text", "content", "body")
-        if text_raw is None:
-            # Иногда last — это объект с .text=None, но есть .image и т.п.
-            return None
-        text = str(text_raw)
-
-        author = self._g(last, "author", "from_user", "user")
-        author_username = None
-        author_id = self._g(last, "author_id", "user_id")
-        if author is not None and not isinstance(author, (int, str)):
-            author_username = getattr(author, "username", None)
-            author_id = author_id or getattr(author, "id", None)
-        elif isinstance(author, str):
-            author_username = author
-        try:
-            author_id = int(author_id) if author_id is not None else None
-        except (TypeError, ValueError):
-            author_id = None
-
-        is_my = bool(
-            my_id is not None
-            and author_id is not None
-            and int(author_id) == int(my_id)
-        )
-
-        return FunPayMessageEvent(
-            chat_id=chat_id,
-            chat_username=str(chat_username) if chat_username is not None else None,
-            author_id=author_id,
-            author_username=str(author_username) if author_username is not None else None,
-            text=text,
-            is_my_message=is_my,
-        )
+            # messages — список сообщений в чате; нам интересны только
+            # последние, и только НЕ свои.
+            for m in messages[-10:]:
+                author_id = m.get("author_id")
+                is_my = bool(
+                    my_id is not None
+                    and author_id is not None
+                    and int(author_id) == int(my_id)
+                )
+                if is_my:
+                    continue
+                msg = FunPayMessageEvent(
+                    chat_id=chat_id,
+                    chat_username=username,
+                    author_id=author_id,
+                    author_username=m.get("author_username") or username,
+                    text=m.get("text", ""),
+                    is_my_message=False,
+                )
+                if not msg.text:
+                    continue
+                if not self._dedup_register("msg", msg):
+                    continue
+                logger.info(
+                    f"FunPay poll: новое сообщение в чате {chat_id} от "
+                    f"@{msg.author_username}: {msg.text[:80]!r}"
+                )
+                if self._on_new_message is not None:
+                    self._dispatch_async(self._on_new_message(msg))
 
     # ---------- dedup ----------
 
