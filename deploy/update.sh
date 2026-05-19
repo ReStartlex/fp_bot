@@ -74,10 +74,18 @@ fi
 
 # 4. Чиним права ДО рестарта. Сервис бежит от 'bot', и .env должен
 # быть владельца bot (mv от root забирает права).
+# Также гарантируем logs/ и data/ как папки (systemd-mount-namespacing
+# падает если их нет) и владельца bot:bot.
+mkdir -p "${APP_DIR}/logs" "${APP_DIR}/data"
 if getent passwd bot >/dev/null 2>&1; then
     chown -R bot:bot "${APP_DIR}"
 fi
+chmod 700 "${APP_DIR}/logs" "${APP_DIR}/data" 2>/dev/null || true
 chmod 600 "${APP_DIR}/.env" 2>/dev/null || true
+# Убеждаемся, что bridge.db и его WAL/SHM журналы доступны на запись
+# для bot (после prev неудачных rm -rf могло слететь).
+find "${APP_DIR}/data" -type f \( -name 'bridge.db' -o -name 'bridge.db-*' \) \
+    -exec chmod 600 {} \; 2>/dev/null || true
 
 # 5. Запускаем (или перезапускаем) сервис.
 if systemctl is-enabled --quiet funpay-ns-bot 2>/dev/null \

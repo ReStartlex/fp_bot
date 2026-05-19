@@ -96,6 +96,12 @@ fi
 git clean -fd --exclude='.venv' --exclude='data' --exclude='.env' \
     --exclude='logs' --exclude='BUILD_INFO' 2>/dev/null || true
 
+# Обязательные runtime-папки. systemd-сервис стартует с
+# ProtectHome/InaccessiblePaths, который требует, чтобы logs/ и
+# data/ существовали ДО старта. Без них unit падает с
+# "Failed to set up mount namespacing: ... No such file or directory".
+mkdir -p "${APP_DIR}/logs" "${APP_DIR}/data"
+
 echo "    [git] fetch+reset через прокси: OK"
 
 # BUILD_INFO пишем из src/_version.py — он обновляется при каждом
