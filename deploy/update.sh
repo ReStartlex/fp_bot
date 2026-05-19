@@ -18,6 +18,13 @@ if [[ ! -d "${APP_DIR}" ]]; then
     exit 1
 fi
 
+# git 2.35+ ругается на "dubious ownership" если папка принадлежит
+# другому пользователю (bot:bot, а update.sh — от root). Регистрируем
+# safe.directory один раз в системном config.
+git config --system --add safe.directory "${APP_DIR}" 2>/dev/null \
+    || git config --global --add safe.directory "${APP_DIR}" 2>/dev/null \
+    || true
+
 # update.sh обязан запускаться от root. Сам скрипт делает chown bot:bot,
 # systemctl restart funpay-ns-bot и chmod 600 .env — всё это требует root.
 # Если запустили из-под bot — пере-вызовем себя через sudo.

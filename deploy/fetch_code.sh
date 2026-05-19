@@ -23,6 +23,13 @@ GIT_PROXY_URL="${GH_PROXY}/https://github.com/${GH_OWNER}/${GH_REPO}.git"
 
 echo "==> Получаем код в ${APP_DIR}"
 
+# git 2.35+ отказывается работать в репозитории, владелец которого не
+# совпадает с текущим юзером ("dubious ownership"). Update.sh идёт от
+# root, а /opt/funpay-ns-bot принадлежит bot:bot — отсюда fatal.
+# Регистрируем директорию как доверенную (идемпотентно).
+git config --global --add safe.directory "${APP_DIR}" 2>/dev/null || true
+git config --system --add safe.directory "${APP_DIR}" 2>/dev/null || true
+
 if [[ -n "${CODEBERG_URL}" ]]; then
     echo "    Использую Codeberg-зеркало: ${CODEBERG_URL}"
     if [[ -d "${APP_DIR}/.git" ]]; then
