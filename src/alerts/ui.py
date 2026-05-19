@@ -298,9 +298,23 @@ def format_funpay_lot_line(lot: Any) -> str:
     )
 
 
+def _format_markup_percent(value: Any) -> str:
+    """Целые без '.0', дробные с обрезкой хвостовых нулей."""
+    if value is None:
+        return "default"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return f"{value}%"
+    if abs(v - round(v)) < 1e-9:
+        return f"{int(round(v))}%"
+    text = f"{v:.2f}".rstrip("0").rstrip(".")
+    return f"{text or '0'}%"
+
+
 def format_mapping_line(m: Any) -> str:
     status = "✅" if m.enabled else "⏸"
-    markup = f"{m.markup_percent}%" if m.markup_percent is not None else "default"
+    markup = _format_markup_percent(m.markup_percent)
     label = short_title(getattr(m, "label", None), limit=60)
     title = f" — {label}" if label else ""
     return (

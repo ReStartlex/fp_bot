@@ -139,3 +139,17 @@ def test_should_update_price_above_threshold():
 
 def test_should_update_price_zero_old():
     assert should_update_price(0.0, 50.0, threshold_percent=2.0) is True
+
+
+def test_pricing_fractional_markup_propagates_through_calculation():
+    """Дробная наценка 5.5% должна влиять на цену с двумя знаками точности."""
+    res = compute_pricing(
+        ns_service=_svc(price=2.0),
+        mapping=_map(markup=5.5),
+        settings=_S(),  # type: ignore[arg-type]
+        fx_rate_usd_to_target=90.0,
+    )
+    assert res.markup_percent == pytest.approx(5.5)
+    # 2 * 90 * 1.055 = 189.9
+    assert res.price_target == pytest.approx(189.9)
+    assert res.round_price() == 190

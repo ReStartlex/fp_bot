@@ -8,7 +8,7 @@ import pytest
 from aiogram.types import InlineKeyboardMarkup
 
 from src.alerts import ui
-from src.alerts.bot import _format_order_line
+from src.alerts.bot import _format_order_line, format_percent
 
 
 # ─────────────── фейковые объекты (как в FunPayAPI / NS) ───────────────
@@ -174,7 +174,9 @@ def test_format_mapping_line_enabled():
     assert "✅" in out
     assert "111" in out
     assert "222" in out
-    assert "15.0%" in out
+    # для целого markup показываем без хвостового '.0'
+    assert "15%" in out
+    assert "15.0%" not in out
     assert "Apple" in out
 
 
@@ -261,6 +263,62 @@ def test_mapping_label_falls_back_to_id():
         label=None,
     )
     assert ui.mapping_label(m) == "#42"
+
+
+def test_format_percent_integer_drops_decimal():
+    assert format_percent(6) == "6"
+    assert format_percent(6.0) == "6"
+    assert format_percent(0) == "0"
+
+
+def test_format_percent_fractional_trims_trailing_zeros():
+    assert format_percent(5.5) == "5.5"
+    assert format_percent(5.50) == "5.5"
+    assert format_percent(7.25) == "7.25"
+    # точность форматирования — до 2 знаков; хвостовые нули убираются
+    assert format_percent(7.001) == "7"
+    assert format_percent(7.1234) == "7.12"
+
+
+def test_format_percent_none_and_invalid():
+    assert format_percent(None) == "—"
+    assert format_percent("hello") == "hello"
+
+
+def test_format_mapping_line_uses_clean_percent_for_integer():
+    @dataclass
+    class FakeMappingLocal:
+        funpay_lot_id: int
+        ns_service_id: int
+        enabled: bool
+        markup_percent: float | None
+        stock_cap: int | None
+        label: str | None
+
+    m = FakeMappingLocal(
+        funpay_lot_id=1, ns_service_id=2, enabled=True,
+        markup_percent=6.0, stock_cap=None, label="x",
+    )
+    line = ui.format_mapping_line(m)
+    assert "6%" in line
+    assert "6.0%" not in line
+
+
+def test_format_mapping_line_keeps_fraction():
+    @dataclass
+    class FakeMappingLocal:
+        funpay_lot_id: int
+        ns_service_id: int
+        enabled: bool
+        markup_percent: float | None
+        stock_cap: int | None
+        label: str | None
+
+    m = FakeMappingLocal(
+        funpay_lot_id=1, ns_service_id=2, enabled=True,
+        markup_percent=5.5, stock_cap=None, label="x",
+    )
+    assert "5.5%" in ui.format_mapping_line(m)
 
 
 def test_format_order_line_uses_moscow_time():

@@ -9,15 +9,32 @@ from loguru import logger
 from src.config import Settings, get_settings
 
 
+# Подстроки, которые мы знаем как шум от FunPayAPI listen-loop'a
+# (рейт-лимит на запрос историй чатов). Наш собственный poll-loop
+# забирает истории отдельным HTTP-клиентом, поэтому эти строки бесполезны.
+_NOISY_PATTERNS = (
+    "не удалось получить истории чатов",
+    "не удалось получить историю чата",
+)
+
+
 class _InterceptHandler(logging.Handler):
     """
     Перенаправляет логи stdlib logging в loguru.
     Нужно, чтобы сообщения FunPayAPI.Runner и других библиотек
     (которые юзают logging.getLogger), оказывались в наших логах,
     а не сыпались отдельной строкой через print() / stderr.
+
+    Дополнительно: понижает уровень/отбрасывает шумные сообщения
+    FunPayAPI о повторных попытках получить историю чата.
     """
 
     def emit(self, record: logging.LogRecord) -> None:
+        message = record.getMessage()
+        lowered = message.lower()
+        if any(pat in lowered for pat in _NOISY_PATTERNS):
+            # Полностью игнорируем — это спам, который ни на что не влияет.
+            return
         try:
             level = logger.level(record.levelname).name
         except (AttributeError, ValueError):
@@ -26,9 +43,7 @@ class _InterceptHandler(logging.Handler):
         while frame and frame.f_code.co_filename == logging.__file__:
             frame = frame.f_back
             depth += 1
-        logger.opt(depth=depth, exception=record.exc_info).log(
-            level, record.getMessage()
-        )
+        logger.opt(depth=depth, exception=record.exc_info).log(level, message)
 
 
 def setup_logging(settings: Settings | None = None) -> None:

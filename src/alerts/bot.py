@@ -67,6 +67,23 @@ def _format_dt(dt: datetime | None) -> str:
     return "—" if msk is None else msk.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def format_percent(value: float | int | None) -> str:
+    """
+    Красивое отображение процентов: целые без «.0», дробные — до 2 знаков
+    с обрезкой хвостовых нулей. Например: 6 -> '6', 5.5 -> '5.5', 5.50 -> '5.5'.
+    """
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if abs(v - round(v)) < 1e-9:
+        return f"{int(round(v))}"
+    text = f"{v:.2f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
 def _format_order_line(o: Order) -> str:
     created_at = _to_moscow(o.created_at)
     created_text = "—" if created_at is None else created_at.strftime("%m-%d %H:%M")
@@ -727,34 +744,25 @@ class TelegramBot:
         reply_markup: InlineKeyboardMarkup | None = None,
     ) -> Message | None:
         """
-        Показывает «панель» в чате. Если предыдущая панель известна,
-        сначала редактируем её; если редакт не удался — удаляем и шлём новую.
-        Так повторные /orders не создают каскад одинаковых заголовков.
+        Показывает «панель» в чате. Всегда отправляет новое сообщение внизу,
+        предварительно удаляя предыдущую панель (если она ещё свежая).
+
+        Зачем именно так:
+        - попытка edit_message_text молча правит сообщение далеко вверху
+          истории, и юзеру кажется, что бот не отвечает на команду;
+        - delete+send гарантирует визуальный отклик на каждый /menu, /orders
+          и т.п., а отсутствие каскада панелей обеспечивается удалением старой.
         """
         if self._bot is None:
             return None
-        prev_id = self._control_msg.get(chat_id)
+        prev_id = self._control_msg.pop(chat_id, None)
         if prev_id is not None:
             try:
-                await self._bot.edit_message_text(
-                    text,
-                    chat_id=chat_id,
-                    message_id=prev_id,
-                    reply_markup=reply_markup,
-                )
-                return None
-            except TelegramBadRequest as exc:
-                err = str(exc).lower()
-                if "message is not modified" in err:
-                    return None
-                try:
-                    await self._bot.delete_message(chat_id, prev_id)
-                except TelegramBadRequest:
-                    pass
-                except Exception as delete_exc:
-                    logger.debug(f"delete prev control: {delete_exc}")
+                await self._bot.delete_message(chat_id, prev_id)
+            except TelegramBadRequest:
+                pass
             except Exception as exc:
-                logger.debug(f"edit prev control: {exc}")
+                logger.debug(f"delete prev control: {exc}")
         new_msg = await self._bot.send_message(
             chat_id, text, reply_markup=reply_markup
         )
@@ -1887,13 +1895,29 @@ class TelegramBot:
             obj.markup_percent = markup
             await session.commit()
 
-        shown = (
-            "default" if markup is None
-            else f"{markup}% (вместо default {self._settings.markup_percent}%)"
-        )
+        from src.config_runtime import get_global_markup_percent
+        eff_default = await get_global_markup_percent(self._settings)
+        if markup is None:
+            shown = f"default ({format_percent(eff_default)}%)"
+            note = ""
+        else:
+            shown = (
+                f"{format_percent(markup)}% "
+                f"(default {format_percent(eff_default)}%)"
+            )
+            if abs(markup - eff_default) < 1e-6:
+                note = (
+                    "\n\nℹ Эта наценка <b>равна default</b> — sync покажет "
+                    "<code>updated=0</code>, потому что цена не изменится. "
+                    "Чтобы избавиться от персонального оверрайда — "
+                    f"<code>/setmarkup {funpay_lot_id} default</code>."
+                )
+            else:
+                note = ""
         await msg.answer(
             f"✏ Markup для лота <code>{funpay_lot_id}</code>: <b>{shown}</b>\n\n"
-            f"Запусти 🔄 Синхронизация или /sync, чтобы новая цена применилась.",
+            f"Запусти 🔄 Синхронизация или /sync, чтобы новая цена применилась."
+            f"{note}",
             reply_markup=ui.single_close_kb(),
         )
 
