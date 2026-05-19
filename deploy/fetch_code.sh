@@ -3,9 +3,10 @@
 # Использовать, когда git clone github.com напрямую не работает (как в нашем
 # случае: Timeweb режет TCP к github.com).
 #
-# Стратегия:
-#   1. Пробуем git clone/pull с CODEBERG_URL (если он задан).
-#   2. Если падает или не задан — качаем tarball через gh-proxy.com.
+# Стратегия (по приоритету):
+#   1. CODEBERG_URL (если задан) — git clone/pull от него.
+#   2. Git clone/fetch через gh-proxy.com (smart HTTP протокол не кэшируется).
+#   3. Tarball через прокси с двойным cache-bust (fallback last resort).
 
 set -euo pipefail
 
@@ -17,6 +18,7 @@ GH_REPO=fp_bot
 CODEBERG_URL=${CODEBERG_URL:-}
 GH_PROXY=${GH_PROXY:-https://gh-proxy.com}
 TARBALL_URL="${GH_PROXY}/https://github.com/${GH_OWNER}/${GH_REPO}/archive/refs/heads/${BRANCH}.tar.gz"
+GIT_PROXY_URL="${GH_PROXY}/https://github.com/${GH_OWNER}/${GH_REPO}.git"
 
 echo "==> Получаем код в ${APP_DIR}"
 
@@ -32,6 +34,115 @@ if [[ -n "${CODEBERG_URL}" ]]; then
     fi
     echo "    Готово через Codeberg."
     exit 0
+fi
+
+# ─── Стратегия 2: git через прокси (smart HTTP не кэшируется) ───
+# gh-proxy.com поддерживает git smart-http. git fetch/clone тянет
+# объекты пакетами и НИКОГДА не отдаёт устаревший snapshot.
+echo "    Пробую git fetch через прокси: ${GIT_PROXY_URL}"
+if [[ -d "${APP_DIR}/.git" ]]; then
+    # Уже клонировано — просто fetch+reset
+    cd "${APP_DIR}"
+    if git config --get remote.origin.url | grep -q "${GH_PROXY}"; then
+        : # remote уже через прокси — ничего не меняем
+    else
+        git remote set-url origin "${GIT_PROXY_URL}"
+    fi
+    if git fetch --depth=1 origin "${BRANCH}" && \
+       git reset --hard "origin/${BRANCH}"; then
+        echo "    [git] fetch+reset через прокси: OK"
+        # Восстановим права после git операций
+        if getent passwd bot >/dev/null 2>&1; then
+            chown -R bot:bot "${APP_DIR}"
+            chmod 600 "${APP_DIR}/.env" 2>/dev/null || true
+        fi
+        # BUILD_INFO из src/_version.py
+        if [[ -f "${APP_DIR}/src/_version.py" ]]; then
+            SHA=$(grep -E '^SHA' "${APP_DIR}/src/_version.py" | head -1 \
+                  | sed -E 's/.*"([^"]+)".*/\1/')
+            DATE=$(grep -E '^DATE' "${APP_DIR}/src/_version.py" | head -1 \
+                  | sed -E 's/.*"([^"]+)".*/\1/')
+            SUBJECT=$(grep -E '^SUBJECT' "${APP_DIR}/src/_version.py" | head -1 \
+                  | sed -E 's/.*"(.*)".*/\1/')
+            {
+                echo "sha=${SHA}"
+                echo "branch=${BRANCH}"
+                echo "date=${DATE}"
+                echo "subject=${SUBJECT}"
+                echo "fetched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            } > "${APP_DIR}/BUILD_INFO"
+            echo "    BUILD_INFO: ${SHA:0:12}  ${DATE:-?}  ${SUBJECT:-?}"
+        fi
+        echo "    Готово через git+proxy."
+        exit 0
+    fi
+    echo "    [git] fetch+reset не удался — fallback на свежий clone"
+    cd /tmp
+fi
+
+# Свежий clone в /tmp, потом aтомарно подменяем APP_DIR (сохраняя .env и data)
+echo "    [git] делаю свежий clone через прокси…"
+TMP_CLONE="/tmp/fp_bot_clone_$(date +%s)"
+rm -rf "${TMP_CLONE}"
+if git clone --depth=1 --branch "${BRANCH}" \
+    "${GIT_PROXY_URL}" "${TMP_CLONE}" 2>&1; then
+    # Сохраняем .env и data
+    PRESERVE_ENV=""
+    if [[ -f "${APP_DIR}/.env" ]]; then
+        PRESERVE_ENV=$(mktemp)
+        cp "${APP_DIR}/.env" "${PRESERVE_ENV}"
+    fi
+    PRESERVE_DATA=""
+    if [[ -d "${APP_DIR}/data" ]]; then
+        PRESERVE_DATA=$(mktemp -d)
+        cp -a "${APP_DIR}/data/." "${PRESERVE_DATA}/" 2>/dev/null || true
+    fi
+    # Сохраняем .venv (не клонировать его заново это медленно)
+    PRESERVE_VENV=""
+    if [[ -d "${APP_DIR}/.venv" ]]; then
+        PRESERVE_VENV="${APP_DIR}.venv_$$"
+        mv "${APP_DIR}/.venv" "${PRESERVE_VENV}"
+    fi
+    rm -rf "${APP_DIR}"
+    mv "${TMP_CLONE}" "${APP_DIR}"
+    # Возвращаем .env, data, .venv
+    if [[ -n "${PRESERVE_ENV}" ]]; then
+        mv "${PRESERVE_ENV}" "${APP_DIR}/.env"
+        chmod 600 "${APP_DIR}/.env"
+    fi
+    if [[ -n "${PRESERVE_DATA}" ]]; then
+        mkdir -p "${APP_DIR}/data"
+        cp -a "${PRESERVE_DATA}/." "${APP_DIR}/data/" 2>/dev/null || true
+        rm -rf "${PRESERVE_DATA}"
+    fi
+    if [[ -n "${PRESERVE_VENV}" ]]; then
+        mv "${PRESERVE_VENV}" "${APP_DIR}/.venv"
+    fi
+    if getent passwd bot >/dev/null 2>&1; then
+        chown -R bot:bot "${APP_DIR}"
+        chmod 600 "${APP_DIR}/.env" 2>/dev/null || true
+    fi
+    if [[ -f "${APP_DIR}/src/_version.py" ]]; then
+        SHA=$(grep -E '^SHA' "${APP_DIR}/src/_version.py" | head -1 \
+              | sed -E 's/.*"([^"]+)".*/\1/')
+        DATE=$(grep -E '^DATE' "${APP_DIR}/src/_version.py" | head -1 \
+              | sed -E 's/.*"([^"]+)".*/\1/')
+        SUBJECT=$(grep -E '^SUBJECT' "${APP_DIR}/src/_version.py" | head -1 \
+              | sed -E 's/.*"(.*)".*/\1/')
+        {
+            echo "sha=${SHA}"
+            echo "branch=${BRANCH}"
+            echo "date=${DATE}"
+            echo "subject=${SUBJECT}"
+            echo "fetched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        } > "${APP_DIR}/BUILD_INFO"
+        echo "    BUILD_INFO: ${SHA:0:12}  ${DATE:-?}  ${SUBJECT:-?}"
+    fi
+    echo "    Готово через git clone+proxy."
+    exit 0
+else
+    echo "    [git] clone через прокси упал — fallback на tarball"
+    rm -rf "${TMP_CLONE}"
 fi
 
 # gh-proxy.com и подобные прокси нередко КЭШИРУЮТ URL'ы вида
