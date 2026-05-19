@@ -18,6 +18,20 @@ if [[ ! -d "${APP_DIR}" ]]; then
     exit 1
 fi
 
+# update.sh обязан запускаться от root. Сам скрипт делает chown bot:bot,
+# systemctl restart funpay-ns-bot и chmod 600 .env — всё это требует root.
+# Если запустили из-под bot — пере-вызовем себя через sudo.
+if [[ "$(id -u)" -ne 0 ]]; then
+    if command -v sudo >/dev/null 2>&1; then
+        echo "==> update.sh требует root, перезапускаю через sudo"
+        exec sudo -E bash "$0" "$@"
+    else
+        echo "ОШИБКА: update.sh должен запускаться от root (нужны chown, systemctl, chmod на .env)."
+        echo "Запусти: sudo bash ${APP_DIR}/deploy/update.sh"
+        exit 1
+    fi
+fi
+
 # 1. Скачиваем свежий код, сохраняя .env и data.
 # Сначала пробуем локальный fetch_code.sh. Если его нет — тянем свежий
 # с GitHub (через proxy, потому что Timeweb-сеть GitHub блокирует).

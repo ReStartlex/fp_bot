@@ -36,15 +36,30 @@ fi
 
 # gh-proxy.com и подобные прокси нередко КЭШИРУЮТ URL'ы вида
 # /archive/refs/heads/main.tar.gz — на VPS прилетал устаревший tarball
-# через 10+ минут после нашего git push'а. Решение: сначала через
-# api.github.com (тоже через прокси) узнаём актуальный SHA main и
-# тянем tarball по конкретному SHA: /archive/${SHA}.tar.gz. Такой URL
-# уникален для каждого коммита, и кэш-промах гарантирован.
+# даже через 30+ минут после push'а в GitHub.
+#
+# Чтобы гарантированно получить свежий код, действуем в три эшелона:
+#
+#   1. Пробуем узнать актуальный SHA main через api.github.com:
+#      a) НАПРЯМУЮ (часто доступно даже если github.com заблокирован)
+#      b) через gh-proxy.com
+#      c) через raw.githubusercontent.com нашего же src/_version.py
+#         (он обновляется при каждом push'е через `stamp_version.py`)
+#   2. Если SHA удалось добыть — тянем tarball по
+#      /archive/${SHA}.tar.gz: такой URL уникален для каждого коммита
+#      и физически не может быть закэширован.
+#   3. Если SHA не получили — добавляем timestamp как query-string
+#      к branch-URL. gh-proxy.com включает query-string в кэш-ключ,
+#      так что это тоже даёт cache-miss.
 LATEST_SHA=""
-COMMITS_API="${GH_PROXY}/https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/commits/${BRANCH}"
-if SHA_JSON=$(curl -fsSL --max-time 30 -H 'Cache-Control: no-cache' \
-    "${COMMITS_API}?nocache=$(date +%s)" 2>/dev/null); then
-    LATEST_SHA=$(echo "${SHA_JSON}" | python3 -c '
+echo "    Пробую узнать актуальный SHA main…"
+
+# (a) api.github.com напрямую
+if [[ -z "${LATEST_SHA}" ]]; then
+    if SHA_JSON=$(curl -fsSL --max-time 15 -H 'Cache-Control: no-cache' \
+        "https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/commits/${BRANCH}" \
+        2>/dev/null); then
+        LATEST_SHA=$(echo "${SHA_JSON}" | python3 -c '
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -52,16 +67,53 @@ try:
 except Exception:
     pass
 ' 2>/dev/null || true)
+        if [[ -n "${LATEST_SHA}" ]]; then
+            echo "    [a] SHA через api.github.com напрямую: ${LATEST_SHA:0:12}"
+        fi
+    fi
 fi
 
+# (b) api.github.com через gh-proxy
+if [[ -z "${LATEST_SHA}" ]]; then
+    if SHA_JSON=$(curl -fsSL --max-time 15 -H 'Cache-Control: no-cache' \
+        "${GH_PROXY}/https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/commits/${BRANCH}?nc=$(date +%s)" \
+        2>/dev/null); then
+        LATEST_SHA=$(echo "${SHA_JSON}" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    sys.stdout.write(data.get("sha", "") or "")
+except Exception:
+    pass
+' 2>/dev/null || true)
+        if [[ -n "${LATEST_SHA}" ]]; then
+            echo "    [b] SHA через gh-proxy → api.github.com: ${LATEST_SHA:0:12}"
+        fi
+    fi
+fi
+
+# (c) read SHA из src/_version.py через raw.githubusercontent с cache-bust
+if [[ -z "${LATEST_SHA}" ]]; then
+    VERSION_URL="${GH_PROXY}/https://raw.githubusercontent.com/${GH_OWNER}/${GH_REPO}/${BRANCH}/src/_version.py?nc=$(date +%s)"
+    if VERSION_PY=$(curl -fsSL --max-time 15 -H 'Cache-Control: no-cache' \
+        "${VERSION_URL}" 2>/dev/null); then
+        LATEST_SHA=$(echo "${VERSION_PY}" | grep -E '^SHA' | head -1 \
+            | sed -E 's/.*"([^"]+)".*/\1/' || true)
+        if [[ -n "${LATEST_SHA}" ]]; then
+            echo "    [c] SHA через raw _version.py: ${LATEST_SHA:0:12}"
+        fi
+    fi
+fi
+
+# Выбираем URL tarball
 if [[ -n "${LATEST_SHA}" ]]; then
     TARBALL_URL="${GH_PROXY}/https://github.com/${GH_OWNER}/${GH_REPO}/archive/${LATEST_SHA}.tar.gz"
-    echo "    Latest SHA на ${BRANCH}: ${LATEST_SHA:0:12}"
-    echo "    Качаю tarball по SHA (cache-busting): ${TARBALL_URL}"
+    echo "    → tarball по SHA: ${TARBALL_URL}"
 else
-    echo "    WARN: не смог узнать актуальный SHA через API, использую branch-URL"
-    echo "    (возможен устаревший tarball из-за кэша прокси)"
-    echo "    Качаю tarball: ${TARBALL_URL}"
+    # Fallback: query-string как cache-bust
+    TARBALL_URL="${GH_PROXY}/https://github.com/${GH_OWNER}/${GH_REPO}/archive/refs/heads/${BRANCH}.tar.gz?nc=$(date +%s)"
+    echo "    WARN: SHA не получили из API/raw — использую branch+query cache-bust"
+    echo "    → ${TARBALL_URL}"
 fi
 
 TMP_TARBALL="/tmp/fp_bot_${BRANCH}_$(date +%s).tar.gz"
@@ -145,6 +197,14 @@ if [[ -n "${SHA}" ]]; then
         echo "fetched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "${APP_DIR}/BUILD_INFO"
     echo "    BUILD_INFO: ${SHA:0:12}  ${DATE:-?}  ${SUBJECT:-?}"
+
+    # САНИТИ: если ожидали один SHA, но получили другой — кричим.
+    if [[ -n "${LATEST_SHA:-}" && "${SHA}" != "${LATEST_SHA}" ]]; then
+        echo
+        echo "    !!! ВНИМАНИЕ: ожидали SHA ${LATEST_SHA:0:12}, а в tarball'е ${SHA:0:12}"
+        echo "    Прокси скорее всего отдал устаревший архив. Попробуй ещё раз"
+        echo "    через минуту или используй CODEBERG_URL=… ./fetch_code.sh"
+    fi
 else
     echo "    WARN: BUILD_INFO не записан (нет src/_version.py и api.github.com недоступен)"
 fi

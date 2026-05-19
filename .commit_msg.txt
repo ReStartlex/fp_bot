@@ -1,0 +1,29 @@
+fix(deploy,smoke): triple-fallback SHA lookup + fix smoke format string
+
+Проблемы из последнего деплоя:
+1. fetch_code.sh: api.github.com через gh-proxy.com был недоступен ->
+   tarball снова из кэша (subject=feat persistent DB cursor вместо
+   нашего fallback fix'а).
+2. watcher_smoke: TypeError при m.get('author_id')=None в f-string
+   :<10 format.
+3. update.sh от bot:bot падал на chown/systemctl ("Operation not
+   permitted").
+
+Что сделано:
+- fetch_code.sh: трёхуровневый поиск актуального SHA main:
+    (a) api.github.com НАПРЯМУЮ (доступен с многих VPS)
+    (b) api.github.com через gh-proxy с ?nc=<timestamp>
+    (c) raw.githubusercontent.com/.../src/_version.py через прокси
+        (наш _version.py обновляется при каждом push через
+        deploy/stamp_version.py).
+  Если хоть один источник вернул SHA — тянем
+  /archive/<SHA>.tar.gz (физически некэшируемый URL).
+  Если все три провалились — добавляем ?nc=<timestamp> в branch-URL
+  (gh-proxy включает query-string в кэш-ключ).
+- fetch_code.sh: после распаковки сверяем SHA из src/_version.py с
+  ожидаемым LATEST_SHA. Несовпадение - громкое WARNING.
+- watcher_smoke.py: безопасный formatter, не падает на None.
+- update.sh: auto-reexec через sudo если запущен не от root
+  (избавляет от "chown: Operation not permitted").
+
+Все 148 тестов проходят.

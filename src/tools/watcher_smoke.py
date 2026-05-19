@@ -96,14 +96,16 @@ async def main(args: argparse.Namespace) -> int:
         print(f"Всего сообщений в выборке: {len(messages)}")
         for m in messages[-20:]:
             mine = (
-                "🤖 (это я)"
+                "[me]"
                 if m.get("author_username") == fp.my_username
-                else "👤"
+                else "[user]"
             )
+            mid = m.get("message_id")
+            aid = m.get("author_id")
             print(
-                f"  id={m.get('message_id'):<10} "
-                f"author_id={m.get('author_id'):<10} "
-                f"user={m.get('author_username','?'):<20} "
+                f"  id={'' if mid is None else mid:<10} "
+                f"author_id={'' if aid is None else aid:<10} "
+                f"user={(m.get('author_username') or '?'):<20} "
                 f"{mine}  "
                 f"text={(m.get('text') or '')[:80]!r}"
             )
