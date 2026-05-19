@@ -32,10 +32,19 @@ if [[ "$(id -u)" -ne 0 ]]; then
     fi
 fi
 
-# 1. Скачиваем свежий код, сохраняя .env и data.
-# Сначала пробуем локальный fetch_code.sh. Если его нет — тянем свежий
-# с GitHub (через proxy, потому что Timeweb-сеть GitHub блокирует).
-# stderr НЕ глотаем: при настоящих ошибках их видно в логе.
+# 1. ОСТАНАВЛИВАЕМ сервис ДО любых файловых операций.
+# Иначе процесс держит open file descriptor на bridge.db; после
+# фоновой подмены файлов SQLite видит "файл удалён" и переключается
+# в read-only режим (отсюда наш "attempt to write a readonly database").
+SERVICE_WAS_RUNNING=0
+if systemctl is-active --quiet funpay-ns-bot 2>/dev/null; then
+    echo "==> Останавливаю funpay-ns-bot до обновления кода"
+    systemctl stop funpay-ns-bot
+    SERVICE_WAS_RUNNING=1
+fi
+
+# 2. Скачиваем свежий код. fetch_code.sh теперь делает in-place git fetch
+# (без rm -rf), поэтому .venv, data/, .env остаются на месте.
 if [[ -x "${APP_DIR}/deploy/fetch_code.sh" ]]; then
     bash "${APP_DIR}/deploy/fetch_code.sh"
 else
@@ -43,37 +52,36 @@ else
     bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/ReStartlex/fp_bot/main/deploy/fetch_code.sh)
 fi
 
-# 2. Обновляем pip-зависимости (если изменились). НЕ глотаем stderr,
-# чтобы конфликты резолвера были видны сразу.
+# 3. Обновляем pip-зависимости. Сервис уже остановлен (выше) — pip
+# может спокойно писать в .venv без гонки.
+# НЕ глотаем stderr: при настоящих ошибках их видно в логе.
+PIP_OK=1
 if ! "${APP_DIR}/.venv/bin/pip" install -r "${APP_DIR}/requirements.txt"; then
+    PIP_OK=0
     echo
-    echo "ОШИБКА: pip install упал. Сервис НЕ перезапускаю (он сейчас работает"
-    echo "на старом коде; новый код требует обновления зависимостей)."
-    echo "Чаще всего это конфликт версий — посмотри вывод выше и поправь"
-    echo "requirements.txt."
-    exit 1
+    echo "ВНИМАНИЕ: pip install упал. Возможно, конфликт версий в"
+    echo "requirements.txt. Сервис будет запущен на СТАРЫХ зависимостях"
+    echo "и новом коде — если новые модули не используются, всё сработает."
+    echo "Иначе посмотри вывод выше и поправь requirements.txt."
 fi
 
-# 3. Чиним права ДО рестарта. Иначе сервис бежит от 'bot', получает
-# Permission denied на .env (положенный нами через mv от root) и падает
-# в auto-restart loop, не оставляя собственных логов.
+# 4. Чиним права ДО рестарта. Сервис бежит от 'bot', и .env должен
+# быть владельца bot (mv от root забирает права).
 if getent passwd bot >/dev/null 2>&1; then
     chown -R bot:bot "${APP_DIR}"
 fi
 chmod 600 "${APP_DIR}/.env" 2>/dev/null || true
 
-# 4. Только теперь — рестарт сервиса (если он управляется systemd)
-if systemctl is-active --quiet funpay-ns-bot 2>/dev/null \
-   || systemctl is-enabled --quiet funpay-ns-bot 2>/dev/null; then
-    systemctl restart funpay-ns-bot
-    echo "Сервис funpay-ns-bot перезапущен."
-    # Проверяем, поднялся ли он. Если нет — сразу показываем стектрейс,
-    # а не оставляем пользователя гадать.
+# 5. Запускаем (или перезапускаем) сервис.
+if systemctl is-enabled --quiet funpay-ns-bot 2>/dev/null \
+   || [[ "${SERVICE_WAS_RUNNING}" -eq 1 ]]; then
+    systemctl start funpay-ns-bot
+    echo "Сервис funpay-ns-bot запущен."
     sleep 4
     if ! systemctl is-active --quiet funpay-ns-bot; then
         echo
-        echo "── ВНИМАНИЕ: сервис не поднялся, последние 40 строк лога ──"
-        journalctl -u funpay-ns-bot -n 40 --no-pager
+        echo "── ВНИМАНИЕ: сервис не поднялся, последние 60 строк лога ──"
+        journalctl -u funpay-ns-bot -n 60 --no-pager
         echo "──────────────────────────────────────────────────────────"
     fi
 fi
