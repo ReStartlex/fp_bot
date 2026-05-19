@@ -111,6 +111,31 @@ class ChatHandler:
     async def _handle_help_request(
         self, event: FunPayMessageEvent, state_chat_id: int
     ) -> None:
+        # Cooldown: если совсем недавно уже подняли тревогу в этом чате,
+        # не флудим ни покупателю, ни в Telegram. Покупатель часто пишет
+        # "!помощь" два-три раза подряд — этого недостаточно, чтобы
+        # дублировать алерты.
+        cooldown_seconds = int(self._settings.chat_help_cooldown_seconds)
+        if cooldown_seconds > 0:
+            async with session_factory()() as session:
+                pre_state = await get_or_create_chat_state(
+                    session,
+                    chat_id=state_chat_id,
+                    buyer_username=event.author_username,
+                )
+                if (
+                    pre_state.last_help_request_at is not None
+                    and (datetime.utcnow() - pre_state.last_help_request_at).total_seconds()
+                    < cooldown_seconds
+                ):
+                    await session.commit()
+                    logger.debug(
+                        f"Help-ack в чате {event.chat_id} пропущен: "
+                        f"cooldown {cooldown_seconds}s ещё не прошёл"
+                    )
+                    return
+                await session.commit()
+
         working_now = self._wh.is_working_now()
         reply = templates.help_acknowledged(
             event.author_username, working_now=working_now, wh=self._wh

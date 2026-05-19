@@ -382,6 +382,28 @@ class FunPayWatcher:
                 }
                 continue
 
+            # Если baseline для этого чата не смог определить last_id
+            # (вернулся None — типичный случай, когда HTML-парсер не нашёл
+            # id у сообщений), мы НЕ можем отличить старые сообщения от
+            # новых. В этом случае ловим максимальный id из текущей
+            # выборки и пропускаем dispatch — это «отложенный baseline»
+            # для конкретного чата. С следующей итерации reads пойдут
+            # уже от известной точки.
+            if last_seen_id is None and messages:
+                new_last_id = max(
+                    (m.get("message_id") for m in messages if m.get("message_id") is not None),
+                    default=None,
+                )
+                self._poll_snapshot[chat_id] = {
+                    "preview": preview,
+                    "last_id": new_last_id,
+                }
+                logger.debug(
+                    f"FunPay poll: отложенный baseline для chat={chat_id}, "
+                    f"last_id={new_last_id} (старые {len(messages)} сообщений пропущены)"
+                )
+                continue
+
             new_messages: list[dict[str, Any]] = []
             new_last_id = last_seen_id
             for m in messages:

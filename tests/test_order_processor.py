@@ -199,6 +199,55 @@ async def test_happy_path_pay_returns_pins_immediately(db_session_factory, setti
 
 
 @pytest.mark.asyncio
+async def test_multi_quantity_propagates_to_ns_and_delivers_all_pins(
+    db_session_factory, settings
+):
+    """
+    Покупатель купил 2 единицы на FunPay → NS получает quantity=2 →
+    возвращает 2 пина → клиент получает оба в одном сообщении.
+    """
+    await _make_mapping(db_session_factory)
+
+    captured_fields: list[list[dict]] = []
+
+    class FakeNSCapturing(FakeNS):
+        async def create_order(self, *, service_id: int, fields):
+            captured_fields.append(list(fields))
+            return await super().create_order(service_id=service_id, fields=fields)
+
+    ns = FakeNSCapturing(pay_pins=["AAAA-1111", "BBBB-2222"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    event = FunPayOrderEvent(
+        funpay_order_id="fp-multi",
+        funpay_lot_id=69300023,
+        buyer_username="alice",
+        buyer_user_id=42,
+        chat_id=555,
+        quantity=2,
+        funpay_price_rub=371.82,
+    )
+
+    result = await process_funpay_order(
+        event, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+    assert result["status"] == "delivered"
+    assert result["pins_count"] == 2
+
+    # NS получил quantity=2 в fields
+    assert captured_fields, "create_order не был вызван"
+    assert captured_fields[0] == [{"key": "quantity", "value": 2}], (
+        f"Ожидал quantity=2, получил: {captured_fields[0]}"
+    )
+
+    # Оба пина в одном сообщении доставки
+    delivery_msg = fp.sent[-1][1]
+    assert "AAAA-1111" in delivery_msg
+    assert "BBBB-2222" in delivery_msg
+
+
+@pytest.mark.asyncio
 async def test_pay_returns_in_progress_then_wait(db_session_factory, settings):
     """Если pay_order вернул pending — должен дёрнуться wait_order_completion."""
     await _make_mapping(db_session_factory)
