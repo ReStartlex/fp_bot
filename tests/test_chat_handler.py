@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from src.chat.handler import (
+    _classify_funpay_system_message,
     _has_help_trigger,
     _looks_like_funpay_system_message,
     _looks_like_own_template_message,
@@ -58,8 +59,25 @@ def test_funpay_paid_order_system_message_is_detected():
         "Booooss, не забудьте потом нажать кнопку «Подтвердить выполнение заказа»."
     )
     assert _looks_like_funpay_system_message(text) is True
+    assert _classify_funpay_system_message(text) == "paid_order"
+
+
+def test_funpay_order_confirmed_system_message_is_detected():
+    text = (
+        "Покупатель Macan1467 подтвердил успешное выполнение заказа "
+        "#C4KPFX6M и отправил деньги продавцу lol228822."
+    )
+    assert _looks_like_funpay_system_message(text) is True
+    assert _classify_funpay_system_message(text) == "order_confirmed"
+
+
+def test_funpay_review_written_system_message_is_detected():
+    text = "Покупатель felechka1store написал отзыв к заказу #F2G4TM6U."
+    assert _looks_like_funpay_system_message(text) is True
+    assert _classify_funpay_system_message(text) == "review_written"
 
 
 def test_regular_buyer_message_is_not_system_message():
     assert _looks_like_funpay_system_message("Здравствуйте, есть товар?") is False
     assert _looks_like_funpay_system_message("!помощь") is False
+    assert _classify_funpay_system_message("Здравствуйте, есть товар?") is None

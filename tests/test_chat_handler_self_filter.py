@@ -114,3 +114,42 @@ def test_handler_ignores_funpay_paid_order_system_message():
     asyncio.run(handler.on_message(event))
     fp.send_message.assert_not_called()
     tg.send.assert_not_called()
+
+
+def test_handler_replies_to_funpay_order_confirmed_system_message():
+    handler, fp, tg = _make_handler(my_username="lol228822")
+    event = FunPayMessageEvent(
+        chat_id=104433092,
+        chat_username="Macan1467",
+        author_id=None,
+        author_username="Macan1467",
+        text=(
+            "Покупатель Macan1467 подтвердил успешное выполнение заказа "
+            "#C4KPFX6M и отправил деньги продавцу lol228822."
+        ),
+        is_my_message=False,
+    )
+    asyncio.run(handler.on_message(event))
+    fp.send_message.assert_called_once()
+    chat_id, text = fp.send_message.call_args.args
+    assert chat_id == 104433092
+    assert "спасибо за подтверждение" in text.lower()
+    assert "отзыв" in text.lower()
+    tg.send.assert_not_called()
+
+
+def test_handler_replies_to_funpay_review_written_system_message():
+    handler, fp, tg = _make_handler(my_username="lol228822")
+    event = FunPayMessageEvent(
+        chat_id=104433092,
+        chat_username="felechka1store",
+        author_id=None,
+        author_username="felechka1store",
+        text="Покупатель felechka1store написал отзыв к заказу #F2G4TM6U.",
+        is_my_message=False,
+    )
+    asyncio.run(handler.on_message(event))
+    fp.send_message.assert_called_once()
+    _, text = fp.send_message.call_args.args
+    assert "спасибо за отзыв" in text.lower()
+    tg.send.assert_not_called()

@@ -145,6 +145,27 @@ def post_review(buyer: str | None, lang: Lang | None = None) -> str:
     return f"🙌 Спасибо за отзыв, {name}! Всегда рад помочь."
 
 
+def order_confirmed_review_request(
+    buyer: str | None, lang: Lang | None = None
+) -> str:
+    """Шлём после системного сообщения FunPay о подтверждении заказа."""
+    lang = lang or _lang()
+    name = _addr(buyer)
+    if lang == "en":
+        return (
+            f"💚 {name}, thanks for confirming the order!\n"
+            f"✨ I'm glad everything went smoothly.\n"
+            f"⭐ If you liked the service, a short review on FunPay would "
+            f"help me a lot. Have a great day!"
+        )
+    return (
+        f"💚 {name}, спасибо за подтверждение заказа!\n"
+        f"✨ Очень рад, что всё прошло успешно.\n"
+        f"⭐ Если сервис понравился, буду очень благодарен за короткий "
+        f"отзыв на FunPay. Хорошего дня!"
+    )
+
+
 # -------------------- В чате до покупки --------------------
 
 def greeting_pre_purchase(

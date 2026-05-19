@@ -30,6 +30,7 @@ from src.funpay.events import FunPayMessageEvent
 
 
 _INVISIBLE_CHARS = "\u200b\u200c\u200d\u2060\u2061\u2062\u2063\u2064\ufeff"
+FunPaySystemKind = str
 
 
 def _clean_chat_text(text: str) -> str:
@@ -59,29 +60,67 @@ def _looks_like_own_template_message(text: str) -> bool:
         "уведомил продавца",
         "подключится к чату",
         "если всё хорошо, буду благодарен за отзыв",
+        "спасибо за подтверждение заказа",
+        "буду очень благодарен за короткий отзыв",
+        "спасибо за отзыв",
         "выдача товара автоматическая",
         "автовыдача работает круглосуточно",
         "preparing your order",
         "your order is ready",
         "i've notified the seller",
+        "thanks for confirming the order",
+        "thanks for the feedback",
         "delivery is automatic",
     )
     return any(marker in cleaned for marker in own_markers)
 
 
-def _looks_like_funpay_system_message(text: str) -> bool:
+def _classify_funpay_system_message(text: str) -> FunPaySystemKind | None:
     """
     FunPay присылает сервисные уведомления в чат как обычные сообщения.
-    Например: "Покупатель X оплатил заказ #ABC... Не забудьте потом нажать..."
-    На такие сообщения нельзя запускать pre-purchase greeting: заказ уже куплен,
-    его обработает order pipeline.
+    Здесь отличаем их от обычного текста покупателя, чтобы не запускать
+    pre-purchase greeting там, где нужен order/review flow.
     """
     cleaned = _clean_chat_text(text).lower()
+
     ru_paid_order = "покупатель" in cleaned and "оплатил заказ" in cleaned
     ru_confirm_hint = "не забудьте" in cleaned and "подтвердить" in cleaned
     en_paid_order = "buyer" in cleaned and "paid order" in cleaned
     en_confirm_hint = "don't forget" in cleaned and "confirm" in cleaned
-    return (ru_paid_order and ru_confirm_hint) or (en_paid_order and en_confirm_hint)
+    if (ru_paid_order and ru_confirm_hint) or (en_paid_order and en_confirm_hint):
+        return "paid_order"
+
+    ru_order_confirmed = (
+        "покупатель" in cleaned
+        and "подтвердил успешное выполнение заказа" in cleaned
+        and "отправил деньги продавцу" in cleaned
+    )
+    en_order_confirmed = (
+        "buyer" in cleaned
+        and "confirmed" in cleaned
+        and ("order" in cleaned or "completion" in cleaned)
+    )
+    if ru_order_confirmed or en_order_confirmed:
+        return "order_confirmed"
+
+    ru_review_written = (
+        "покупатель" in cleaned
+        and "написал отзыв" in cleaned
+        and "заказ" in cleaned
+    )
+    en_review_written = (
+        "buyer" in cleaned
+        and ("left feedback" in cleaned or "wrote a review" in cleaned)
+        and "order" in cleaned
+    )
+    if ru_review_written or en_review_written:
+        return "review_written"
+
+    return None
+
+
+def _looks_like_funpay_system_message(text: str) -> bool:
+    return _classify_funpay_system_message(text) is not None
 
 
 def _shortlink(chat_id: int, username: str | None) -> str:
@@ -156,11 +195,9 @@ class ChatHandler:
             )
             return
 
-        if _looks_like_funpay_system_message(text):
-            log.info(
-                "ChatHandler: пропускаю системное сообщение FunPay; "
-                "заказ обработает order pipeline"
-            )
+        system_kind = _classify_funpay_system_message(text)
+        if system_kind is not None:
+            await self._handle_funpay_system_message(event, system_kind, log)
             return
 
         async with session_factory()() as session:
@@ -181,6 +218,36 @@ class ChatHandler:
             log.debug("ChatHandler: autogreeting выключен, ничего не отвечаю")
 
     # ---------- Сценарии ----------
+
+    async def _handle_funpay_system_message(
+        self, event: FunPayMessageEvent, kind: FunPaySystemKind, log
+    ) -> None:
+        if kind == "paid_order":
+            log.info(
+                "ChatHandler: пропускаю системное сообщение FunPay об оплате; "
+                "заказ обработает order pipeline"
+            )
+            return
+
+        if kind == "order_confirmed":
+            reply = templates.order_confirmed_review_request(event.author_username)
+        elif kind == "review_written":
+            reply = templates.post_review(event.author_username)
+        else:
+            log.info(f"ChatHandler: неизвестное системное сообщение FunPay: {kind}")
+            return
+
+        try:
+            await self._fp.send_message(event.chat_id, reply)
+            log.info(
+                f"ChatHandler: ответил на системное сообщение FunPay "
+                f"kind={kind} в чат {event.chat_id}"
+            )
+        except Exception as exc:
+            logger.opt(exception=exc).warning(
+                f"Не отправил ответ на системное сообщение FunPay "
+                f"kind={kind} в чат {event.chat_id}: {exc}"
+            )
 
     async def _handle_help_request(
         self, event: FunPayMessageEvent, state_chat_id: int
