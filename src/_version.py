@@ -4,6 +4,6 @@ deploy/stamp_version.py перед каждым push'ем.
 
 ВАЖНО: НЕ редактируй вручную — твои изменения будут перезаписаны.
 """
-SHA = "6b7d78e9b69f25ddd32d9d73d76bc15f1c531a77"
-DATE = "2026-05-19T16:13:21+03:00"
-SUBJECT = "fix(deploy,smoke): triple-fallback SHA lookup + fix smoke format string"
+SHA = "28e0644a2fc2902219f289669b4e7038c3e9d4eb"
+DATE = "2026-05-19T16:13:53+03:00"
+SUBJECT = "chore: remove accidentally committed .commit_msg.txt + ignore it"
