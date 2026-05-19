@@ -757,17 +757,22 @@ class FunPayWatcher:
             return None
         funpay_order_id = str(funpay_order_id)
 
-        funpay_lot_id_raw = self._g(order_obj, "lot_id", "offer_id")
+        # В FunPayAPI NewOrderEvent обычно приходит как OrderShortcut:
+        # id/description/amount/price/buyer_username/buyer_id/status/html.
+        # В нём НЕТ lot_id и chat_id. Не отбрасываем такой заказ здесь:
+        # order processor сможет сопоставить его с маппингом по description
+        # или единственному активному маппингу.
+        funpay_lot_id_raw = self._g(order_obj, "lot_id", "offer_id", "lot")
         try:
             funpay_lot_id = int(funpay_lot_id_raw) if funpay_lot_id_raw is not None else 0
         except (TypeError, ValueError):
             funpay_lot_id = 0
         if funpay_lot_id <= 0:
             logger.warning(
-                f"FunPay NEW_ORDER: не нашёл валидный lot_id, "
-                f"order={funpay_order_id}, raw={order_obj!r}. Пропускаю."
+                f"FunPay NEW_ORDER: событие без lot_id, "
+                f"order={funpay_order_id}; попробую сопоставить в processor. "
+                f"raw={order_obj!r}"
             )
-            return None
 
         buyer = self._g(order_obj, "buyer", "buyer_username", "username")
         buyer_username = (
@@ -802,6 +807,16 @@ class FunPayWatcher:
         except (TypeError, ValueError):
             funpay_price_rub = None
 
+        description = self._g(
+            order_obj,
+            "description",
+            "short_description",
+            "title",
+            "full_description",
+        )
+        if description is not None and not isinstance(description, str):
+            description = str(description)
+
         return FunPayOrderEvent(
             funpay_order_id=funpay_order_id,
             funpay_lot_id=funpay_lot_id,
@@ -810,6 +825,7 @@ class FunPayWatcher:
             chat_id=chat_id,
             quantity=max(1, quantity),
             funpay_price_rub=funpay_price_rub,
+            description=description,
         )
 
     def _normalize_message(self, event: Any) -> Optional[FunPayMessageEvent]:

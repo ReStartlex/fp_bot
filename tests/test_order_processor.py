@@ -117,16 +117,32 @@ class FakeNS:
 class FakeFunPay:
     """Имитирует FunPayClient.send_message; можно сделать падающим."""
 
-    def __init__(self, *, fail: bool = False, fail_times: int = 0):
+    def __init__(
+        self, *, fail: bool = False, fail_times: int = 0,
+        chat_by_name_id: int | None = None,
+    ):
         self.sent: list[tuple[int, str]] = []
         self._fail = fail
         self._fail_times = fail_times
+        self.account = self
+        self._chat_by_name_id = chat_by_name_id
 
     async def send_message(self, chat_id: int, text: str):
         if self._fail or self._fail_times > 0:
             self._fail_times = max(0, self._fail_times - 1)
             raise RuntimeError("FunPay send_message моковый сбой")
         self.sent.append((chat_id, text))
+
+    @staticmethod
+    async def _to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def get_chat_by_name(self, username: str, make_request: bool = False):
+        if self._chat_by_name_id is None:
+            return None
+        class Chat:
+            id = self._chat_by_name_id
+        return Chat()
 
 
 class FakeTelegram:
@@ -245,6 +261,69 @@ async def test_multi_quantity_propagates_to_ns_and_delivers_all_pins(
     delivery_msg = fp.sent[-1][1]
     assert "AAAA-1111" in delivery_msg
     assert "BBBB-2222" in delivery_msg
+
+
+@pytest.mark.asyncio
+async def test_order_without_lot_id_uses_single_enabled_mapping(
+    db_session_factory, settings
+):
+    """
+    FunPayAPI NewOrderEvent приходит как OrderShortcut без lot_id.
+    Для тестового режима с одним активным маппингом processor должен
+    сопоставить заказ и не пропустить покупку.
+    """
+    await _make_mapping(db_session_factory, lot_id=69300023)
+    ns = FakeNS(pay_pins=["AAAA-1111"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    event = FunPayOrderEvent(
+        funpay_order_id="fp-no-lot",
+        funpay_lot_id=0,
+        buyer_username="alice",
+        buyer_user_id=42,
+        chat_id=555,
+        quantity=1,
+        funpay_price_rub=200.0,
+        description="Apple Gift Card | USA | 2 USD",
+    )
+
+    result = await process_funpay_order(
+        event, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "delivered"
+    db_order = await _order(db_session_factory, "fp-no-lot")
+    assert db_order is not None
+    assert db_order.funpay_lot_id == 69300023
+
+
+@pytest.mark.asyncio
+async def test_order_without_chat_id_resolves_chat_by_buyer_name(
+    db_session_factory, settings
+):
+    await _make_mapping(db_session_factory, lot_id=69300023)
+    ns = FakeNS(pay_pins=["AAAA-1111"])
+    fp = FakeFunPay(chat_by_name_id=777)
+    tg = FakeTelegram()
+
+    event = FunPayOrderEvent(
+        funpay_order_id="fp-no-chat",
+        funpay_lot_id=69300023,
+        buyer_username="alice",
+        buyer_user_id=42,
+        chat_id=None,
+        quantity=1,
+        funpay_price_rub=200.0,
+        description="Apple Gift Card | USA | 2 USD",
+    )
+
+    result = await process_funpay_order(
+        event, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "delivered"
+    assert fp.sent and all(chat_id == 777 for chat_id, _ in fp.sent)
 
 
 @pytest.mark.asyncio

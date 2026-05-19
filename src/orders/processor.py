@@ -29,10 +29,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from loguru import logger
+
 from sqlalchemy import select
 
 from src.alerts.telegram import TelegramNotifier
@@ -78,14 +79,91 @@ class FunPayOrderEvent:
     chat_id: Optional[int]
     quantity: int = 1
     funpay_price_rub: Optional[float] = None
+    description: Optional[str] = None
 
 
-async def _find_mapping(funpay_lot_id: int) -> Mapping | None:
+def _norm_text(value: str | None) -> str:
+    return " ".join((value or "").lower().split())
+
+
+async def _resolve_mapping(event: FunPayOrderEvent, log) -> Mapping | None:
     async with session_factory()() as session:
+        if event.funpay_lot_id > 0:
+            result = await session.execute(
+                select(Mapping).where(Mapping.funpay_lot_id == event.funpay_lot_id)
+            )
+            return result.scalar_one_or_none()
+
         result = await session.execute(
-            select(Mapping).where(Mapping.funpay_lot_id == funpay_lot_id)
+            select(Mapping).where(Mapping.enabled.is_(True))
         )
-        return result.scalar_one_or_none()
+        enabled = list(result.scalars().all())
+
+    if not enabled:
+        return None
+
+    desc = _norm_text(event.description)
+    if desc:
+        for mapping in enabled:
+            label = _norm_text(mapping.label)
+            if label and (label in desc or desc in label):
+                log.warning(
+                    f"FunPay order без lot_id сопоставлен по label: "
+                    f"order={event.funpay_order_id}, label={mapping.label!r}, "
+                    f"lot={mapping.funpay_lot_id}"
+                )
+                return mapping
+
+    if len(enabled) == 1:
+        mapping = enabled[0]
+        log.warning(
+            f"FunPay order без lot_id: использую единственный активный "
+            f"маппинг lot={mapping.funpay_lot_id}. "
+            f"description={event.description!r}"
+        )
+        return mapping
+
+    log.error(
+        f"FunPay order без lot_id и не удалось однозначно выбрать маппинг: "
+        f"enabled_mappings={len(enabled)}, description={event.description!r}"
+    )
+    return None
+
+
+async def _resolve_chat_id(
+    event: FunPayOrderEvent, funpay_client: FunPayClient | None, log
+) -> int | None:
+    if event.chat_id is not None:
+        return event.chat_id
+    if funpay_client is None or not event.buyer_username:
+        return None
+
+    def _lookup() -> int | None:
+        account = funpay_client.account
+        get_chat_by_name = getattr(account, "get_chat_by_name", None)
+        if callable(get_chat_by_name):
+            try:
+                chat = get_chat_by_name(event.buyer_username, True)
+                chat_id = getattr(chat, "id", None)
+                return int(chat_id) if chat_id is not None else None
+            except Exception:
+                return None
+        return None
+
+    try:
+        chat_id = await funpay_client._to_thread(_lookup)  # type: ignore[attr-defined]
+    except Exception as exc:
+        log.warning(
+            f"Не смог найти chat_id по buyer_username={event.buyer_username!r}: {exc}"
+        )
+        return None
+
+    if chat_id is not None:
+        log.info(
+            f"Восстановил chat_id={chat_id} по buyer_username="
+            f"{event.buyer_username!r}"
+        )
+    return chat_id
 
 
 def _build_ns_fields(template_json: str | None, quantity: int) -> list[dict]:
@@ -153,10 +231,15 @@ async def _process_locked(
     dry_run: bool,
     log,
 ) -> dict:
+    if event.chat_id is None:
+        resolved_chat_id = await _resolve_chat_id(event, funpay_client, log)
+        if resolved_chat_id is not None:
+            event = replace(event, chat_id=resolved_chat_id)
+
     log.info(
         f"Обработка FunPay-заказа: lot={event.funpay_lot_id}, "
         f"qty={event.quantity}, buyer={event.buyer_username}, "
-        f"dry_run={dry_run}"
+        f"chat={event.chat_id}, dry_run={dry_run}"
     )
 
     # ─── 1. Быстрый выход для уже доставленных ───
@@ -190,10 +273,11 @@ async def _process_locked(
         return {"status": "failed", "reason": "pins_ready без pins"}
 
     # ─── 3. Маппинг ───
-    mapping = await _find_mapping(event.funpay_lot_id)
+    mapping = await _resolve_mapping(event, log)
     if mapping is None or not mapping.enabled:
         reason = (
-            f"нет маппинга для funpay_lot_id={event.funpay_lot_id}"
+            f"нет маппинга для funpay_lot_id={event.funpay_lot_id} "
+            f"(description={event.description!r})"
             if mapping is None
             else "маппинг выключен (enabled=false)"
         )
@@ -202,7 +286,7 @@ async def _process_locked(
             order = existing or await create_order(
                 session,
                 funpay_order_id=event.funpay_order_id,
-                funpay_lot_id=event.funpay_lot_id,
+                funpay_lot_id=event.funpay_lot_id or 0,
                 ns_service_id=0,
                 buyer_username=event.buyer_username,
                 buyer_user_id=event.buyer_user_id,
@@ -219,11 +303,14 @@ async def _process_locked(
         return {"status": "failed", "reason": reason}
 
     # ─── 4. Создаём/находим Order в БД ───
+    effective_funpay_lot_id = (
+        event.funpay_lot_id if event.funpay_lot_id > 0 else mapping.funpay_lot_id
+    )
     async with session_factory()() as session:
         db_order = existing or await create_order(
             session,
             funpay_order_id=event.funpay_order_id,
-            funpay_lot_id=event.funpay_lot_id,
+            funpay_lot_id=effective_funpay_lot_id,
             ns_service_id=mapping.ns_service_id,
             buyer_username=event.buyer_username,
             buyer_user_id=event.buyer_user_id,
