@@ -19,7 +19,7 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.config import Settings
-from src.db.models import Base, Mapping, Order
+from src.db.models import Base, KnownLot, Mapping, Order
 from src.db.repo import find_order_by_funpay_id, upsert_mapping
 from src.ns.models import (
     CreateOrderResponse,
@@ -171,14 +171,26 @@ def _event(order_id: str = "fp-100", lot_id: int = 69300023) -> FunPayOrderEvent
     )
 
 
-async def _make_mapping(factory, *, lot_id: int = 69300023, svc_id: int = 20) -> None:
+async def _make_mapping(
+    factory,
+    *,
+    lot_id: int = 69300023,
+    svc_id: int = 20,
+    label: str = "Test Apple USA 2 USD",
+) -> None:
     async with factory() as s:
         await upsert_mapping(
             s, funpay_lot_id=lot_id, ns_service_id=svc_id,
             markup_percent=6.0, stock_cap=10,
             ns_fields_template='{"quantity":"@QUANTITY"}',
-            enabled=True, label="Test Apple USA 2 USD",
+            enabled=True, label=label,
         )
+        await s.commit()
+
+
+async def _make_known_lot(factory, *, lot_id: int, title: str) -> None:
+    async with factory() as s:
+        s.add(KnownLot(funpay_lot_id=lot_id, title=title))
         await s.commit()
 
 
@@ -294,6 +306,107 @@ async def test_order_without_lot_id_uses_single_enabled_mapping(
 
     assert result["status"] == "delivered"
     db_order = await _order(db_session_factory, "fp-no-lot")
+    assert db_order is not None
+    assert db_order.funpay_lot_id == 69300023
+
+
+@pytest.mark.asyncio
+async def test_order_without_lot_id_matches_russian_description_among_mappings(
+    db_session_factory, settings
+):
+    """
+    Реальный FunPay NewOrderEvent часто приходит без lot_id, но с русским
+    описанием лота. Даже если label маппинга англоязычный, должны выбрать
+    правильный Apple 2 USD, а не упасть с "нет маппинга для lot_id=0".
+    """
+    await _make_mapping(
+        db_session_factory,
+        lot_id=69300023,
+        svc_id=20,
+        label="Apple Gift Card | USA | 2 USD",
+    )
+    await _make_mapping(
+        db_session_factory,
+        lot_id=69300024,
+        svc_id=21,
+        label="Apple Gift Card | USA | 5 USD",
+    )
+    ns = FakeNS(pay_pins=["AAAA-1111"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    event = FunPayOrderEvent(
+        funpay_order_id="fp-russian-desc",
+        funpay_lot_id=0,
+        buyer_username="alice",
+        buyer_user_id=42,
+        chat_id=555,
+        quantity=1,
+        funpay_price_rub=147.0,
+        description=(
+            "✈️АВТОВЫДАЧА 🔑 Подарочная карта Apple 🔵 2 USD "
+            "(США) 🔵, USD, 2 USD"
+        ),
+    )
+
+    result = await process_funpay_order(
+        event, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "delivered"
+    db_order = await _order(db_session_factory, "fp-russian-desc")
+    assert db_order is not None
+    assert db_order.funpay_lot_id == 69300023
+    assert db_order.ns_service_id == 20
+
+
+@pytest.mark.asyncio
+async def test_order_without_lot_id_can_match_known_lot_title(
+    db_session_factory, settings
+):
+    await _make_mapping(
+        db_session_factory,
+        lot_id=69300023,
+        svc_id=20,
+        label="Service #20",
+    )
+    await _make_mapping(
+        db_session_factory,
+        lot_id=69300024,
+        svc_id=21,
+        label="Service #21",
+    )
+    await _make_known_lot(
+        db_session_factory,
+        lot_id=69300023,
+        title="✈️АВТОВЫДАЧА 🔑 Подарочная карта Apple 🔵 2 USD (США)",
+    )
+    await _make_known_lot(
+        db_session_factory,
+        lot_id=69300024,
+        title="✈️АВТОВЫДАЧА 🔑 Подарочная карта Apple 🔵 5 USD (США)",
+    )
+    ns = FakeNS(pay_pins=["AAAA-1111"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    event = FunPayOrderEvent(
+        funpay_order_id="fp-known-title",
+        funpay_lot_id=0,
+        buyer_username="alice",
+        buyer_user_id=42,
+        chat_id=555,
+        quantity=1,
+        funpay_price_rub=147.0,
+        description="Подарочная карта Apple 2 USD США, USD, 2 USD",
+    )
+
+    result = await process_funpay_order(
+        event, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "delivered"
+    db_order = await _order(db_session_factory, "fp-known-title")
     assert db_order is not None
     assert db_order.funpay_lot_id == 69300023
 

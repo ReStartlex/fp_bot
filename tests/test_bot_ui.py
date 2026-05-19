@@ -8,7 +8,7 @@ import pytest
 from aiogram.types import InlineKeyboardMarkup
 
 from src.alerts import ui
-from src.alerts.bot import _format_order_line, format_percent
+from src.alerts.bot import TelegramBot, _format_order_line, format_percent
 
 
 # ─────────────── фейковые объекты (как в FunPayAPI / NS) ───────────────
@@ -251,6 +251,26 @@ def test_funpay_lot_label_uses_title_not_id():
     out = ui.funpay_lot_label(lot, max_len=30)
     assert "69300023" not in out
     assert "Apple" in out
+
+
+def test_lots_page_name_button_is_noop_not_target():
+    """
+    Нажатие на название лота не должно случайно переназначать target.
+    Для назначения оставляем отдельную явную кнопку "🎯 Цель".
+    """
+    bot = object.__new__(TelegramBot)
+    sess = type("Sess", (), {"items": [FakeLot(69300023, "Apple 2 USD", "147")]})()
+    _, kb = bot._build_lots_page(  # type: ignore[attr-defined]
+        sess,
+        "abcd",
+        sess.items,
+        0,
+        1,
+    )
+    rows = kb.inline_keyboard
+    assert rows[0][0].callback_data == "noop"
+    callbacks = [button.callback_data for row in rows for button in row]
+    assert "act:fp_target:abcd:0" in callbacks
 
 
 def test_mapping_label_falls_back_to_id():

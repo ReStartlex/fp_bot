@@ -1129,8 +1129,8 @@ class TelegramBot:
             global_idx = page * PAGE_SIZE + local_idx
             row_top = [
                 InlineKeyboardButton(
-                    text=f"🎯 {ui.funpay_lot_label(lot, max_len=28)}",
-                    callback_data=f"act:fp_target:{sid}:{global_idx}",
+                    text=f"ℹ️ {ui.funpay_lot_label(lot, max_len=34)}",
+                    callback_data="noop",
                 ),
             ]
             row_bot = [
@@ -1141,6 +1141,10 @@ class TelegramBot:
                 InlineKeyboardButton(
                     text="🔬 Inspect",
                     callback_data=f"act:lot_inspect:{sid}:{global_idx}",
+                ),
+                InlineKeyboardButton(
+                    text="🎯 Цель",
+                    callback_data=f"act:fp_target:{sid}:{global_idx}",
                 ),
             ]
             item_buttons.append(row_top)
@@ -1163,7 +1167,7 @@ class TelegramBot:
             total_pages=total_pages,
             total_items=len(sess.items),
             empty_text=(
-                "Маппингов нет. Открой «🛒 Лоты FunPay», выбери лот кнопкой 🎯, "
+                "Маппингов нет. Открой «🛒 Лоты FunPay», нажми отдельную кнопку 🎯 Цель, "
                 "потом из «🗂 Каталог NS» или /ns_search нажми «✅ …» на услуге."
             ),
         )

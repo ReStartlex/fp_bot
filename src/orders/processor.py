@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -39,7 +40,7 @@ from sqlalchemy import select
 from src.alerts.telegram import TelegramNotifier
 from src.chat import templates
 from src.config import Settings, get_settings
-from src.db.models import Mapping, Order
+from src.db.models import KnownLot, Mapping, Order
 from src.db.repo import (
     create_order,
     find_order_by_funpay_id,
@@ -83,7 +84,56 @@ class FunPayOrderEvent:
 
 
 def _norm_text(value: str | None) -> str:
-    return " ".join((value or "").lower().split())
+    raw = (value or "").lower()
+    raw = raw.replace("ё", "е")
+    return " ".join(re.findall(r"[a-zа-я0-9]+", raw))
+
+
+_WEAK_MATCH_TOKENS = {
+    "usd",
+    "gift",
+    "card",
+    "карта",
+    "подарочная",
+    "автовыдача",
+    "auto",
+    "delivery",
+}
+
+
+def _text_tokens(value: str | None) -> set[str]:
+    tokens = set(_norm_text(value).split())
+    return {
+        t for t in tokens
+        if (len(t) > 1 or t.isdigit()) and t not in _WEAK_MATCH_TOKENS
+    }
+
+
+def _mapping_match_score(
+    *,
+    description: str | None,
+    mapping: Mapping,
+    known_title: str | None,
+) -> int:
+    desc_norm = _norm_text(description)
+    if not desc_norm:
+        return 0
+
+    score = 0
+    for source, exact_bonus in (
+        (mapping.label, 100),
+        (known_title, 120),
+    ):
+        source_norm = _norm_text(source)
+        if not source_norm:
+            continue
+        if source_norm in desc_norm or desc_norm in source_norm:
+            score += exact_bonus
+        common = _text_tokens(description) & _text_tokens(source)
+        score += len(common) * 10
+        # Совпавшие числа вроде 2/5/10 USD особенно важны для Apple cards.
+        score += sum(15 for token in common if token.isdigit())
+    return score
 
 
 async def _resolve_mapping(event: FunPayOrderEvent, log) -> Mapping | None:
@@ -98,6 +148,14 @@ async def _resolve_mapping(event: FunPayOrderEvent, log) -> Mapping | None:
             select(Mapping).where(Mapping.enabled.is_(True))
         )
         enabled = list(result.scalars().all())
+        known_rows = {}
+        if enabled:
+            known = await session.execute(
+                select(KnownLot).where(
+                    KnownLot.funpay_lot_id.in_([m.funpay_lot_id for m in enabled])
+                )
+            )
+            known_rows = {row.funpay_lot_id: row for row in known.scalars().all()}
 
     if not enabled:
         return None
@@ -113,6 +171,40 @@ async def _resolve_mapping(event: FunPayOrderEvent, log) -> Mapping | None:
                     f"lot={mapping.funpay_lot_id}"
                 )
                 return mapping
+
+    scored: list[tuple[int, Mapping]] = []
+    if desc:
+        for mapping in enabled:
+            known_title = getattr(known_rows.get(mapping.funpay_lot_id), "title", None)
+            score = _mapping_match_score(
+                description=event.description,
+                mapping=mapping,
+                known_title=known_title,
+            )
+            if score > 0:
+                scored.append((score, mapping))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        if scored:
+            best_score, best_mapping = scored[0]
+            second_score = scored[1][0] if len(scored) > 1 else 0
+            # Нужен явный отрыв, чтобы не выбрать случайный Apple-лот при
+            # неоднозначном описании. При единственном совпадении score >= 20
+            # достаточно: обычно это "apple + 2" или KnownLot title.
+            if best_score >= 20 and best_score >= second_score + 10:
+                log.warning(
+                    f"FunPay order без lot_id сопоставлен по описанию: "
+                    f"order={event.funpay_order_id}, lot={best_mapping.funpay_lot_id}, "
+                    f"score={best_score}, second={second_score}, "
+                    f"description={event.description!r}"
+                )
+                return best_mapping
+            log.error(
+                f"FunPay order без lot_id: описание похоже на несколько "
+                f"маппингов, не выбираю автоматически. candidates="
+                f"{[(score, mapping.funpay_lot_id) for score, mapping in scored[:5]]}, "
+                f"description={event.description!r}"
+            )
+            return None
 
     if len(enabled) == 1:
         mapping = enabled[0]
