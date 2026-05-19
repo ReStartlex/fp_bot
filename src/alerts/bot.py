@@ -18,6 +18,7 @@ import html
 import time
 from datetime import datetime, timezone
 from functools import wraps
+from types import SimpleNamespace
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
 
@@ -577,6 +578,15 @@ class TelegramBot:
             self._target_labels.pop(msg.chat.id, None)
             await msg.answer("Цель сброшена.", reply_markup=ui.single_close_kb())
 
+        # Пользователь иногда пишет "setmarkup ..." без ведущего "/".
+        # Telegram тогда не считает это командой, поэтому явно поддерживаем
+        # такие сообщения для владельца, чтобы бот не выглядел "зависшим".
+        @dp.message(F.text)
+        async def cmd_plain_text_alias(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._dispatch_plain_text_command(msg)
+
         # ----- callback router -----
 
         @dp.callback_query(F.data == "noop")
@@ -668,6 +678,56 @@ class TelegramBot:
                 + "<i>Выбери услугу в Каталоге NS или Поиске — замапим в один клик.</i>"
             )
         return ui.MENU_GREETING
+
+    async def _dispatch_plain_text_command(self, msg: Message) -> bool:
+        """
+        Поддержка команд без ведущего слеша: "setmarkup 69300023 5.5",
+        "sync", "menu" и т.п. Возвращает True, если сообщение было командой.
+        """
+        text = (msg.text or "").strip()
+        if not text or text.startswith("/"):
+            return False
+        cmd = text.split(maxsplit=1)[0].lower()
+        aliases = {
+            "menu": self._plain_menu,
+            "меню": self._plain_menu,
+            "sync": self._plain_sync,
+            "синхронизация": self._plain_sync,
+            "setmarkup": self._plain_setmarkup,
+            "markup": self._plain_setmarkup,
+            "наценка": self._plain_setmarkup,
+            "settings": self._plain_settings,
+            "настройки": self._plain_settings,
+        }
+        handler = aliases.get(cmd)
+        if handler is None:
+            return False
+        await handler(msg, text)
+        return True
+
+    def _slash_msg(self, msg: Message, text: str):
+        return SimpleNamespace(
+            text="/" + text,
+            answer=msg.answer,
+            chat=msg.chat,
+            from_user=msg.from_user,
+        )
+
+    async def _plain_menu(self, msg: Message, text: str) -> None:
+        await self._send_view(
+            msg.chat.id,
+            self._menu_text(msg.chat.id),
+            reply_markup=ui.main_menu(self._target_label_for(msg.chat.id)),
+        )
+
+    async def _plain_sync(self, msg: Message, text: str) -> None:
+        await self._do_sync(self._slash_msg(msg, text))  # type: ignore[arg-type]
+
+    async def _plain_setmarkup(self, msg: Message, text: str) -> None:
+        await self._do_setmarkup(self._slash_msg(msg, text))  # type: ignore[arg-type]
+
+    async def _plain_settings(self, msg: Message, text: str) -> None:
+        await self._do_show_settings(self._slash_msg(msg, text))  # type: ignore[arg-type]
 
     async def _get_stock(self, *, force: bool = False) -> StockResponse:
         """NS-каталог с кэшем 60 секунд."""
@@ -1914,10 +1974,51 @@ class TelegramBot:
                 )
             else:
                 note = ""
-        await msg.answer(
+        base_text = (
             f"✏ Markup для лота <code>{funpay_lot_id}</code>: <b>{shown}</b>\n\n"
-            f"Запусти 🔄 Синхронизация или /sync, чтобы новая цена применилась."
-            f"{note}",
+            f"{note}"
+        )
+
+        if self._sync_trigger is None:
+            await msg.answer(
+                base_text
+                + "\n\nЗапусти 🔄 Синхронизация или /sync, чтобы новая цена применилась.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        progress = await msg.answer(
+            base_text + "\n\n⏳ Сразу запускаю sync, чтобы применить цену...",
+            reply_markup=ui.single_close_kb(),
+        )
+        try:
+            result = await self._sync_trigger()
+        except Exception as exc:
+            logger.exception("Sync after setmarkup failed")
+            await progress.edit_text(
+                base_text
+                + "\n\n❌ Sync после setmarkup упал: "
+                f"<code>{html.escape(str(exc))[:300]}</code>\n"
+                "Наценка сохранена; можно повторить /sync вручную.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        checked = result.get("checked", 0)
+        updated = result.get("updated", 0)
+        skipped = result.get("skipped", 0)
+        if updated:
+            sync_note = "✅ Цена/остаток применены на FunPay."
+        else:
+            sync_note = (
+                "ℹ Sync не внёс изменений: текущая цена на FunPay уже совпадает "
+                "с расчётом или отличается меньше чем на видимую единицу."
+            )
+        await progress.edit_text(
+            base_text
+            + "\n\n"
+            + sync_note
+            + f"\nSync: checked={checked}, updated={updated}, skipped={skipped}",
             reply_markup=ui.single_close_kb(),
         )
 

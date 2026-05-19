@@ -69,16 +69,30 @@ async def _seed_mapping(lot_id: int) -> None:
         await session.commit()
 
 
-async def _run(text: str, lot_id: int = 69300023) -> tuple[float | None, str]:
-    bot = TelegramBot(settings=_settings())
-    msg = SimpleNamespace(text=text, answer=AsyncMock())
+async def _run(
+    text: str,
+    lot_id: int = 69300023,
+    *,
+    sync_trigger=None,
+) -> tuple[float | None, str]:
+    bot = TelegramBot(settings=_settings(), sync_trigger=sync_trigger)
+    progress = SimpleNamespace(edit_text=AsyncMock())
+    msg = SimpleNamespace(
+        text=text,
+        answer=AsyncMock(return_value=progress),
+        chat=SimpleNamespace(id=123),
+        from_user=SimpleNamespace(id=123),
+    )
     await bot._do_setmarkup(msg)  # type: ignore[arg-type]
     async with session_factory()() as session:
         obj = (
             await session.execute(select(Mapping).where(Mapping.funpay_lot_id == lot_id))
         ).scalar_one_or_none()
     assert obj is not None
-    reply_text = msg.answer.call_args.args[0] if msg.answer.call_args else ""
+    if progress.edit_text.call_args:
+        reply_text = progress.edit_text.call_args.args[0]
+    else:
+        reply_text = msg.answer.call_args.args[0] if msg.answer.call_args else ""
     return obj.markup_percent, reply_text
 
 
@@ -176,3 +190,78 @@ def test_setmarkup_different_value_no_hint():
         finally:
             await close_db()
     _async(go())
+
+
+def test_setmarkup_runs_sync_immediately_when_available():
+    async def go():
+        await init_db()
+        try:
+            await _seed_mapping(69300023)
+            sync = AsyncMock(return_value={"checked": 1, "updated": 1, "skipped": 0})
+            value, text = await _run(
+                "/setmarkup 69300023 5.5",
+                sync_trigger=sync,
+            )
+            assert value == pytest.approx(5.5)
+            sync.assert_awaited_once()
+            assert "Цена/остаток применены" in text
+            assert "updated=1" in text
+        finally:
+            await close_db()
+    _async(go())
+
+
+def test_setmarkup_sync_updated_zero_explains_already_current():
+    async def go():
+        await init_db()
+        try:
+            await _seed_mapping(69300023)
+            sync = AsyncMock(return_value={"checked": 1, "updated": 0, "skipped": 0})
+            _, text = await _run(
+                "/setmarkup 69300023 5.5",
+                sync_trigger=sync,
+            )
+            assert "уже совпадает" in text
+            assert "updated=0" in text
+        finally:
+            await close_db()
+    _async(go())
+
+
+def test_plain_text_setmarkup_alias_is_accepted():
+    async def go():
+        await init_db()
+        try:
+            await _seed_mapping(69300023)
+            bot = TelegramBot(settings=_settings())
+            progress = SimpleNamespace(edit_text=AsyncMock())
+            msg = SimpleNamespace(
+                text="setmarkup 69300023 5.5",
+                answer=AsyncMock(return_value=progress),
+                chat=SimpleNamespace(id=123),
+                from_user=SimpleNamespace(id=123),
+            )
+            handled = await bot._dispatch_plain_text_command(msg)  # type: ignore[arg-type]
+            async with session_factory()() as session:
+                obj = (
+                    await session.execute(
+                        select(Mapping).where(Mapping.funpay_lot_id == 69300023)
+                    )
+                ).scalar_one()
+            assert handled is True
+            assert obj.markup_percent == pytest.approx(5.5)
+            msg.answer.assert_awaited()
+        finally:
+            await close_db()
+    _async(go())
+
+
+def test_plain_text_unknown_is_not_handled():
+    bot = TelegramBot(settings=_settings())
+    msg = SimpleNamespace(
+        text="просто сообщение",
+        answer=AsyncMock(),
+        chat=SimpleNamespace(id=123),
+        from_user=SimpleNamespace(id=123),
+    )
+    assert _async(bot._dispatch_plain_text_command(msg)) is False  # type: ignore[arg-type]
