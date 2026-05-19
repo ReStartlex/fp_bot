@@ -105,6 +105,15 @@ class Settings(BaseSettings):
     work_hours_end: int = Field(default=23, ge=1, le=24)
     seller_display_name: str = "продавец"
 
+    # FunPayAPI.Runner.listen() в новых версиях FunPay часто валит шумные
+    # ошибки вида «Не удалось получить истории чатов […]: превышено
+    # количество попыток» — это её внутренний рейт-лимит на запросы
+    # истории чатов; для наших целей бесполезно, поскольку наш poll-loop
+    # сам тянет сообщения через свой HTTP-клиент.
+    # По умолчанию выключаем listen-loop, чтобы не загрязнять логи.
+    funpay_listen_enabled: bool = False
+    funpay_poll_interval_seconds: float = Field(default=5.0, ge=1.0)
+
     @field_validator("ns_api_secret")
     @classmethod
     def _check_secret_base64(cls, v: SecretStr) -> SecretStr:

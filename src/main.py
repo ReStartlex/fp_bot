@@ -223,6 +223,8 @@ class App:
             self.fp,
             on_new_order=self._on_new_order,
             on_new_message=self._on_new_message,
+            poll_interval_seconds=self.settings.funpay_poll_interval_seconds,
+            listen_enabled=self.settings.funpay_listen_enabled,
         )
         try:
             self.watcher.start()

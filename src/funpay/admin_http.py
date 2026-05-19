@@ -201,89 +201,163 @@ class FunPayAdminClient:
         }
 
     async def _ensure_csrf(self) -> str | None:
-        """Возвращает CSRF-токен (кеш + при необходимости тянет с главной)."""
+        """
+        Возвращает CSRF-токен. Ищет в нескольких источниках:
+        кэш → главная → /chat/.
+        """
         token = getattr(self, "_csrf_token", None)
         if token:
             return token
+
         info = await self.whoami()
-        return info.get("csrf_token")
+        token = info.get("csrf_token")
+        if token:
+            self._csrf_token = token
+            return token
+
+        # Fallback: тянем CSRF со страницы /chat/, иногда он только там
+        try:
+            r = await asyncio.to_thread(self._sync_get, f"{self.BASE}/chat/")
+            soup = BeautifulSoup(r.text, "html.parser")
+            for sel, attr in (
+                ('meta[name="csrf-token"]', "content"),
+                ('input[name="csrf_token"]', "value"),
+                ('input[name="csrf-token"]', "value"),
+            ):
+                el = soup.select_one(sel)
+                if el is not None:
+                    val = el.get(attr)
+                    if val:
+                        self._csrf_token = val
+                        return val
+            # Или из embedded JS: window.csrf_token = "..."
+            m = re.search(
+                r'csrf[_-]token["\']?\s*[:=]\s*["\']([a-zA-Z0-9_\-]+)["\']',
+                r.text,
+            )
+            if m:
+                self._csrf_token = m.group(1)
+                return m.group(1)
+        except Exception:
+            pass
+        return None
 
     async def send_chat_message(
-        self, chat_id: int, text: str
+        self, chat_id: int, text: str, retries: int = 2
     ) -> dict[str, Any]:
         """
-        Прямая отправка сообщения через FunPay /runner/ AJAX.
+        Прямая отправка сообщения в FunPay-чат через AJAX /runner/.
 
-        FunPay принимает JSON-payload вида:
-            objects = [{"type": "chat_node", "id": "users-<my_id>-<chat_id>",
-                        "tag": "<random>", "data": false}]
-            request = {"action": "chat_message",
-                       "data": {"node": <chat_id>, "last_message": -1,
-                                "content": "<text>"}}
+        Контракт берём ровно из FunPayAPI.Account.send_message — это тот
+        же endpoint и payload, который FunPay сейчас поддерживает.
 
-        Но в реальности FunPay меняет формат периодически; самый надёжный
-        путь, который работает на боте FunPay-Vertex и нашем probe-тесте:
-        POST /runner/ с form-data objects=<json> request=<json>.
+        Отличие от FunPayAPI: мы НЕ парсим html ответа в `Message`
+        объект. Достаточно вернуть `{ok: True}` если FunPay принял
+        отправку. Парсер html — самая хрупкая часть в FunPayAPI,
+        именно он падает с `'NoneType' object has no attribute 'text'`
+        когда FunPay меняет вёрстку.
 
-        Если эндпоинт сломан или сменился — вернём `{ok: False, ...}`,
-        и SendMessage сможет это логировать.
+        Retries: на rate-limit / временную сеть. Между попытками — пауза
+        с экспоненциальным ростом.
         """
         import json as _json
-        csrf = await self._ensure_csrf()
+        last_result: dict[str, Any] = {"ok": False}
 
-        request_payload = {
-            "action": "chat_message",
-            "data": {
-                "node": int(chat_id),
-                "last_message": -1,
-                "content": text,
-            },
-        }
-        objects_payload = []  # FunPay принимает пустой массив тоже
+        for attempt in range(retries + 1):
+            csrf = await self._ensure_csrf()
 
-        data: dict[str, str] = {
-            "objects": _json.dumps(objects_payload),
-            "request": _json.dumps(request_payload),
-        }
-        if csrf:
-            data["csrf_token"] = csrf
-
-        url = f"{self.BASE}/runner/"
-
-        def _post() -> requests.Response:
-            return self._session.post(
-                url,
-                data=data,
-                headers={
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": f"{self.BASE}/chat/?node={int(chat_id)}",
-                    "Origin": self.BASE,
+            request_payload = {
+                "action": "chat_message",
+                "data": {
+                    "node": int(chat_id),
+                    "last_message": -1,
+                    "content": text,
                 },
-                timeout=20,
-                allow_redirects=False,
-            )
+            }
+            # Формат objects берём ровно из FunPayAPI.Account.send_message —
+            # он отлично работает на сервере FunPay; если этого блока нет,
+            # FunPay часто отвечает {"response": null}.
+            objects_payload = [
+                {
+                    "type": "chat_node",
+                    "id": int(chat_id),
+                    "tag": "00000000",
+                    "data": {
+                        "node": int(chat_id),
+                        "last_message": -1,
+                        "content": "",
+                    },
+                }
+            ]
 
-        r = await asyncio.to_thread(_post)
-        result: dict[str, Any] = {
-            "http_status": r.status_code,
-            "body_preview": r.text[:300],
-        }
-        try:
-            j = r.json()
-        except Exception:
-            j = None
-        if isinstance(j, dict):
-            result["json"] = j
-            response = j.get("response") or {}
-            error = response.get("error") if isinstance(response, dict) else None
-            result["ok"] = r.ok and not error
-            if error:
-                result["funpay_error"] = error
-        else:
+            data: dict[str, str] = {
+                "objects": _json.dumps(objects_payload),
+                "request": _json.dumps(request_payload),
+            }
+            if csrf:
+                data["csrf_token"] = csrf
+
+            url = f"{self.BASE}/runner/"
+
+            def _post() -> requests.Response:
+                return self._session.post(
+                    url,
+                    data=data,
+                    headers={
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": f"{self.BASE}/chat/?node={int(chat_id)}",
+                        "Origin": self.BASE,
+                        "Accept": "*/*",
+                    },
+                    timeout=20,
+                    allow_redirects=False,
+                )
+
+            try:
+                r = await asyncio.to_thread(_post)
+            except Exception as exc:
+                last_result = {
+                    "ok": False,
+                    "exception": f"{type(exc).__name__}: {exc}",
+                    "attempt": attempt,
+                }
+                if attempt < retries:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+
+            result: dict[str, Any] = {
+                "http_status": r.status_code,
+                "body_preview": r.text[:300],
+                "attempt": attempt,
+            }
+            try:
+                j = r.json()
+            except Exception:
+                j = None
+            if isinstance(j, dict):
+                result["json"] = j
+                response = j.get("response") or {}
+                error = response.get("error") if isinstance(response, dict) else None
+                result["ok"] = r.ok and not error
+                if error:
+                    result["funpay_error"] = error
+                # На 429 / временную ошибку FunPay часто отвечает 200 + error
+                if not result["ok"] and attempt < retries:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    last_result = result
+                    continue
+                return result
+            # Не JSON
             result["ok"] = bool(r.ok)
             if not r.ok:
                 result["funpay_error"] = f"HTTP {r.status_code}"
-        return result
+                if attempt < retries:
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    last_result = result
+                    continue
+            return result
+
+        return last_result
 
     async def get_chats_snapshot(self) -> list[dict[str, Any]]:
         """

@@ -34,10 +34,40 @@ if [[ -n "${CODEBERG_URL}" ]]; then
     exit 0
 fi
 
-echo "    Качаю tarball: ${TARBALL_URL}"
-TMP_TARBALL="/tmp/fp_bot_${BRANCH}.tar.gz"
+# gh-proxy.com и подобные прокси нередко КЭШИРУЮТ URL'ы вида
+# /archive/refs/heads/main.tar.gz — на VPS прилетал устаревший tarball
+# через 10+ минут после нашего git push'а. Решение: сначала через
+# api.github.com (тоже через прокси) узнаём актуальный SHA main и
+# тянем tarball по конкретному SHA: /archive/${SHA}.tar.gz. Такой URL
+# уникален для каждого коммита, и кэш-промах гарантирован.
+LATEST_SHA=""
+COMMITS_API="${GH_PROXY}/https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/commits/${BRANCH}"
+if SHA_JSON=$(curl -fsSL --max-time 30 -H 'Cache-Control: no-cache' \
+    "${COMMITS_API}?nocache=$(date +%s)" 2>/dev/null); then
+    LATEST_SHA=$(echo "${SHA_JSON}" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    sys.stdout.write(data.get("sha", "") or "")
+except Exception:
+    pass
+' 2>/dev/null || true)
+fi
+
+if [[ -n "${LATEST_SHA}" ]]; then
+    TARBALL_URL="${GH_PROXY}/https://github.com/${GH_OWNER}/${GH_REPO}/archive/${LATEST_SHA}.tar.gz"
+    echo "    Latest SHA на ${BRANCH}: ${LATEST_SHA:0:12}"
+    echo "    Качаю tarball по SHA (cache-busting): ${TARBALL_URL}"
+else
+    echo "    WARN: не смог узнать актуальный SHA через API, использую branch-URL"
+    echo "    (возможен устаревший tarball из-за кэша прокси)"
+    echo "    Качаю tarball: ${TARBALL_URL}"
+fi
+
+TMP_TARBALL="/tmp/fp_bot_${BRANCH}_$(date +%s).tar.gz"
 rm -f "${TMP_TARBALL}"
-curl -fL --max-time 60 -o "${TMP_TARBALL}" "${TARBALL_URL}"
+curl -fL --max-time 60 -H 'Cache-Control: no-cache' \
+    -o "${TMP_TARBALL}" "${TARBALL_URL}"
 
 # Сохраняем .env и data/logs если уже есть
 PRESERVE_ENV=""

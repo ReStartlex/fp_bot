@@ -74,6 +74,7 @@ class FunPayWatcher:
         poll_interval_seconds: float = 5.0,
         listen_restart_delay_seconds: float = 5.0,
         dedup_cache_size: int = 1024,
+        listen_enabled: bool = True,
     ) -> None:
         self._fp = fp_client
         self._on_new_order = on_new_order
@@ -84,6 +85,7 @@ class FunPayWatcher:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._poll_interval = poll_interval_seconds
         self._listen_restart_delay = listen_restart_delay_seconds
+        self._listen_enabled = listen_enabled
 
         # Дедуп по message_id (если есть) или по (chat_id, author_id, text)
         # как fallback. Хранит ограниченное число ключей.
@@ -176,23 +178,32 @@ class FunPayWatcher:
     # ---------- lifecycle ----------
 
     def start(self) -> None:
-        if self._listen_thread is not None and self._listen_thread.is_alive():
+        if self._poll_thread is not None and self._poll_thread.is_alive():
             return
         self._stop_evt.clear()
         self._baseline_ready.clear()
         self._loop = asyncio.get_running_loop()
-        self._listen_thread = threading.Thread(
-            target=self._listen_loop, name="funpay-watcher-listen", daemon=True
-        )
+
+        if self._listen_enabled:
+            self._listen_thread = threading.Thread(
+                target=self._listen_loop, name="funpay-watcher-listen", daemon=True
+            )
+            self._listen_thread.start()
+
         self._poll_thread = threading.Thread(
             target=self._poll_loop, name="funpay-watcher-poll", daemon=True
         )
-        self._listen_thread.start()
         self._poll_thread.start()
-        logger.info(
-            f"FunPay watcher запущен (listen-thread + poll каждые "
-            f"{self._poll_interval:.0f}s)"
-        )
+        if self._listen_enabled:
+            logger.info(
+                f"FunPay watcher запущен (listen-thread + poll каждые "
+                f"{self._poll_interval:.0f}s)"
+            )
+        else:
+            logger.info(
+                f"FunPay watcher запущен (только poll каждые "
+                f"{self._poll_interval:.0f}s — listen отключён)"
+            )
 
     def stop(self) -> None:
         self._stop_evt.set()
