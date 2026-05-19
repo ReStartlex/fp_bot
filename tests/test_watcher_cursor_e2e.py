@@ -295,6 +295,54 @@ async def test_repeated_same_preview_help_is_caught_by_active_poll(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_same_help_text_with_different_message_ids_is_not_deduped(db_factory):
+    """
+    Дедуп должен работать по message_id, а не по тексту, когда id есть.
+    Иначе серия одинаковых !помощь превращается в "дубликаты" и молча
+    пропадает после первого ответа.
+    """
+    fp, admin, w = _make_watcher_with_admin()
+    chat_id = 100
+
+    async with db_factory() as session:
+        await upsert_chat_cursor(session, chat_id=chat_id, last_message_id=9002)
+        await session.commit()
+
+    w._baseline_ready.set()
+    w._poll_snapshot[chat_id] = {"preview": "!помощь"}
+    handled: list = []
+
+    async def _on_new(msg):
+        handled.append(msg)
+
+    w._on_new_message = _on_new
+
+    admin.get_chats_snapshot = AsyncMock(return_value=[
+        {"chat_id": chat_id, "username": "buyer1", "preview": "!помощь", "unread": False},
+    ])
+    admin.get_chat_messages = AsyncMock(return_value=[
+        {"message_id": 9003, "author_id": 1, "author_username": "buyer1", "text": "!помощь"},
+    ])
+    await w._poll_once_async()
+    await asyncio.sleep(0.05)
+
+    admin.get_chats_snapshot = AsyncMock(return_value=[
+        {"chat_id": chat_id, "username": "buyer1", "preview": "!помощь", "unread": False},
+    ])
+    admin.get_chat_messages = AsyncMock(return_value=[
+        {"message_id": 9004, "author_id": 1, "author_username": "buyer1", "text": "!помощь"},
+    ])
+    await w._poll_once_async()
+    await asyncio.sleep(0.05)
+
+    assert [m.text for m in handled] == ["!помощь", "!помощь"]
+
+    async with db_factory() as session:
+        cursor = await get_chat_cursor(session, chat_id)
+        assert cursor.last_message_id == 9004
+
+
+@pytest.mark.asyncio
 async def test_new_chat_appears_after_first_run_processes_last_message(db_factory):
     fp, admin, w = _make_watcher_with_admin()
 

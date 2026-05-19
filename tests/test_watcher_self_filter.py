@@ -45,11 +45,11 @@ def test_is_my_message_handles_none_username_safely():
     assert w._is_my_message(author_id=None, author_username=None) is False
 
 
-def test_dedup_dual_keys_listen_then_poll():
+def test_dedup_listen_without_id_does_not_block_poll_with_id():
     """
-    listen-loop: видит сообщение БЕЗ message_id (FunPayAPI его не отдаёт).
-    poll-loop: видит то же сообщение С message_id (HTML data-id).
-    Дедуп должен поймать второе обращение, потому что text-hash совпадает.
+    Если poll даёт message_id, id считается главным источником правды.
+    Text-hash от listen-loop без id НЕ должен блокировать poll-сообщение,
+    иначе повторные одинаковые !помощь пропадают.
     """
     w = _make_watcher()
     chat_id = 104433092
@@ -65,11 +65,11 @@ def test_dedup_dual_keys_listen_then_poll():
     assert w._dedup_register("msg", listen_event) is True
 
     poll_keys = w._make_msg_dedup_keys(chat_id, 5_555_555, 2, "!помощь")
-    assert w._seen_or_register(poll_keys) is True
+    assert w._seen_or_register(poll_keys) is False
 
 
-def test_dedup_dual_keys_poll_then_listen():
-    """Обратный порядок: poll первый, listen второй."""
+def test_dedup_poll_with_id_does_not_register_text_fallback():
+    """Poll-сообщение с id не должно занимать text-key."""
     w = _make_watcher()
     chat_id = 104433092
 
@@ -84,7 +84,7 @@ def test_dedup_dual_keys_poll_then_listen():
         text="!помощь",
         is_my_message=False,
     )
-    assert w._dedup_register("msg", listen_event) is False
+    assert w._dedup_register("msg", listen_event) is True
 
 
 def test_dedup_different_messages_not_collapsed():
@@ -95,14 +95,13 @@ def test_dedup_different_messages_not_collapsed():
     assert w._seen_or_register(k2) is False
 
 
-def test_dedup_same_text_different_message_ids_treated_as_dup():
+def test_dedup_same_text_different_message_ids_are_not_duplicates():
     """
-    Если text-hash совпадает, мы дедупим даже когда message_id разные.
-    Это позволяет защититься от того, что один и тот же msg попал через
-    оба источника, и они приписали ему разные id (или ни одного / какой-то).
+    Одинаковый текст с разными message_id — это разные сообщения.
+    Например покупатель три раза подряд пишет !помощь.
     """
     w = _make_watcher()
     k1 = w._make_msg_dedup_keys(123, 111, 1, "одинаковый текст")
     assert w._seen_or_register(k1) is False
     k2 = w._make_msg_dedup_keys(123, 222, 1, "одинаковый текст")
-    assert w._seen_or_register(k2) is True
+    assert w._seen_or_register(k2) is False
