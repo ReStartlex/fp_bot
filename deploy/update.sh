@@ -29,8 +29,16 @@ else
     bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/ReStartlex/fp_bot/main/deploy/fetch_code.sh)
 fi
 
-# 2. Обновляем pip-зависимости (если изменились)
-"${APP_DIR}/.venv/bin/pip" install -q -r "${APP_DIR}/requirements.txt"
+# 2. Обновляем pip-зависимости (если изменились). НЕ глотаем stderr,
+# чтобы конфликты резолвера были видны сразу.
+if ! "${APP_DIR}/.venv/bin/pip" install -r "${APP_DIR}/requirements.txt"; then
+    echo
+    echo "ОШИБКА: pip install упал. Сервис НЕ перезапускаю (он сейчас работает"
+    echo "на старом коде; новый код требует обновления зависимостей)."
+    echo "Чаще всего это конфликт версий — посмотри вывод выше и поправь"
+    echo "requirements.txt."
+    exit 1
+fi
 
 # 3. Чиним права ДО рестарта. Иначе сервис бежит от 'bot', получает
 # Permission denied на .env (положенный нами через mv от root) и падает

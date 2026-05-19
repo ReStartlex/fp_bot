@@ -12,11 +12,15 @@ pyotp>=2.9.0                   # TOTP для 2FA ns.gifts (если включе
 # --- FunPay ---
 # FunPayAPI используем только для long-poll событий чата (golden_key хватает).
 # Админ-операции с лотами идут через свой HTTP-клиент (admin_http.py),
-# потому что в FunPayAPI установленной версии get_lot_fields/save_lot
-# ожидают JSON, а FunPay отдаёт HTML — парсим HTML сами.
-FunPayAPI>=0.1.34
-beautifulsoup4>=4.12.0
-requests>=2.31.0
+# потому что в установленной FunPayAPI get_lot_fields/save_lot ожидают
+# JSON, а FunPay отдаёт HTML — парсим HTML сами.
+#
+# ВАЖНО: НЕ закрепляем версию requests/beautifulsoup4 здесь — FunPayAPI
+# тащит свой requests (обычно <2.31), и жёсткое `requests>=2.31` ломает
+# pip resolver (ResolutionImpossible). Те версии, что приходят с
+# FunPayAPI, для нашего admin_http полностью достаточны.
+FunPayAPI
+beautifulsoup4
 
 # --- Telegram ---
 aiogram>=3.5.0
