@@ -676,10 +676,55 @@ class FunPayClient:
         return {"ok": True, "source": "FunPayAPI.save_lot"}
 
     async def send_message(self, chat_id: int, text: str) -> Any:
-        """Отправить сообщение в чат с покупателем."""
-        return await self._to_thread(
-            self.account.send_message, chat_id, text
-        )
+        """
+        Отправить сообщение в чат с покупателем.
+
+        Стратегия:
+        1. Пробуем FunPayAPI.Account.send_message (sync → to_thread).
+           Если получилось — успех.
+        2. Если FunPayAPI отказал (JSONDecodeError, NetworkError и т.д.) —
+           переключаемся на наш собственный admin_http.send_chat_message,
+           который не зависит от внутренней JSON-логики FunPayAPI.
+
+        Все исходы логируются подробно — иначе невозможно понять,
+        почему бот молчит.
+        """
+        text_preview = text[:80].replace("\n", "\\n")
+        try:
+            result = await self._to_thread(
+                self.account.send_message, chat_id, text
+            )
+            logger.info(
+                f"FunPay send_message OK [via FunPayAPI]: "
+                f"chat={chat_id}, text={text_preview!r}"
+            )
+            return result
+        except Exception as exc:
+            logger.warning(
+                f"FunPay send_message via FunPayAPI упал "
+                f"({type(exc).__name__}: {exc}). "
+                f"Пробую через admin_http fallback…"
+            )
+        # Fallback: прямой HTTP POST через admin_http
+        try:
+            result = await self._admin.send_chat_message(chat_id, text)
+            if result.get("ok"):
+                logger.info(
+                    f"FunPay send_message OK [via admin_http fallback]: "
+                    f"chat={chat_id}, text={text_preview!r}"
+                )
+            else:
+                logger.error(
+                    f"FunPay send_message FAIL даже через fallback: "
+                    f"chat={chat_id}, result={result}"
+                )
+            return result
+        except Exception as exc:
+            logger.opt(exception=exc).error(
+                f"FunPay send_message: и FunPayAPI, и admin_http упали. "
+                f"chat={chat_id}, text={text_preview!r}, err={exc}"
+            )
+            raise
 
     # ----- Диагностика -----
 

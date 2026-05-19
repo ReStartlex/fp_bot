@@ -1,6 +1,8 @@
 """Async-сессия SQLAlchemy + создание таблиц при первом запуске."""
 from __future__ import annotations
 
+from loguru import logger
+from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.config import get_settings
@@ -31,10 +33,30 @@ def session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 async def init_db() -> None:
-    """Создать таблицы если их нет."""
+    """
+    Создаёт таблицы, если их ещё нет. Идемпотентно: `create_all`
+    не трогает существующие данные.
+
+    Логируем, какие таблицы реально существуют после init — это важно
+    для диагностики на VPS (после добавления модели легко забыть, что
+    у пользователя уже есть старая БД без новой таблицы — create_all
+    добавит её, но мы хотим явное подтверждение в логе).
+    """
     engine = _get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        existing = await conn.run_sync(
+            lambda sync_conn: inspect(sync_conn).get_table_names()
+        )
+    expected = set(Base.metadata.tables.keys())
+    missing = expected - set(existing)
+    if missing:
+        logger.warning(f"init_db: после create_all отсутствуют таблицы: {missing}")
+    else:
+        logger.info(
+            f"init_db: все таблицы на месте ({len(existing)}): "
+            f"{sorted(existing)}"
+        )
 
 
 async def close_db() -> None:

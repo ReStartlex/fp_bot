@@ -56,16 +56,17 @@ async def test_first_run_writes_cursors_without_dispatch(db_factory):
     ])
 
     dispatched: list = []
-    w._dispatch_async = lambda coro: dispatched.append(coro)  # type: ignore
-    w._on_new_message = AsyncMock()
-    w._loop = None
+    handled: list = []
 
-    # Запускаем _poll_once в потоке executor (он внутри использует asyncio.run)
-    await asyncio.to_thread(w._poll_once)
+    async def _on_new(msg):
+        handled.append(msg)
 
-    assert dispatched == [], "Первый прогон не должен dispatch'ить старые сообщения"
+    w._on_new_message = _on_new
 
-    # Курсор записан в БД
+    await w._poll_once_async()
+
+    assert handled == [], "Первый прогон не должен dispatch'ить старые сообщения"
+
     async with db_factory() as session:
         cursor = await get_chat_cursor(session, chat_id)
         assert cursor is not None
@@ -77,29 +78,33 @@ async def test_second_poll_dispatches_only_new_messages(db_factory):
     fp, admin, w = _make_watcher_with_admin()
     chat_id = 100
 
-    # ── 1) первый poll: baseline ──
     admin.get_chats_snapshot = AsyncMock(return_value=[
         {"chat_id": chat_id, "username": "buyer1", "preview": "старое", "unread": False},
     ])
     admin.get_chat_messages = AsyncMock(return_value=[
         {"message_id": 9001, "author_id": 1, "author_username": "buyer1", "text": "старое"},
     ])
-    dispatched: list = []
-    w._dispatch_async = lambda coro: dispatched.append(coro)  # type: ignore
-    w._on_new_message = AsyncMock()
-    w._loop = None
-    await asyncio.to_thread(w._poll_once)
-    assert dispatched == []
+    handled: list = []
 
-    # ── 2) пришло новое сообщение ──
+    async def _on_new(msg):
+        handled.append(msg)
+
+    w._on_new_message = _on_new
+
+    await w._poll_once_async()
+    assert handled == []
+
     admin.get_chats_snapshot = AsyncMock(return_value=[
         {"chat_id": chat_id, "username": "buyer1", "preview": "!помощь", "unread": True},
     ])
     admin.get_chat_messages = AsyncMock(return_value=[
         {"message_id": 9002, "author_id": 1, "author_username": "buyer1", "text": "!помощь"},
     ])
-    await asyncio.to_thread(w._poll_once)
-    assert len(dispatched) == 1
+    await w._poll_once_async()
+    # asyncio.create_task внутри poll → даём task'у пробежать
+    await asyncio.sleep(0.05)
+    assert len(handled) == 1
+    assert handled[0].text == "!помощь"
 
     async with db_factory() as session:
         cursor = await get_chat_cursor(session, chat_id)
@@ -118,45 +123,44 @@ async def test_restart_does_not_replay_old_messages(db_factory):
     admin.get_chat_messages = AsyncMock(return_value=[
         {"message_id": 9001, "author_id": 1, "author_username": "buyer1", "text": "!помощь"},
     ])
-    dispatched1: list = []
-    w1._dispatch_async = lambda coro: dispatched1.append(coro)  # type: ignore
-    w1._on_new_message = AsyncMock()
-    w1._loop = None
-    await asyncio.to_thread(w1._poll_once)
-    # На первом прогоне ничего не диспатчилось — это правильно
-    assert dispatched1 == []
+    handled1: list = []
 
-    # Имитируем рестарт: новый watcher с тем же fp
+    async def _on_new1(msg):
+        handled1.append(msg)
+
+    w1._on_new_message = _on_new1
+
+    await w1._poll_once_async()
+    assert handled1 == []
+
     _, _, w2 = _make_watcher_with_admin()
     w2._fp._admin = admin
-    dispatched2: list = []
-    w2._dispatch_async = lambda coro: dispatched2.append(coro)  # type: ignore
-    w2._on_new_message = AsyncMock()
-    w2._loop = None
-    await asyncio.to_thread(w2._poll_once)
-    # курсор из БД (=9001) → "!помощь" с id=9001 НЕ старше → ничего нового
-    assert dispatched2 == []
+    handled2: list = []
+
+    async def _on_new2(msg):
+        handled2.append(msg)
+
+    w2._on_new_message = _on_new2
+    await w2._poll_once_async()
+    await asyncio.sleep(0.05)
+    assert handled2 == []
 
 
 @pytest.mark.asyncio
 async def test_new_chat_appears_after_first_run_processes_last_message(db_factory):
-    """
-    После первого baseline в чате X (X не было в snapshot первого прогона)
-    появилось сообщение «Привет» от нового покупателя — должно быть
-    обработано.
-    """
     fp, admin, w = _make_watcher_with_admin()
 
-    # 1) baseline: пустой snapshot
     admin.get_chats_snapshot = AsyncMock(return_value=[])
     admin.get_chat_messages = AsyncMock(return_value=[])
-    dispatched: list = []
-    w._dispatch_async = lambda coro: dispatched.append(coro)  # type: ignore
-    w._on_new_message = AsyncMock()
-    w._loop = None
-    await asyncio.to_thread(w._poll_once)
+    handled: list = []
 
-    # 2) появился новый чат
+    async def _on_new(msg):
+        handled.append(msg)
+
+    w._on_new_message = _on_new
+
+    await w._poll_once_async()
+
     chat_id = 555
     admin.get_chats_snapshot = AsyncMock(return_value=[
         {"chat_id": chat_id, "username": "K1kern", "preview": "Привет", "unread": True},
@@ -164,9 +168,11 @@ async def test_new_chat_appears_after_first_run_processes_last_message(db_factor
     admin.get_chat_messages = AsyncMock(return_value=[
         {"message_id": 7777, "author_id": 1, "author_username": "K1kern", "text": "Привет"},
     ])
-    await asyncio.to_thread(w._poll_once)
+    await w._poll_once_async()
+    await asyncio.sleep(0.05)
 
-    assert len(dispatched) == 1, "новое сообщение в новом чате должно сработать"
+    assert len(handled) == 1
+    assert handled[0].text == "Привет"
 
     async with db_factory() as session:
         cursor = await get_chat_cursor(session, chat_id)

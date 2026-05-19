@@ -70,13 +70,20 @@ class ChatHandler:
         )
 
     async def on_message(self, event: FunPayMessageEvent) -> None:
+        log = logger.bind(chat=event.chat_id, author=event.author_username)
+        log.info(
+            f"ChatHandler.on_message: text={event.text[:80]!r} "
+            f"is_my={event.is_my_message}"
+        )
+
         if event.is_my_message:
+            log.debug("ChatHandler: пропускаю — is_my_message=True")
             return
-        # Подстраховка №2: даже если is_my_message не выставился,
-        # сравниваем author_username с собственным ником. FunPay не всегда
-        # отдаёт data-author в HTML, поэтому source-фильтр может ошибаться —
-        # а реагировать на свои же шаблоны (с !помощь внутри) категорически
-        # нельзя, иначе бот зациклится сам на себя.
+
+        # Подстраховка: сравниваем author_username с моим ником.
+        # FunPay не всегда отдаёт data-author в HTML, и фильтр в watcher
+        # может ошибиться. Реагировать на свои же сообщения категорически
+        # нельзя.
         my_username = getattr(self._fp, "my_username", None)
         if (
             my_username
@@ -84,27 +91,33 @@ class ChatHandler:
             and event.author_username.strip().lower()
             == my_username.strip().lower()
         ):
-            logger.debug(
-                f"ChatHandler: пропускаю сообщение в чате {event.chat_id} — "
-                f"автор @{event.author_username} = это я"
+            log.info(
+                f"ChatHandler: пропускаю — автор @{event.author_username} "
+                f"совпадает с моим ником (self-message)"
             )
             return
+
         text = (event.text or "").strip()
         if not text:
+            log.debug("ChatHandler: пустой текст после strip — пропуск")
             return
 
         async with session_factory()() as session:
-            state = await get_or_create_chat_state(
+            await get_or_create_chat_state(
                 session, chat_id=event.chat_id, buyer_username=event.author_username
             )
             await session.commit()
 
         if _has_help_trigger(text, self._triggers):
+            log.info(f"ChatHandler: HELP-триггер найден в тексте → help-flow")
             await self._handle_help_request(event, state_chat_id=event.chat_id)
             return
 
         if self._settings.chat_autogreeting_enabled:
+            log.debug("ChatHandler: проверяю greeting cooldown")
             await self._maybe_greet(event, state_chat_id=event.chat_id)
+        else:
+            log.debug("ChatHandler: autogreeting выключен, ничего не отвечаю")
 
     # ---------- Сценарии ----------
 
@@ -142,8 +155,14 @@ class ChatHandler:
         )
         try:
             await self._fp.send_message(event.chat_id, reply)
+            logger.info(
+                f"ChatHandler: help-ack отправлен в чат {event.chat_id} "
+                f"для @{event.author_username}"
+            )
         except Exception as exc:
-            logger.warning(f"Не отправил help-ack в чат {event.chat_id}: {exc}")
+            logger.opt(exception=exc).warning(
+                f"Не отправил help-ack в чат {event.chat_id}: {exc}"
+            )
 
         async with session_factory()() as session:
             state = await get_or_create_chat_state(
@@ -189,7 +208,10 @@ class ChatHandler:
         try:
             await self._fp.send_message(event.chat_id, greeting)
             logger.info(
-                f"Поздоровался в чате {event.chat_id} с @{event.author_username}"
+                f"ChatHandler: приветствие отправлено в чат {event.chat_id} "
+                f"для @{event.author_username} (working_now={working_now})"
             )
         except Exception as exc:
-            logger.warning(f"Не отправил приветствие в чат {event.chat_id}: {exc}")
+            logger.opt(exception=exc).warning(
+                f"Не отправил приветствие в чат {event.chat_id}: {exc}"
+            )

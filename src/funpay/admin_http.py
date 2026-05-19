@@ -138,6 +138,7 @@ class FunPayAdminClient:
             )
         self._golden_key = golden_key
         self._user_agent = user_agent
+        self._csrf_token: str | None = None
 
     # ----- low-level -----
 
@@ -181,11 +182,108 @@ class FunPayAdminClient:
         )
         if link:
             username = link.get_text(strip=True)
+
+        # CSRF-токен и app-data — кешируем для последующего send_chat_message
+        csrf = None
+        meta = soup.find("meta", attrs={"name": "csrf-token"}) or soup.find(
+            "input", attrs={"name": "csrf_token"}
+        )
+        if meta is not None:
+            csrf = meta.get("content") or meta.get("value")
+        if csrf:
+            self._csrf_token = csrf
+
         return {
             "user_id": user_id,
             "username": username,
             "authenticated": bool(user_id),
+            "csrf_token": csrf,
         }
+
+    async def _ensure_csrf(self) -> str | None:
+        """Возвращает CSRF-токен (кеш + при необходимости тянет с главной)."""
+        token = getattr(self, "_csrf_token", None)
+        if token:
+            return token
+        info = await self.whoami()
+        return info.get("csrf_token")
+
+    async def send_chat_message(
+        self, chat_id: int, text: str
+    ) -> dict[str, Any]:
+        """
+        Прямая отправка сообщения через FunPay /runner/ AJAX.
+
+        FunPay принимает JSON-payload вида:
+            objects = [{"type": "chat_node", "id": "users-<my_id>-<chat_id>",
+                        "tag": "<random>", "data": false}]
+            request = {"action": "chat_message",
+                       "data": {"node": <chat_id>, "last_message": -1,
+                                "content": "<text>"}}
+
+        Но в реальности FunPay меняет формат периодически; самый надёжный
+        путь, который работает на боте FunPay-Vertex и нашем probe-тесте:
+        POST /runner/ с form-data objects=<json> request=<json>.
+
+        Если эндпоинт сломан или сменился — вернём `{ok: False, ...}`,
+        и SendMessage сможет это логировать.
+        """
+        import json as _json
+        csrf = await self._ensure_csrf()
+
+        request_payload = {
+            "action": "chat_message",
+            "data": {
+                "node": int(chat_id),
+                "last_message": -1,
+                "content": text,
+            },
+        }
+        objects_payload = []  # FunPay принимает пустой массив тоже
+
+        data: dict[str, str] = {
+            "objects": _json.dumps(objects_payload),
+            "request": _json.dumps(request_payload),
+        }
+        if csrf:
+            data["csrf_token"] = csrf
+
+        url = f"{self.BASE}/runner/"
+
+        def _post() -> requests.Response:
+            return self._session.post(
+                url,
+                data=data,
+                headers={
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Referer": f"{self.BASE}/chat/?node={int(chat_id)}",
+                    "Origin": self.BASE,
+                },
+                timeout=20,
+                allow_redirects=False,
+            )
+
+        r = await asyncio.to_thread(_post)
+        result: dict[str, Any] = {
+            "http_status": r.status_code,
+            "body_preview": r.text[:300],
+        }
+        try:
+            j = r.json()
+        except Exception:
+            j = None
+        if isinstance(j, dict):
+            result["json"] = j
+            response = j.get("response") or {}
+            error = response.get("error") if isinstance(response, dict) else None
+            result["ok"] = r.ok and not error
+            if error:
+                result["funpay_error"] = error
+        else:
+            result["ok"] = bool(r.ok)
+            if not r.ok:
+                result["funpay_error"] = f"HTTP {r.status_code}"
+        return result
 
     async def get_chats_snapshot(self) -> list[dict[str, Any]]:
         """
