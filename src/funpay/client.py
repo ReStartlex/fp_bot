@@ -38,6 +38,10 @@ class FunPayClient:
         self._settings = settings or get_settings()
         self._account: Any = None
         self._lock = asyncio.Lock()
+        # Кешируем свой username — нужен для фильтрации
+        # своих же сообщений в watcher / ChatHandler.
+        self._my_username_cache: str | None = None
+        self._my_user_id_cache: int | None = None
 
     async def __aenter__(self) -> "FunPayClient":
         return self
@@ -291,13 +295,28 @@ class FunPayClient:
                 _build_and_get
             )
 
-        # Лог: только факт наличия cookies, не значения. Админ-операции с
-        # лотами идут через свой HTTP-клиент (src.funpay.admin_http) и
-        # не зависят от того, нашлась ли requests.Session внутри FunPayAPI —
-        # поэтому http_sessions_with_cookies теперь не критичен.
+        # Запоминаем свой username/id из FunPayAPI.Account; если их нет —
+        # подстрахуемся через whoami() (admin_http).
+        if getattr(self._account, "username", None):
+            self._my_username_cache = str(self._account.username)
+        if getattr(self._account, "id", None):
+            try:
+                self._my_user_id_cache = int(self._account.id)
+            except (TypeError, ValueError):
+                pass
+        if self._my_username_cache is None or self._my_user_id_cache is None:
+            try:
+                me = await self._admin.whoami()
+                if not self._my_username_cache and me.get("username"):
+                    self._my_username_cache = str(me["username"])
+                if not self._my_user_id_cache and me.get("user_id"):
+                    self._my_user_id_cache = int(me["user_id"])
+            except Exception as exc:
+                logger.debug(f"FunPay whoami() для self-id упал: {exc}")
+
         logger.info(
-            f"FunPay подключён: id={self.account_id}, "
-            f"username={self.username}, "
+            f"FunPay подключён: id={self._my_user_id_cache}, "
+            f"username={self._my_username_cache}, "
             f"golden_key=set, "
             f"phpsessid={'set' if phpsessid else 'not set (ok, FunPay выдаст сам)'}, "
             f"баланс={self.balance}"
@@ -314,11 +333,21 @@ class FunPayClient:
 
     @property
     def account_id(self) -> int | None:
-        return getattr(self.account, "id", None)
+        return self._my_user_id_cache or getattr(self.account, "id", None)
 
     @property
     def username(self) -> str | None:
-        return getattr(self.account, "username", None)
+        return self._my_username_cache or getattr(self.account, "username", None)
+
+    @property
+    def my_username(self) -> str | None:
+        """Свой username (login) — для фильтрации собственных сообщений."""
+        return self._my_username_cache
+
+    @property
+    def my_user_id(self) -> int | None:
+        """Свой user_id — для фильтрации собственных сообщений."""
+        return self._my_user_id_cache
 
     @property
     def balance(self) -> Any:

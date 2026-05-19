@@ -72,6 +72,23 @@ class ChatHandler:
     async def on_message(self, event: FunPayMessageEvent) -> None:
         if event.is_my_message:
             return
+        # Подстраховка №2: даже если is_my_message не выставился,
+        # сравниваем author_username с собственным ником. FunPay не всегда
+        # отдаёт data-author в HTML, поэтому source-фильтр может ошибаться —
+        # а реагировать на свои же шаблоны (с !помощь внутри) категорически
+        # нельзя, иначе бот зациклится сам на себя.
+        my_username = getattr(self._fp, "my_username", None)
+        if (
+            my_username
+            and event.author_username
+            and event.author_username.strip().lower()
+            == my_username.strip().lower()
+        ):
+            logger.debug(
+                f"ChatHandler: пропускаю сообщение в чате {event.chat_id} — "
+                f"автор @{event.author_username} = это я"
+            )
+            return
         text = (event.text or "").strip()
         if not text:
             return

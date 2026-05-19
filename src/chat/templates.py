@@ -128,16 +128,15 @@ def greeting_pre_purchase(
         if working_now:
             return (
                 f"Hi, {name}! 👋\n"
-                f"Delivery is automatic: codes arrive in chat within seconds after payment.\n"
-                f"If you have any questions, write me here or type <code>!help</code> to "
-                f"ping the seller."
+                f"Delivery is automatic — codes arrive in chat within seconds after payment.\n"
+                f"If you have any questions, just write here and I'll jump in."
             )
         return (
             f"Hi, {name}! 👋\n"
-            f"Working hours are {wh.format_window()} ({wh.tz_name}). "
-            f"Auto-delivery still works at any time — codes will arrive in chat within "
+            f"Working hours: {wh.format_window()} ({wh.tz_name}). "
+            f"Auto-delivery still works around the clock — codes arrive in chat within "
             f"seconds after payment.\n"
-            f"If you need a human, type <code>!help</code>."
+            f"If anything comes up, write here — I'll reply in the morning."
         )
 
     if working_now:
@@ -145,14 +144,14 @@ def greeting_pre_purchase(
             f"Здравствуйте, {name}! 👋\n"
             f"Выдача автоматическая — коды приходят в чат в течение нескольких секунд "
             f"после оплаты.\n"
-            f"Если есть вопросы, пишите сюда или напишите !помощь — и я подключусь."
+            f"Если возникнут вопросы по заказу — просто напишите сюда, я подключусь."
         )
     return (
         f"Здравствуйте, {name}! 👋\n"
-        f"Я работаю с {wh.format_window()} ({wh.tz_name}). "
+        f"Работаю с {wh.format_window()} ({wh.tz_name}). "
         f"Выдача товара автоматическая и работает круглосуточно — коды приходят в "
         f"чат в течение нескольких секунд после оплаты.\n"
-        f"Если нужен человек, напишите !помощь — я свяжусь с вами утром."
+        f"Если возникнут вопросы — напишите сюда, отвечу утром."
     )
 
 

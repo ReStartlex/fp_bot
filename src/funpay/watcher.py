@@ -93,6 +93,55 @@ class FunPayWatcher:
         # baseline = baseline установлен, начинаем нормальный polling
         self._baseline_ready = threading.Event()
 
+    def _is_my_message(
+        self, author_id: Any, author_username: str | None
+    ) -> bool:
+        """
+        Сообщение считается «нашим» если:
+        - author_id совпадает с self.account.id, ИЛИ
+        - author_username совпадает с self._fp.my_username (case-insensitive).
+
+        Username-фильтр критически важен: FunPay не всегда отдаёт data-author
+        в HTML, а без него фильтр только по id пропустит наше сообщение,
+        и handler начнёт реагировать на свои же шаблоны.
+        """
+        my_id = (
+            getattr(self._fp, "my_user_id", None)
+            or getattr(self._fp.account, "id", None)
+        )
+        my_username = getattr(self._fp, "my_username", None) or getattr(
+            self._fp.account, "username", None
+        )
+        try:
+            if (
+                my_id is not None
+                and author_id is not None
+                and int(author_id) == int(my_id)
+            ):
+                return True
+        except (TypeError, ValueError):
+            pass
+        if (
+            my_username
+            and author_username
+            and str(author_username).strip().lower()
+            == str(my_username).strip().lower()
+        ):
+            return True
+        return False
+
+    def _make_msg_dedup_key(
+        self,
+        chat_id: int,
+        message_id: Any,
+        author_id: Any,
+        text: str,
+    ) -> tuple[Any, ...]:
+        """Единый ключ дедупа сообщений (одинаковый для listen и poll loop)."""
+        if message_id is not None:
+            return ("msg", chat_id, "id", message_id)
+        return ("msg", chat_id, "text", author_id, hash(text[:200]))
+
     # ---------- lifecycle ----------
 
     def start(self) -> None:
@@ -240,7 +289,6 @@ class FunPayWatcher:
             logger.debug(f"FunPay poll: get_chats_snapshot упал: {exc}")
             return
 
-        my_id = getattr(self._fp.account, "id", None)
         is_baseline = not self._baseline_ready.is_set()
 
         # Чаты, для которых надо тянуть историю:
@@ -325,30 +373,28 @@ class FunPayWatcher:
 
             for m in new_messages:
                 author_id = m.get("author_id")
-                is_my = bool(
-                    my_id is not None
-                    and author_id is not None
-                    and int(author_id) == int(my_id)
-                )
-                if is_my:
+                author_username = m.get("author_username")
+                # Username собеседника берём из карточки списка чатов
+                # (более надёжно, чем парсинг из HTML сообщения).
+                if not author_username:
+                    author_username = username
+                if self._is_my_message(author_id, author_username):
+                    # Своё сообщение — обязательно пропускаем, иначе бот
+                    # триггерится на свои же шаблоны (например, на
+                    # "!помощь" в тексте приветствия).
                     continue
                 msg = FunPayMessageEvent(
                     chat_id=chat_id,
                     chat_username=username,
                     author_id=author_id,
-                    author_username=m.get("author_username") or username,
+                    author_username=author_username,
                     text=m.get("text", ""),
                     is_my_message=False,
                 )
                 if not msg.text:
                     continue
-                # Дедуп по message_id (если есть) — гарантирует, что
-                # одно и то же сообщение не обработается дважды (например,
-                # если оно пришло и через listen, и через poll).
-                key: tuple[Any, ...] = (
-                    "msg",
-                    chat_id,
-                    m.get("message_id") or f"text:{hash(msg.text[:200])}",
+                key = self._make_msg_dedup_key(
+                    chat_id, m.get("message_id"), author_id, msg.text
                 )
                 with self._seen_lock:
                     if key in self._seen_keys:
@@ -385,11 +431,13 @@ class FunPayWatcher:
     def _dedup_register(self, kind: str, payload: Any) -> bool:
         """Регистрирует ключ; True если ключ новый (= обрабатывать)."""
         if kind == "msg" and isinstance(payload, FunPayMessageEvent):
-            key = (
-                "msg",
-                payload.chat_id,
-                payload.author_id,
-                hash(payload.text[:200]),
+            # listen-loop обычно НЕ знает message_id (FunPayAPI его не
+            # отдаёт в этой версии), поэтому fallback на (chat_id, text).
+            # Чтобы синхронизироваться с poll-loop, используем общий
+            # формат ключа из _make_msg_dedup_key.
+            msg_id = getattr(payload, "message_id", None)
+            key = self._make_msg_dedup_key(
+                payload.chat_id, msg_id, payload.author_id, payload.text
             )
         elif kind == "order" and isinstance(payload, FunPayOrderEvent):
             key = ("order", payload.funpay_order_id)
@@ -593,14 +641,16 @@ class FunPayWatcher:
         except (TypeError, ValueError):
             author_id = None
 
-        my_id = getattr(self._fp.account, "id", None)
-        is_my = bool(my_id is not None and author_id is not None and int(author_id) == int(my_id))
+        normalized_username = (
+            str(author_username) if author_username is not None else None
+        )
+        is_my = self._is_my_message(author_id, normalized_username)
 
         return FunPayMessageEvent(
             chat_id=chat_id,
             chat_username=str(chat_username) if chat_username is not None else None,
             author_id=author_id,
-            author_username=str(author_username) if author_username is not None else None,
+            author_username=normalized_username,
             text=text,
             is_my_message=is_my,
         )
