@@ -4,6 +4,6 @@ deploy/stamp_version.py перед каждым push'ем.
 
 ВАЖНО: НЕ редактируй вручную — твои изменения будут перезаписаны.
 """
-SHA = "7e0055d947bc5683f11733588b4eae5e3678e962"
-DATE = "2026-05-19T14:17:42+03:00"
-SUBJECT = "fix(watcher,client): radical fix - poll-thread uses MAIN asyncio loop + admin_http fallback for send_message"
+SHA = "90c6207513ed1b7e533a5644b4d6557e24d735a7"
+DATE = "2026-05-19T16:07:03+03:00"
+SUBJECT = "fix(deploy,funpay): bust gh-proxy cache + admin_http send retries + silence FunPayAPI noise"
