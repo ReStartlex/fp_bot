@@ -16,9 +16,10 @@ from __future__ import annotations
 import asyncio
 import html
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import wraps
 from typing import Awaitable, Callable
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -50,13 +51,27 @@ NS_TIMEOUT_SECONDS = 15.0
 FP_TIMEOUT_SECONDS = 15.0
 
 
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+
+
+def _to_moscow(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(MOSCOW_TZ)
+
+
 def _format_dt(dt: datetime | None) -> str:
-    return "—" if dt is None else dt.strftime("%Y-%m-%d %H:%M:%S")
+    msk = _to_moscow(dt)
+    return "—" if msk is None else msk.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _format_order_line(o: Order) -> str:
+    created_at = _to_moscow(o.created_at)
+    created_text = "—" if created_at is None else created_at.strftime("%m-%d %H:%M")
     return (
-        f"<code>{o.created_at.strftime('%m-%d %H:%M')}</code> "
+        f"<code>{created_text} MSK</code> "
         f"#{o.funpay_order_id} → {o.status} "
         f"(NS:{o.ns_custom_id or '—'})"
     )
@@ -712,20 +727,34 @@ class TelegramBot:
         reply_markup: InlineKeyboardMarkup | None = None,
     ) -> Message | None:
         """
-        Шлёт «панель» в чат, предварительно удаляя предыдущую.
-        Так в истории чата всегда максимум одно «живое» меню-сообщение,
-        и нет каскада повторяющихся заголовков.
+        Показывает «панель» в чате. Если предыдущая панель известна,
+        сначала редактируем её; если редакт не удался — удаляем и шлём новую.
+        Так повторные /orders не создают каскад одинаковых заголовков.
         """
         if self._bot is None:
             return None
         prev_id = self._control_msg.get(chat_id)
         if prev_id is not None:
             try:
-                await self._bot.delete_message(chat_id, prev_id)
-            except TelegramBadRequest:
-                pass
+                await self._bot.edit_message_text(
+                    text,
+                    chat_id=chat_id,
+                    message_id=prev_id,
+                    reply_markup=reply_markup,
+                )
+                return None
+            except TelegramBadRequest as exc:
+                err = str(exc).lower()
+                if "message is not modified" in err:
+                    return None
+                try:
+                    await self._bot.delete_message(chat_id, prev_id)
+                except TelegramBadRequest:
+                    pass
+                except Exception as delete_exc:
+                    logger.debug(f"delete prev control: {delete_exc}")
             except Exception as exc:
-                logger.debug(f"delete prev control: {exc}")
+                logger.debug(f"edit prev control: {exc}")
         new_msg = await self._bot.send_message(
             chat_id, text, reply_markup=reply_markup
         )

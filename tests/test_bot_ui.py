@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 import pytest
 from aiogram.types import InlineKeyboardMarkup
 
 from src.alerts import ui
+from src.alerts.bot import _format_order_line
 
 
 # ─────────────── фейковые объекты (как в FunPayAPI / NS) ───────────────
@@ -43,6 +45,14 @@ class FakeMapping:
     markup_percent: float | None
     stock_cap: int | None
     label: str | None
+
+
+@dataclass
+class FakeOrder:
+    created_at: datetime
+    funpay_order_id: str
+    status: str
+    ns_custom_id: str | None
 
 
 # ─────────────── главное меню ───────────────
@@ -251,6 +261,18 @@ def test_mapping_label_falls_back_to_id():
         label=None,
     )
     assert ui.mapping_label(m) == "#42"
+
+
+def test_format_order_line_uses_moscow_time():
+    order = FakeOrder(
+        created_at=datetime(2026, 5, 19, 15, 12),
+        funpay_order_id="F2G4TM6U",
+        status="delivered",
+        ns_custom_id="ns-1",
+    )
+    out = _format_order_line(order)  # type: ignore[arg-type]
+    assert "05-19 18:12 MSK" in out
+    assert "#F2G4TM6U" in out
 
 
 # ─────────────── render_list ───────────────

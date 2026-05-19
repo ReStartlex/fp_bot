@@ -7,11 +7,10 @@
 
 Тон: спокойный, доброжелательный, по делу. Без «хей-хей» и капса.
 
-Про слово «!помощь» в текстах:
-  Watcher и ChatHandler фильтруют собственные сообщения по
-  `my_username`, поэтому литерал «!помощь» в шаблоне не вызовет
-  само-триггер. Это даёт нам право чётко проинструктировать
-  покупателя, как позвать живого человека.
+Про команду помощи в текстах:
+  FunPay иногда возвращает исходящие сообщения как входящие, поэтому
+  в шаблонах не пишем триггер слитно. Покупателю показываем
+  `! помощь` и явно просим убрать пробел.
 """
 from __future__ import annotations
 
@@ -81,7 +80,8 @@ def delivery(buyer: str | None, pins: list[str], lang: Lang | None = None) -> st
             f"{intro}\n\n"
             f"{codes_block}\n\n"
             f"📌 Please activate within 24 hours.\n"
-            f"❓ If something goes wrong, write here — type !help and I'll "
+            f"❓ If something goes wrong, write here — type ! help "
+            f"(without the space) and I'll "
             f"jump in personally.\n"
             f"⭐ If everything is fine, a short feedback would mean a lot."
         )
@@ -95,7 +95,8 @@ def delivery(buyer: str | None, pins: list[str], lang: Lang | None = None) -> st
         f"{intro}\n\n"
         f"{codes_block}\n\n"
         f"📌 Пожалуйста, активируйте в течение 24 часов.\n"
-        f"❓ Если что-то пошло не так — напишите !помощь, и я подключусь лично.\n"
+        f"❓ Если что-то пошло не так — напишите ! помощь "
+        f"(слитно, без пробела), и я подключусь лично.\n"
         f"⭐ Если всё хорошо, буду благодарен за отзыв."
     )
 
@@ -166,15 +167,15 @@ def greeting_pre_purchase(
                 f"⚡ Delivery is automatic: the goods arrive in this chat "
                 f"within seconds after payment.\n"
                 f"❓ If you have any questions, just write here — or type "
-                f"!help to ping me personally."
+                f"! help without the space to ping me personally."
             )
         return (
             f"👋 Hi, {name}!\n"
             f"🕒 Working hours: {wh.format_window()} ({wh.tz_name}). "
             f"Auto-delivery still works around the clock — the goods arrive "
             f"in chat within seconds after payment.\n"
-            f"❓ If you need a human, type !help — I'll reply first thing "
-            f"in the morning."
+            f"❓ If you need a human, type ! help without the space — "
+            f"I'll reply first thing in the morning."
         )
 
     if working_now:
@@ -183,14 +184,15 @@ def greeting_pre_purchase(
             f"⚡ Выдача товара автоматическая — приходит сюда, в чат, в "
             f"течение нескольких секунд после оплаты.\n"
             f"❓ Если есть вопросы — просто напишите сюда. Чтобы позвать "
-            f"меня лично — отправьте !помощь."
+            f"меня лично — отправьте ! помощь (слитно, без пробела)."
         )
     return (
         f"👋 Здравствуйте, {name}!\n"
         f"🕒 Я работаю с {wh.format_window()} ({wh.tz_name}).\n"
         f"⚡ Автовыдача работает круглосуточно — товар придёт в чат за "
         f"несколько секунд после оплаты.\n"
-        f"❓ Если нужен живой человек — отправьте !помощь, я отвечу утром."
+        f"❓ Если нужен живой человек — отправьте ! помощь "
+        f"(слитно, без пробела), я отвечу утром."
     )
 
 

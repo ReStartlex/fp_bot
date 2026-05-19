@@ -29,12 +29,44 @@ from src.funpay.client import FunPayClient
 from src.funpay.events import FunPayMessageEvent
 
 
+_INVISIBLE_CHARS = "\u200b\u200c\u200d\u2060\u2061\u2062\u2063\u2064\ufeff"
+
+
+def _clean_chat_text(text: str) -> str:
+    """FunPay иногда добавляет невидимые символы к эху наших сообщений."""
+    cleaned = text
+    for ch in _INVISIBLE_CHARS:
+        cleaned = cleaned.replace(ch, "")
+    return cleaned.strip()
+
+
 def _has_help_trigger(text: str, triggers: set[str]) -> bool:
     """True если в тексте сообщения есть хотя бы один help-токен."""
     if not text or not triggers:
         return False
-    lowered = text.lower()
+    lowered = _clean_chat_text(text).lower()
     return any(t in lowered for t in triggers)
+
+
+def _looks_like_own_template_message(text: str) -> bool:
+    """Fallback-фильтр для случаев, когда FunPay отдаёт наше сообщение как buyer."""
+    cleaned = _clean_chat_text(text).lower()
+    own_markers = (
+        "готовлю ваш заказ",
+        "спасибо за покупку",
+        "ваш заказ готов",
+        "пожалуйста, активируйте в течение 24",
+        "уведомил продавца",
+        "подключится к чату",
+        "если всё хорошо, буду благодарен за отзыв",
+        "выдача товара автоматическая",
+        "автовыдача работает круглосуточно",
+        "preparing your order",
+        "your order is ready",
+        "i've notified the seller",
+        "delivery is automatic",
+    )
+    return any(marker in cleaned for marker in own_markers)
 
 
 def _shortlink(chat_id: int, username: str | None) -> str:
@@ -97,9 +129,16 @@ class ChatHandler:
             )
             return
 
-        text = (event.text or "").strip()
+        text = _clean_chat_text(event.text or "")
         if not text:
             log.debug("ChatHandler: пустой текст после strip — пропуск")
+            return
+
+        if _looks_like_own_template_message(text):
+            log.info(
+                "ChatHandler: пропускаю — текст похож на исходящий шаблон "
+                "бота, FunPay отдал его как входящее сообщение"
+            )
             return
 
         async with session_factory()() as session:

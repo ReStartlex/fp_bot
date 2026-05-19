@@ -74,3 +74,23 @@ def test_handler_ignores_when_only_message_id_matches():
     asyncio.run(handler.on_message(event))
     fp.send_message.assert_not_called()
     tg.send.assert_not_called()
+
+
+def test_handler_ignores_own_delivery_echo_with_wrong_author():
+    handler, fp, tg = _make_handler(my_username="lol228822")
+    event = FunPayMessageEvent(
+        chat_id=104433092,
+        chat_username="felechka1store",
+        author_id=None,
+        author_username="felechka1store",
+        text=(
+            "\u2064🎉 felechka1store, ваш заказ готов:\n\n"
+            "• X53N8R79L2LDPYWV\n\n"
+            "❓ Если что-то пошло не так — напишите !помощь, "
+            "и я подключусь лично."
+        ),
+        is_my_message=False,
+    )
+    asyncio.run(handler.on_message(event))
+    fp.send_message.assert_not_called()
+    tg.send.assert_not_called()
