@@ -59,3 +59,4 @@ mappings_*.csv
 *.local
 secrets/
 .gitcommitmsg.tmp
+.commit_msg.txt
