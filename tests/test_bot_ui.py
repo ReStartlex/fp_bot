@@ -273,6 +273,20 @@ def test_lots_page_name_button_is_noop_not_target():
     assert "act:fp_target:abcd:0" in callbacks
 
 
+def test_clear_target_removes_menu_target_state():
+    bot = object.__new__(TelegramBot)
+    bot._target_lots = {123: 69300023}
+    bot._target_labels = {123: "Apple 2 USD"}
+
+    assert bot._target_label_for(123) == "Apple 2 USD (#69300023)"  # type: ignore[attr-defined]
+
+    bot._clear_target(123)  # type: ignore[attr-defined]
+
+    assert bot._target_label_for(123) is None  # type: ignore[attr-defined]
+    assert 123 not in bot._target_lots
+    assert 123 not in bot._target_labels
+
+
 def test_mapping_label_falls_back_to_id():
     m = FakeMapping(
         funpay_lot_id=42,

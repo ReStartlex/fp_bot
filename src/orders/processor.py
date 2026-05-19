@@ -90,7 +90,6 @@ def _norm_text(value: str | None) -> str:
 
 
 _WEAK_MATCH_TOKENS = {
-    "usd",
     "gift",
     "card",
     "карта",

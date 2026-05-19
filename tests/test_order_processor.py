@@ -432,6 +432,53 @@ async def test_order_without_lot_id_can_match_known_lot_title(
 
 
 @pytest.mark.asyncio
+async def test_order_without_lot_id_distinguishes_same_amount_by_currency(
+    db_session_factory, settings
+):
+    """
+    При выкладке разных валют одинаковый номинал не должен смешиваться:
+    Battle.net 5 USD и 5 EUR похожи почти полностью, поэтому токен валюты
+    обязан участвовать в fallback-сопоставлении order без lot_id.
+    """
+    await _make_mapping(
+        db_session_factory,
+        lot_id=69406129,
+        svc_id=196,
+        label="Blizzard Gift Card | US | 5 USD",
+    )
+    await _make_mapping(
+        db_session_factory,
+        lot_id=69406130,
+        svc_id=197,
+        label="Blizzard Gift Card | EU | 5 EUR",
+    )
+    ns = FakeNS(pay_pins=["BATTLE-USD-5"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    event = FunPayOrderEvent(
+        funpay_order_id="fp-bnet-usd",
+        funpay_lot_id=0,
+        buyer_username="alice",
+        buyer_user_id=42,
+        chat_id=555,
+        quantity=1,
+        funpay_price_rub=383.0,
+        description="Подарочная карта Battle.net 5 USD (США), USD, 5 USD",
+    )
+
+    result = await process_funpay_order(
+        event, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "delivered"
+    db_order = await _order(db_session_factory, "fp-bnet-usd")
+    assert db_order is not None
+    assert db_order.funpay_lot_id == 69406129
+    assert db_order.ns_service_id == 196
+
+
+@pytest.mark.asyncio
 async def test_order_without_chat_id_resolves_chat_by_buyer_name(
     db_session_factory, settings
 ):

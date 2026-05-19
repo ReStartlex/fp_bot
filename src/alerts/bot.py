@@ -574,8 +574,7 @@ class TelegramBot:
         async def cmd_clear_target(msg: Message) -> None:
             if not self._is_owner(msg):
                 return
-            self._target_lots.pop(msg.chat.id, None)
-            self._target_labels.pop(msg.chat.id, None)
+            self._clear_target(msg.chat.id)
             await msg.answer("Цель сброшена.", reply_markup=ui.single_close_kb())
 
         # Пользователь иногда пишет "setmarkup ..." без ведущего "/".
@@ -608,8 +607,7 @@ class TelegramBot:
             if not self._is_owner(cq):
                 await cq.answer()
                 return
-            self._target_lots.pop(cq.from_user.id, None)
-            self._target_labels.pop(cq.from_user.id, None)
+            self._clear_target(cq.from_user.id)
             await cq.answer("Цель сброшена", show_alert=False)
             await self._edit_or_answer(
                 cq, self._menu_text(cq.from_user.id),
@@ -668,6 +666,10 @@ class TelegramBot:
         if label:
             return f"{label} (#{lot_id})"
         return f"#{lot_id}"
+
+    def _clear_target(self, chat_id: int) -> None:
+        self._target_lots.pop(chat_id, None)
+        self._target_labels.pop(chat_id, None)
 
     def _menu_text(self, chat_id: int) -> str:
         target = self._target_label_for(chat_id)
@@ -2728,6 +2730,7 @@ class TelegramBot:
             await session.commit()
         svc_label = ui.short_title(ns_service.service_name, limit=40)
         fp_label = self._target_labels.get(cq.from_user.id) or f"#{funpay_lot_id}"
+        self._clear_target(cq.from_user.id)
         await cq.answer(
             f"✅ Замаппил «{fp_label}» → {svc_label}",
             show_alert=True,
@@ -2741,6 +2744,7 @@ class TelegramBot:
                 f"NS#{obj.ns_service_id} · "
                 f"<i>{html.escape(svc_label)}</i>\n\n"
                 f"Markup: default ({self._settings.markup_percent}%)\n"
+                f"🎯 Цель сброшена — можно выбирать следующий лот.\n"
                 f"Запусти 🔄 Синхронизация чтобы применить.",
                 reply_markup=ui.single_close_kb(),
             )
