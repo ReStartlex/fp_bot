@@ -291,27 +291,17 @@ class FunPayClient:
                 _build_and_get
             )
 
-        # Лог намеренно показывает только факт наличия PHPSESSID, а не его
-        # значение — секрет не должен утекать в журналы.
-        sessions = sorted(set(
-            report_before["sessions_touched"] + report_after["sessions_touched"]
-        ))
-        has_phpsessid_attr = bool(getattr(self._account, "phpsessid", None))
+        # Лог: только факт наличия cookies, не значения. Админ-операции с
+        # лотами идут через свой HTTP-клиент (src.funpay.admin_http) и
+        # не зависят от того, нашлась ли requests.Session внутри FunPayAPI —
+        # поэтому http_sessions_with_cookies теперь не критичен.
         logger.info(
             f"FunPay подключён: id={self.account_id}, "
             f"username={self.username}, "
-            f"phpsessid={'set' if phpsessid else 'MISSING'}, "
-            f"phpsessid_attr={'present' if has_phpsessid_attr else 'absent'}, "
-            f"http_sessions_with_cookies={sessions or 'NONE_FOUND'}, "
+            f"golden_key=set, "
+            f"phpsessid={'set' if phpsessid else 'not set (ok, FunPay выдаст сам)'}, "
             f"баланс={self.balance}"
         )
-        if phpsessid and not sessions:
-            logger.error(
-                "FunPay: ни одной requests.Session не найдено в Account. "
-                "Cookies некуда положить, библиотека ходит без PHPSESSID. "
-                "Запусти `python -m src.tools.funpay_introspect` и пришли "
-                "вывод — добавим нужный путь в _install_cookies()."
-            )
         return self._account
 
     @property

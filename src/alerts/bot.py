@@ -111,9 +111,24 @@ def _format_status_text(
 def _read_build_info() -> str:
     """
     Возвращает короткую строку с версией задеплоенного кода — git SHA и
-    дату последнего коммита. Берёт это из файла BUILD_INFO, который пишет
-    deploy/fetch_code.sh при каждом обновлении.
+    дату последнего коммита.
+
+    Приоритет источников:
+    1. src/_version.py — пишется deploy/stamp_version.py перед каждым push'ем.
+    2. BUILD_INFO — пишется deploy/fetch_code.sh, если api.github.com доступен.
     """
+    # 1. _version.py — самый надёжный путь
+    try:
+        from src import _version  # type: ignore
+        sha = (getattr(_version, "SHA", "") or "")[:12]
+        date = getattr(_version, "DATE", "") or ""
+        subj = (getattr(_version, "SUBJECT", "") or "")[:80]
+        if sha and sha != "unknown":
+            return f"build: <code>{sha}</code> ({date})\nкоммит: <i>{subj}</i>\n"
+    except Exception:
+        pass
+
+    # 2. BUILD_INFO fallback
     import os
     candidates = [
         os.path.join(os.getcwd(), "BUILD_INFO"),
@@ -137,7 +152,7 @@ def _read_build_info() -> str:
         subj = (data.get("subject") or "")[:80]
         if sha:
             return f"build: <code>{sha}</code> ({date})\nкоммит: <i>{subj}</i>\n"
-    return "build: <i>BUILD_INFO не найден — обнови через deploy/update.sh</i>\n"
+    return "build: <i>версия не определена</i>\n"
 
 
 def _guard(handler):

@@ -92,13 +92,10 @@ async def _decide_for_one(
         lot_fields = await funpay_client.get_lot_fields(mapping.funpay_lot_id)
     except Exception as exc:
         text = str(exc)
-        # Подсказка по самой частой проблеме
         hint = ""
-        if "expecting value" in text.lower():
-            hint = (
-                " (вероятно протух FUNPAY_PHPSESSID — обнови в .env и "
-                "перезапусти сервис)"
-            )
+        # Auth-ошибка (golden_key инвалидирован FunPay'ем) — самая частая.
+        if "auth" in text.lower() or "login" in text.lower():
+            hint = " (обнови FUNPAY_GOLDEN_KEY в .env и перезапусти сервис)"
         return LotSyncDecision(
             funpay_lot_id=mapping.funpay_lot_id,
             ns_service_id=mapping.ns_service_id,

@@ -77,39 +77,46 @@ if getent passwd bot >/dev/null 2>&1; then
     echo "    chown bot:bot ${APP_DIR} — ОК"
 fi
 
-# Записываем BUILD_INFO для /version и update.sh. Тянем последний коммит
-# main через gh-proxy (тарбол сам по себе SHA не содержит). Парсим JSON
-# через python3 (он всегда есть на VPS), потому что grep на бинарных
-# полях msg/title капризничает с многострочными значениями и юникодом.
-COMMITS_URL="${GH_PROXY}/https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/commits/${BRANCH}?nocache=$(date +%s)"
-if BUILD_JSON=$(curl -fsSL --max-time 30 "${COMMITS_URL}" 2>&1); then
-    # ВАЖНО: НЕ используем heredoc одновременно с pipe — bash отдаст
-    # python3 в stdin одно из двух, и парсер развалится. Передаём JSON
-    # через переменную окружения, а скрипт даём флагом -c.
-    PARSED=$(BUILD_JSON="${BUILD_JSON}" python3 -c '
+# Записываем BUILD_INFO. Источник истины — файл src/_version.py,
+# который пишется при каждом push'е (см. pre-push hook / git commit).
+# Если файла нет — пробуем api.github.com через прокси (он часто 403,
+# поэтому это только fallback).
+SHA=""
+DATE=""
+SUBJECT=""
+if [[ -f "${APP_DIR}/src/_version.py" ]]; then
+    SHA=$(grep -E '^SHA' "${APP_DIR}/src/_version.py" | head -1 \
+          | sed -E 's/.*"([^"]+)".*/\1/')
+    DATE=$(grep -E '^DATE' "${APP_DIR}/src/_version.py" | head -1 \
+          | sed -E 's/.*"([^"]+)".*/\1/')
+    SUBJECT=$(grep -E '^SUBJECT' "${APP_DIR}/src/_version.py" | head -1 \
+          | sed -E 's/.*"(.*)".*/\1/')
+fi
+if [[ -z "${SHA}" ]]; then
+    COMMITS_URL="${GH_PROXY}/https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/commits/${BRANCH}?nocache=$(date +%s)"
+    if BUILD_JSON=$(curl -fsSL --max-time 30 "${COMMITS_URL}" 2>/dev/null); then
+        PARSED=$(BUILD_JSON="${BUILD_JSON}" python3 -c '
 import json, os
 data = json.loads(os.environ["BUILD_JSON"])
 sha = data.get("sha", "")
 date = (data.get("commit") or {}).get("author", {}).get("date", "")
 msg = ((data.get("commit") or {}).get("message") or "").splitlines()[0][:160]
 print(f"{sha}|{date}|{msg}")
-' 2>&1) || PARSED=""
-    IFS='|' read -r SHA DATE SUBJECT <<< "${PARSED}"
-    if [[ -n "${SHA}" && "${SHA}" != *"error"* && "${SHA}" != *"Traceback"* ]]; then
-        {
-            echo "sha=${SHA}"
-            echo "branch=${BRANCH}"
-            echo "date=${DATE}"
-            echo "subject=${SUBJECT}"
-            echo "fetched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        } > "${APP_DIR}/BUILD_INFO"
-        echo "    BUILD_INFO: ${SHA:0:12}  ${DATE}  ${SUBJECT}"
-    else
-        echo "    WARN: BUILD_INFO не записан. Ответ python3: ${PARSED:0:200}"
-        echo "    WARN: первые 200 байт ответа GitHub: ${BUILD_JSON:0:200}"
+' 2>/dev/null) || PARSED=""
+        IFS='|' read -r SHA DATE SUBJECT <<< "${PARSED}"
     fi
+fi
+if [[ -n "${SHA}" ]]; then
+    {
+        echo "sha=${SHA}"
+        echo "branch=${BRANCH}"
+        echo "date=${DATE}"
+        echo "subject=${SUBJECT}"
+        echo "fetched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "${APP_DIR}/BUILD_INFO"
+    echo "    BUILD_INFO: ${SHA:0:12}  ${DATE:-?}  ${SUBJECT:-?}"
 else
-    echo "    WARN: BUILD_INFO не записан (curl к api.github.com упал): ${BUILD_JSON:0:200}"
+    echo "    WARN: BUILD_INFO не записан (нет src/_version.py и api.github.com недоступен)"
 fi
 
 echo "    Готово через gh-proxy."

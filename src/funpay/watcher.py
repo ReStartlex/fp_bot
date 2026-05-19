@@ -1,18 +1,29 @@
 """
-FunPay watcher: слушает события (Runner.listen()) в фоне и раздаёт callbacks:
+FunPay watcher: слушает события и раздаёт callbacks:
     on_new_order(FunPayOrderEvent)
     on_new_message(FunPayMessageEvent)
 
-FunPayAPI работает блокирующе (requests + sync generator). listen() крутится
-в отдельном thread, события через run_coroutine_threadsafe попадают в asyncio.
+Архитектура (после долгой битвы с FunPayAPI 1.1.0):
 
-API библиотеки FunPayAPI разное в разных форках, поэтому атрибуты ищем
-через getattr-fallback.
+1. listen-loop — крутит `Runner.listen()` библиотеки. Авто-перезапуск,
+   если генератор тихо завершился.
+2. poll-loop — независимый poller: раз в N секунд тянет
+   `account.get_chats()` сам, диффает с предыдущим снимком, на любое
+   входящее сообщение зовёт handler. Это спасает в случае, когда
+   listen() ничего не присылает (а такое в этой версии библиотеки
+   реально бывает: после `INITIAL_CHAT` поток событий пропадает).
+3. dedup-кеш — гарантирует, что одно и то же сообщение не сработает
+   дважды (когда оно пришло и через listen, и через poll).
+
+Оба цикла живут в отдельных daemon-threads. События в asyncio
+прокидываем через `asyncio.run_coroutine_threadsafe`.
 """
 from __future__ import annotations
 
 import asyncio
 import threading
+import time
+from collections import deque
 from typing import Any, Awaitable, Callable, Optional
 
 from loguru import logger
@@ -26,8 +37,32 @@ OrderCallback = Callable[[FunPayOrderEvent], Awaitable[None]]
 MessageCallback = Callable[[FunPayMessageEvent], Awaitable[None]]
 
 
+# Типы событий, которые в разных версиях FunPayAPI означают
+# «в чате появилось новое сообщение».
+MESSAGE_TYPES = (
+    "NEW_MESSAGE",
+    "MESSAGE_NEW",
+    "CHAT_MESSAGE",
+    "NEW_CHAT_MESSAGE",
+    "MESSAGE",
+    "LAST_CHAT_MESSAGE_CHANGED",
+    "CHATS_LIST_CHANGED",
+)
+ORDER_TYPES = (
+    "NEW_ORDER",
+    "ORDER_NEW",
+    "ORDERS_LIST_CHANGED",
+)
+# Шум, который не интересен ни handler-у, ни нам в логах.
+NOISE_TYPES = (
+    "INITIAL_CHAT",
+    "INITIAL_ORDER",
+)
+
+
 class FunPayWatcher:
-    """Запускает фоновый слушатель и зовёт callbacks на каждое релевантное событие."""
+    """Запускает фоновый слушатель + poller и зовёт callbacks на каждое
+    релевантное событие."""
 
     def __init__(
         self,
@@ -35,38 +70,105 @@ class FunPayWatcher:
         *,
         on_new_order: OrderCallback | None = None,
         on_new_message: MessageCallback | None = None,
+        poll_interval_seconds: float = 5.0,
+        listen_restart_delay_seconds: float = 5.0,
+        dedup_cache_size: int = 1024,
     ) -> None:
         self._fp = fp_client
         self._on_new_order = on_new_order
         self._on_new_message = on_new_message
         self._stop_evt = threading.Event()
-        self._thread: threading.Thread | None = None
+        self._listen_thread: threading.Thread | None = None
+        self._poll_thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._poll_interval = poll_interval_seconds
+        self._listen_restart_delay = listen_restart_delay_seconds
+
+        # Дедуп: помним недавно обработанные ключи сообщений/заказов.
+        # Ключ для сообщения: (chat_id, author_id, hash(text[:200])).
+        self._seen_keys: deque[tuple[Any, ...]] = deque(maxlen=dedup_cache_size)
+        self._seen_lock = threading.Lock()
+        # Snapshot чатов для polling: {chat_id: last_msg_signature}
+        self._poll_snapshot: dict[int, str] = {}
+        # Уже видели ли мы хотя бы один INITIAL_CHAT snapshot (=> baseline есть)
+        self._baseline_ready = threading.Event()
+
+    # ---------- lifecycle ----------
 
     def start(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
+        if self._listen_thread is not None and self._listen_thread.is_alive():
             return
         self._stop_evt.clear()
+        self._baseline_ready.clear()
         self._loop = asyncio.get_running_loop()
-        self._thread = threading.Thread(
-            target=self._run, name="funpay-watcher", daemon=True
+        self._listen_thread = threading.Thread(
+            target=self._listen_loop, name="funpay-watcher-listen", daemon=True
         )
-        self._thread.start()
-        logger.info("FunPay watcher запущен")
+        self._poll_thread = threading.Thread(
+            target=self._poll_loop, name="funpay-watcher-poll", daemon=True
+        )
+        self._listen_thread.start()
+        self._poll_thread.start()
+        logger.info(
+            f"FunPay watcher запущен (listen-thread + poll каждые "
+            f"{self._poll_interval:.0f}s)"
+        )
 
     def stop(self) -> None:
         self._stop_evt.set()
-        if self._thread is not None:
-            self._thread.join(timeout=10)
+        for t in (self._listen_thread, self._poll_thread):
+            if t is not None:
+                t.join(timeout=10)
         logger.info("FunPay watcher остановлен")
 
-    # ---------- Внутреннее ----------
+    # ---------- listen-loop ----------
 
-    def _run(self) -> None:
-        try:
-            self._listen_blocking()
-        except Exception as exc:
-            logger.exception(f"FunPay watcher упал: {exc}")
+    def _listen_loop(self) -> None:
+        """
+        Крутит Runner.listen() в бесконечном цикле. Если генератор
+        тихо завершился (FunPayAPI 1.1.0 это делает после INITIAL_CHAT
+        снимка в ряде случаев) — рестартую через короткую паузу.
+        """
+        while not self._stop_evt.is_set():
+            try:
+                events_iter = self._get_event_iterator()
+            except Exception as exc:
+                logger.warning(
+                    f"FunPay watcher: не смог получить event-iterator "
+                    f"({type(exc).__name__}: {exc}). Повтор через "
+                    f"{self._listen_restart_delay}s."
+                )
+                if self._stop_evt.wait(self._listen_restart_delay):
+                    return
+                continue
+
+            events_consumed = 0
+            try:
+                for event in events_iter:
+                    if self._stop_evt.is_set():
+                        return
+                    events_consumed += 1
+                    try:
+                        self._handle_event(event)
+                    except Exception as exc:
+                        logger.exception(
+                            f"Не получилось обработать FunPay-событие: {exc}"
+                        )
+            except Exception as exc:
+                logger.warning(
+                    f"FunPay listen() итерация упала "
+                    f"({type(exc).__name__}: {exc}). Перезапускаю через "
+                    f"{self._listen_restart_delay}s."
+                )
+
+            if self._stop_evt.is_set():
+                return
+            logger.debug(
+                f"FunPay listen() завершил итерацию ({events_consumed} событий). "
+                f"Перезапуск через {self._listen_restart_delay}s."
+            )
+            if self._stop_evt.wait(self._listen_restart_delay):
+                return
 
     def _get_event_iterator(self) -> Any:
         """Возвращает iterable событий FunPay (зависит от версии библиотеки)."""
@@ -76,15 +178,12 @@ class FunPayWatcher:
         if runner is not None:
             listen = getattr(runner, "listen", None)
             if callable(listen):
-                logger.debug("FunPay watcher: использую account.runner.listen()")
                 return listen()
 
         get_updates = getattr(account, "get_updates", None)
         if callable(get_updates):
             try:
-                gen = get_updates()
-                logger.debug("FunPay watcher: использую account.get_updates()")
-                return gen
+                return get_updates()
             except TypeError as exc:
                 logger.debug(f"account.get_updates() не итерируется: {exc}")
 
@@ -92,65 +191,265 @@ class FunPayWatcher:
             from FunPayAPI import Runner  # type: ignore
 
             runner = Runner(account)
-            logger.debug("FunPay watcher: использую Runner(account).listen()")
             return runner.listen()
         except Exception as exc:
             logger.debug(f"Runner(account).listen() недоступен: {exc}")
 
         raise RuntimeError(
             "FunPayAPI: не нашёл способ слушать события. "
-            "Сделай FunPayClient.describe_account() и пришли вывод."
+            "Запусти `python -m src.tools.funpay_introspect` и пришли вывод."
         )
 
-    def _listen_blocking(self) -> None:
-        events_iter = self._get_event_iterator()
-        for event in events_iter:
-            if self._stop_evt.is_set():
-                break
+    # ---------- poll-loop ----------
+
+    def _poll_loop(self) -> None:
+        """
+        Опрашивает account.get_chats() с интервалом self._poll_interval.
+
+        На первом проходе формируем baseline snapshot — никаких алертов
+        не шлём. На всех последующих проходах диффим: если для какого-то
+        chat_id «подпись последнего сообщения» изменилась, и автор —
+        не мы, считаем что пришло новое сообщение и вызываем handler.
+        """
+        # Первый цикл - короткая задержка, чтобы listen-loop успел
+        # подключиться к Runner; иначе оба полезут одновременно.
+        time.sleep(2.0)
+        while not self._stop_evt.is_set():
             try:
-                self._handle_event(event)
+                self._poll_once()
             except Exception as exc:
-                logger.exception(f"Не получилось обработать FunPay-событие: {exc}")
+                logger.debug(f"FunPay poll-loop: итерация упала: {exc}")
+            if self._stop_evt.wait(self._poll_interval):
+                return
+
+    def _poll_once(self) -> None:
+        chats = self._fetch_chats_snapshot()
+        my_id = getattr(self._fp.account, "id", None)
+
+        # Первый снимок — просто baseline.
+        is_baseline = not self._baseline_ready.is_set()
+
+        new_snapshot: dict[int, str] = {}
+        for chat in chats:
+            chat_id = self._g(chat, "id", "chat_id", "node_id")
+            if chat_id is None:
+                continue
+            try:
+                chat_id_int = int(chat_id)
+            except (TypeError, ValueError):
+                continue
+
+            last = self._extract_last_message(chat)
+            if last is None:
+                # У чата ещё нет сообщений — пропускаем.
+                continue
+            signature = self._message_signature(last)
+            new_snapshot[chat_id_int] = signature
+
+            if is_baseline:
+                continue
+
+            prev_signature = self._poll_snapshot.get(chat_id_int)
+            if prev_signature == signature:
+                continue
+
+            # Сообщение изменилось — кто автор?
+            msg = self._normalize_message_from_chat(chat, last, my_id)
+            if msg is None or msg.is_my_message:
+                continue
+            if not self._dedup_register("msg", msg):
+                # Уже видели это сообщение через listen.
+                continue
+            logger.info(
+                f"FunPay poll: новое сообщение в чате {msg.chat_id} от "
+                f"@{msg.author_username}: {msg.text[:80]!r}"
+            )
+            if self._on_new_message is not None:
+                self._dispatch_async(self._on_new_message(msg))
+
+        self._poll_snapshot = new_snapshot
+        if is_baseline:
+            self._baseline_ready.set()
+            logger.info(
+                f"FunPay poll: baseline зафиксирован "
+                f"({len(new_snapshot)} чатов)"
+            )
+
+    def _fetch_chats_snapshot(self) -> list[Any]:
+        """Получает список чатов из FunPayAPI (метод варьируется)."""
+        account = self._fp.account
+        # FunPayAPI 1.1.0: account.get_chats()
+        getter = getattr(account, "get_chats", None)
+        if callable(getter):
+            try:
+                value = getter()
+                return self._flatten_chats(value)
+            except Exception as exc:
+                logger.debug(f"account.get_chats() упал: {exc}")
+
+        # Старые версии: account.chats атрибут
+        chats = getattr(account, "chats", None)
+        if chats is not None:
+            return self._flatten_chats(chats)
+
+        return []
+
+    @staticmethod
+    def _flatten_chats(value: Any) -> list[Any]:
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            return list(value.values())
+        return []
+
+    def _extract_last_message(self, chat: Any) -> Any:
+        """Возвращает последнее сообщение в чате (или None)."""
+        # FunPayAPI 1.1.0: chat.last_message — Message object
+        for attr in (
+            "last_message",
+            "last_msg",
+            "last_by_id",
+        ):
+            value = getattr(chat, attr, None)
+            if value is not None:
+                return value
+        # некоторые форки кладут last_message_text + last_message_author напрямую
+        text = getattr(chat, "last_message_text", None)
+        if text is not None:
+            return chat  # сам chat несёт last_message_* атрибуты
+        return None
+
+    def _message_signature(self, last: Any) -> str:
+        """Стабильная сигнатура для дедупа: msg_id + author_id + первые
+        80 символов текста. Если msg_id нет — текст + author."""
+        msg_id = self._g(last, "id", "message_id")
+        author_id = self._g(last, "author_id", "user_id")
+        if author_id is None:
+            author = self._g(last, "author", "from_user")
+            if author is not None and not isinstance(author, (int, str)):
+                author_id = getattr(author, "id", None)
+        text = self._g(last, "text", "content", "body") or ""
+        if msg_id is not None:
+            return f"{msg_id}|{author_id}|{str(text)[:80]}"
+        return f"{author_id}|{str(text)[:200]}"
+
+    def _normalize_message_from_chat(
+        self, chat: Any, last: Any, my_id: Any
+    ) -> Optional[FunPayMessageEvent]:
+        chat_id_raw = self._g(chat, "id", "chat_id", "node_id")
+        try:
+            chat_id = int(chat_id_raw) if chat_id_raw is not None else None
+        except (TypeError, ValueError):
+            chat_id = None
+        if chat_id is None:
+            return None
+
+        chat_username = self._g(
+            chat, "name", "interlocutor", "chat_name", "chat_username"
+        )
+
+        text_raw = self._g(last, "text", "content", "body")
+        if text_raw is None:
+            # Иногда last — это объект с .text=None, но есть .image и т.п.
+            return None
+        text = str(text_raw)
+
+        author = self._g(last, "author", "from_user", "user")
+        author_username = None
+        author_id = self._g(last, "author_id", "user_id")
+        if author is not None and not isinstance(author, (int, str)):
+            author_username = getattr(author, "username", None)
+            author_id = author_id or getattr(author, "id", None)
+        elif isinstance(author, str):
+            author_username = author
+        try:
+            author_id = int(author_id) if author_id is not None else None
+        except (TypeError, ValueError):
+            author_id = None
+
+        is_my = bool(
+            my_id is not None
+            and author_id is not None
+            and int(author_id) == int(my_id)
+        )
+
+        return FunPayMessageEvent(
+            chat_id=chat_id,
+            chat_username=str(chat_username) if chat_username is not None else None,
+            author_id=author_id,
+            author_username=str(author_username) if author_username is not None else None,
+            text=text,
+            is_my_message=is_my,
+        )
+
+    # ---------- dedup ----------
+
+    def _dedup_register(self, kind: str, payload: Any) -> bool:
+        """Регистрирует ключ; True если ключ новый (= обрабатывать)."""
+        if kind == "msg" and isinstance(payload, FunPayMessageEvent):
+            key = (
+                "msg",
+                payload.chat_id,
+                payload.author_id,
+                hash(payload.text[:200]),
+            )
+        elif kind == "order" and isinstance(payload, FunPayOrderEvent):
+            key = ("order", payload.funpay_order_id)
+        else:
+            return True
+
+        with self._seen_lock:
+            if key in self._seen_keys:
+                return False
+            self._seen_keys.append(key)
+        return True
+
+    # ---------- event handling ----------
 
     def _handle_event(self, event: Any) -> None:
         event_type = self._extract_event_type(event)
         type_str = str(event_type).upper() if event_type is not None else ""
 
-        # Лог любого типа на INFO — иначе при LOG_LEVEL=INFO не видно,
-        # доходят ли вообще события до watcher.
-        logger.info(f"FunPay event: type={type_str or 'UNKNOWN'!r}")
-
-        if "NEW_ORDER" in type_str or "ORDER_NEW" in type_str:
-            order = self._normalize_order(event)
-            if order is not None and self._on_new_order is not None:
-                logger.info(
-                    f"FunPay NEW_ORDER: order={order.funpay_order_id}, "
-                    f"lot={order.funpay_lot_id}, qty={order.quantity}"
-                )
-                self._dispatch_async(self._on_new_order(order))
+        # INITIAL_* — это снимок на старте listen(). Шумит. На DEBUG.
+        if any(noise in type_str for noise in NOISE_TYPES):
+            logger.debug(f"FunPay event (noise): type={type_str!r}")
             return
 
-        if (
-            "NEW_MESSAGE" in type_str
-            or "MESSAGE_NEW" in type_str
-            or "CHAT_MESSAGE" in type_str
-            or type_str == "MESSAGE"
-        ):
+        logger.info(f"FunPay event: type={type_str!r}")
+
+        if any(t in type_str for t in ORDER_TYPES):
+            order = self._normalize_order(event)
+            if order is None:
+                return
+            if not self._dedup_register("order", order):
+                return
+            if self._on_new_order is None:
+                return
+            logger.info(
+                f"FunPay NEW_ORDER: order={order.funpay_order_id}, "
+                f"lot={order.funpay_lot_id}, qty={order.quantity}"
+            )
+            self._dispatch_async(self._on_new_order(order))
+            return
+
+        if any(t in type_str for t in MESSAGE_TYPES):
             msg = self._normalize_message(event)
             if msg is None:
-                logger.warning(
-                    f"FunPay {type_str}: не смог нормализовать сообщение: "
-                    f"{event!r}"
+                logger.debug(
+                    f"FunPay {type_str}: не смог нормализовать (нет text?): "
+                    f"event={event!r}"
                 )
                 return
+            if msg.is_my_message:
+                return
+            if not self._dedup_register("msg", msg):
+                # Уже видели через poller — игнорируем.
+                return
             if self._on_new_message is None:
-                logger.debug(
-                    "FunPay сообщение пришло, но on_new_message callback не задан"
-                )
                 return
             logger.info(
                 f"FunPay NEW_MESSAGE: chat={msg.chat_id}, "
-                f"author={msg.author_username}, my={msg.is_my_message}, "
+                f"author=@{msg.author_username}, "
                 f"text={msg.text[:80]!r}"
             )
             self._dispatch_async(self._on_new_message(msg))
@@ -165,7 +464,6 @@ class FunPayWatcher:
 
     @staticmethod
     def _on_dispatch_done(future: Any) -> None:
-        """Логируем исключения из dispatched корутин (иначе теряются)."""
         try:
             exc = future.exception()
         except Exception as e:
@@ -176,7 +474,7 @@ class FunPayWatcher:
                 f"Неперехваченное исключение в dispatched FunPay handler: {exc}"
             )
 
-    # ---------- Нормализация ----------
+    # ---------- нормализация event объектов ----------
 
     def _normalize_order(self, event: Any) -> Optional[FunPayOrderEvent]:
         order_obj = (
@@ -192,9 +490,7 @@ class FunPayWatcher:
             return None
         funpay_order_id = str(funpay_order_id)
 
-        # lot_id критичен — мы по нему ищем маппинг. subcategory_id и node_id
-        # это совсем другие сущности, fallback на них даст ложный поиск.
-        funpay_lot_id_raw = self._g(order_obj, "lot_id", "offer_id", "subcategory_id")
+        funpay_lot_id_raw = self._g(order_obj, "lot_id", "offer_id")
         try:
             funpay_lot_id = int(funpay_lot_id_raw) if funpay_lot_id_raw is not None else 0
         except (TypeError, ValueError):
@@ -250,13 +546,20 @@ class FunPayWatcher:
         )
 
     def _normalize_message(self, event: Any) -> Optional[FunPayMessageEvent]:
-        # В разных версиях message-объект лежит в event.message_obj / event.message / event.data
         msg_obj = (
             getattr(event, "message_obj", None)
             or getattr(event, "message", None)
             or getattr(event, "data", None)
             or event
         )
+        # LAST_CHAT_MESSAGE_CHANGED шлёт chat-объект как .data; внутри последнее
+        # сообщение лежит в .last_message
+        if hasattr(msg_obj, "last_message"):
+            inner = getattr(msg_obj, "last_message")
+            if inner is not None:
+                # для нормализации нам нужен и текст, и автор — last_message несёт оба
+                msg_obj = inner
+
         text_raw = self._g(msg_obj, "text", "content", "body")
         if text_raw is None:
             return None
@@ -267,6 +570,13 @@ class FunPayWatcher:
             chat_id = int(chat_id_raw) if chat_id_raw is not None else None
         except (TypeError, ValueError):
             chat_id = None
+        if chat_id is None:
+            # fallback: chat_id может быть на исходном event-е
+            outer_chat = self._g(event, "chat_id", "node_id")
+            try:
+                chat_id = int(outer_chat) if outer_chat is not None else None
+            except (TypeError, ValueError):
+                chat_id = None
         if chat_id is None:
             return None
 
@@ -285,7 +595,6 @@ class FunPayWatcher:
         except (TypeError, ValueError):
             author_id = None
 
-        # "Моё" сообщение определяем по account.id
         my_id = getattr(self._fp.account, "id", None)
         is_my = bool(my_id is not None and author_id is not None and int(author_id) == int(my_id))
 
