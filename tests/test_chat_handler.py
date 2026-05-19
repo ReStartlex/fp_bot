@@ -1,7 +1,11 @@
 """Тесты помощника help-триггеров (без сети)."""
 from __future__ import annotations
 
-from src.chat.handler import _has_help_trigger, _looks_like_own_template_message
+from src.chat.handler import (
+    _has_help_trigger,
+    _looks_like_funpay_system_message,
+    _looks_like_own_template_message,
+)
 
 
 def test_help_trigger_simple():
@@ -45,3 +49,17 @@ def test_own_delivery_template_is_detected_even_with_funpay_prefix():
         "❓ Если что-то пошло не так — напишите !помощь"
     )
     assert _looks_like_own_template_message(text) is True
+
+
+def test_funpay_paid_order_system_message_is_detected():
+    text = (
+        "Покупатель Booooss оплатил заказ #XDK51RB3. App Store & iTunes, "
+        "Подарочные карты, АВТОВЫДАЧА. "
+        "Booooss, не забудьте потом нажать кнопку «Подтвердить выполнение заказа»."
+    )
+    assert _looks_like_funpay_system_message(text) is True
+
+
+def test_regular_buyer_message_is_not_system_message():
+    assert _looks_like_funpay_system_message("Здравствуйте, есть товар?") is False
+    assert _looks_like_funpay_system_message("!помощь") is False

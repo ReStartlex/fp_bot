@@ -69,6 +69,21 @@ def _looks_like_own_template_message(text: str) -> bool:
     return any(marker in cleaned for marker in own_markers)
 
 
+def _looks_like_funpay_system_message(text: str) -> bool:
+    """
+    FunPay присылает сервисные уведомления в чат как обычные сообщения.
+    Например: "Покупатель X оплатил заказ #ABC... Не забудьте потом нажать..."
+    На такие сообщения нельзя запускать pre-purchase greeting: заказ уже куплен,
+    его обработает order pipeline.
+    """
+    cleaned = _clean_chat_text(text).lower()
+    ru_paid_order = "покупатель" in cleaned and "оплатил заказ" in cleaned
+    ru_confirm_hint = "не забудьте" in cleaned and "подтвердить" in cleaned
+    en_paid_order = "buyer" in cleaned and "paid order" in cleaned
+    en_confirm_hint = "don't forget" in cleaned and "confirm" in cleaned
+    return (ru_paid_order and ru_confirm_hint) or (en_paid_order and en_confirm_hint)
+
+
 def _shortlink(chat_id: int, username: str | None) -> str:
     """Удобная ссылка/упоминание для алерта в Telegram."""
     if username:
@@ -138,6 +153,13 @@ class ChatHandler:
             log.info(
                 "ChatHandler: пропускаю — текст похож на исходящий шаблон "
                 "бота, FunPay отдал его как входящее сообщение"
+            )
+            return
+
+        if _looks_like_funpay_system_message(text):
+            log.info(
+                "ChatHandler: пропускаю системное сообщение FunPay; "
+                "заказ обработает order pipeline"
             )
             return
 

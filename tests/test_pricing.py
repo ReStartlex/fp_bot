@@ -127,9 +127,15 @@ def test_should_update_price_first_time():
     assert should_update_price(None, 100.0, threshold_percent=2.0) is True
 
 
-def test_should_update_price_below_threshold():
-    # 100 -> 101 = +1% — ниже порога 2%
-    assert should_update_price(100.0, 101.0, threshold_percent=2.0) is False
+def test_should_update_price_visible_unit_change_even_below_threshold():
+    # 100 -> 101 = +1% ниже порога 2%, но это видимое изменение цены.
+    # Ручной markup должен реально применяться, а не застревать на updated=0.
+    assert should_update_price(100.0, 101.0, threshold_percent=2.0) is True
+
+
+def test_should_update_price_sub_unit_noise_below_threshold():
+    # Для дробных валют/шумовых колебаний меньше единицы порог всё ещё работает.
+    assert should_update_price(100.0, 100.5, threshold_percent=2.0) is False
 
 
 def test_should_update_price_above_threshold():

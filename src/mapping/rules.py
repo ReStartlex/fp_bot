@@ -101,10 +101,19 @@ def should_update_price(
     threshold_percent: float,
 ) -> bool:
     """
-    True если новая цена отличается от старой больше чем на threshold%.
+    True если новая цена должна быть записана на FunPay.
+
+    Для RUB-лотов важен сам факт видимого изменения цены: если цена на витрине
+    должна стать 145 вместо 147, её надо обновить даже при пороге 2%, иначе
+    ручная смена markup 7% -> 5.5% выглядит "нерабочей".
+
+    threshold_percent остаётся защитой от мелкого шума для дробных валют и
+    sub-unit колебаний.
     Если старая неизвестна — всегда True.
     """
     if old_price is None or old_price <= 0:
+        return True
+    if abs(new_price - old_price) >= 1.0:
         return True
     diff_percent = abs(new_price - old_price) / old_price * 100.0
     return diff_percent >= threshold_percent

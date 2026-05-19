@@ -94,3 +94,23 @@ def test_handler_ignores_own_delivery_echo_with_wrong_author():
     asyncio.run(handler.on_message(event))
     fp.send_message.assert_not_called()
     tg.send.assert_not_called()
+
+
+def test_handler_ignores_funpay_paid_order_system_message():
+    handler, fp, tg = _make_handler(my_username="lol228822")
+    event = FunPayMessageEvent(
+        chat_id=104433092,
+        chat_username="Booooss",
+        author_id=None,
+        author_username="Booooss",
+        text=(
+            "Покупатель Booooss оплатил заказ #XDK51RB3. "
+            "App Store & iTunes, Подарочные карты, АВТОВЫДАЧА. "
+            "Booooss, не забудьте потом нажать кнопку "
+            "«Подтвердить выполнение заказа»."
+        ),
+        is_my_message=False,
+    )
+    asyncio.run(handler.on_message(event))
+    fp.send_message.assert_not_called()
+    tg.send.assert_not_called()
