@@ -359,10 +359,22 @@ class FunPayWatcher:
 
         is_first_run = not self._baseline_ready.is_set()
         if is_first_run:
+            # На baseline НЕ тянем messages для каждого чата (50 запросов
+            # подряд → FunPay даёт 429 → следующие реальные сообщения
+            # теряются на минуту). Просто запоминаем preview, чтобы на
+            # следующем poll'е diff'ить от него. Курсоры в БД могут
+            # отсутствовать (in_memory baseline) — это OK, при первом
+            # реальном изменении preview мы возьмём last message.
             logger.info(
                 f"FunPay poll: первый прогон, {len(items)} чатов в snapshot — "
-                f"инициализирую курсоры в БД"
+                f"запоминаю preview без HTTP-запросов (избегаем 429)"
             )
+            for item in items:
+                self._poll_snapshot[item["chat_id"]] = {
+                    "preview": item.get("preview", "")
+                }
+            self._baseline_ready.set()
+            return
 
         to_fetch: list[tuple[int, str | None, str]] = []
         for item in items:
@@ -371,9 +383,7 @@ class FunPayWatcher:
             username = item.get("username")
             unread = item.get("unread", False)
             prev_state = self._poll_snapshot.get(chat_id) or {}
-            if is_first_run:
-                to_fetch.append((chat_id, username, preview))
-            elif prev_state.get("preview") != preview or unread:
+            if prev_state.get("preview") != preview or unread:
                 logger.debug(
                     f"FunPay poll: chat={chat_id} preview изменился "
                     f"({prev_state.get('preview')!r} -> {preview!r}, "
@@ -398,7 +408,7 @@ class FunPayWatcher:
             new_messages, new_last_id = self._select_new_messages(
                 messages=messages,
                 cursor_last_id=cursor_last_id,
-                is_first_run=is_first_run,
+                is_first_run=False,  # baseline уже завершён выше
             )
 
             self._poll_snapshot[chat_id] = {"preview": preview}
@@ -442,13 +452,7 @@ class FunPayWatcher:
                         self._safe_call_message_handler(msg)
                     )
 
-        if is_first_run:
-            self._baseline_ready.set()
-            logger.info(
-                f"FunPay poll: первый прогон завершён — {len(to_fetch)} "
-                f"чатов синхронизированы с БД-курсорами"
-            )
-        elif total_dispatched > 0:
+        if total_dispatched > 0:
             logger.info(
                 f"FunPay poll: dispatched {total_dispatched} новое(ых) сообщение(й)"
             )

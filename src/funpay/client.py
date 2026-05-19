@@ -679,15 +679,23 @@ class FunPayClient:
         """
         Отправить сообщение в чат с покупателем.
 
-        Стратегия:
-        1. Пробуем FunPayAPI.Account.send_message (sync → to_thread).
-           Если получилось — успех.
-        2. Если FunPayAPI отказал (JSONDecodeError, NetworkError и т.д.) —
-           переключаемся на наш собственный admin_http.send_chat_message,
-           который не зависит от внутренней JSON-логики FunPayAPI.
+        ВАЖНОЕ ОТКРЫТИЕ:
+            FunPayAPI.Account.send_message выполняет POST /runner/
+            (сообщение реально доставлено FunPay), а ПОТОМ парсит
+            HTML ответа: parser.find("div.message-text").text.
+            Когда FunPay меняет вёрстку, parser.find возвращает None,
+            и FunPayAPI бросает AttributeError "'NoneType' object has
+            no attribute 'text'" — НО САМО СООБЩЕНИЕ УЖЕ ДОСТАВЛЕНО.
 
-        Все исходы логируются подробно — иначе невозможно понять,
-        почему бот молчит.
+        Поэтому стратегия:
+        1. FunPayAPI.send_message. Если успешно — OK.
+        2. Если AttributeError "NoneType ... text" — это известный
+           glitch FunPayAPI после успешной отправки. Считаем
+           сообщение доставленным, никаких fallback'ов (иначе
+           отправим дубль).
+        3. Любая ДРУГАЯ ошибка — пробуем admin_http fallback.
+
+        Все исходы логируются.
         """
         text_preview = text[:80].replace("\n", "\\n")
         try:
@@ -699,12 +707,30 @@ class FunPayClient:
                 f"chat={chat_id}, text={text_preview!r}"
             )
             return result
+        except AttributeError as exc:
+            # Известный glitch FunPayAPI: сообщение ОТПРАВЛЕНО, но парсер
+            # ответа упал. Не делаем fallback — иначе будет дубль.
+            err_str = str(exc).lower()
+            if "nonetype" in err_str and "text" in err_str:
+                logger.info(
+                    f"FunPay send_message OK [via FunPayAPI, response "
+                    f"parser glitch ignored]: chat={chat_id}, "
+                    f"text={text_preview!r}"
+                )
+                return {"ok": True, "via": "funpayapi_with_parser_glitch"}
+            # Другой AttributeError — действительно ошибка, fallback'имся
+            logger.warning(
+                f"FunPay send_message via FunPayAPI упал "
+                f"({type(exc).__name__}: {exc}). "
+                f"Пробую через admin_http fallback…"
+            )
         except Exception as exc:
             logger.warning(
                 f"FunPay send_message via FunPayAPI упал "
                 f"({type(exc).__name__}: {exc}). "
                 f"Пробую через admin_http fallback…"
             )
+
         # Fallback: прямой HTTP POST через admin_http
         try:
             result = await self._admin.send_chat_message(chat_id, text)

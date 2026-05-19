@@ -43,7 +43,12 @@ def _make_watcher_with_admin():
 
 
 @pytest.mark.asyncio
-async def test_first_run_writes_cursors_without_dispatch(db_factory):
+async def test_first_run_does_not_dispatch_and_does_not_http(db_factory):
+    """
+    На baseline watcher НЕ должен делать HTTP-запросы к сообщениям
+    каждого чата (иначе FunPay даёт 429 на 50 чатах подряд).
+    Просто запоминает preview в in-memory snapshot.
+    """
     fp, admin, w = _make_watcher_with_admin()
     chat_id = 100
 
@@ -55,7 +60,6 @@ async def test_first_run_writes_cursors_without_dispatch(db_factory):
         {"message_id": 9001, "author_id": 1, "author_username": "buyer1", "text": "старое"},
     ])
 
-    dispatched: list = []
     handled: list = []
 
     async def _on_new(msg):
@@ -66,11 +70,16 @@ async def test_first_run_writes_cursors_without_dispatch(db_factory):
     await w._poll_once_async()
 
     assert handled == [], "Первый прогон не должен dispatch'ить старые сообщения"
+    admin.get_chat_messages.assert_not_called(), \
+        "На baseline НЕ должно быть HTTP-запросов к get_chat_messages"
+
+    assert w._poll_snapshot.get(chat_id, {}).get("preview") == "старое", \
+        "preview должен быть запомнен в in-memory snapshot"
 
     async with db_factory() as session:
         cursor = await get_chat_cursor(session, chat_id)
-        assert cursor is not None
-        assert cursor.last_message_id == 9001
+        assert cursor is None, \
+            "Курсор в БД на baseline НЕ создаётся (он появится при первом реальном изменении)"
 
 
 @pytest.mark.asyncio
@@ -98,11 +107,14 @@ async def test_second_poll_dispatches_only_new_messages(db_factory):
         {"chat_id": chat_id, "username": "buyer1", "preview": "!помощь", "unread": True},
     ])
     admin.get_chat_messages = AsyncMock(return_value=[
+        {"message_id": 9001, "author_id": 1, "author_username": "buyer1", "text": "старое"},
         {"message_id": 9002, "author_id": 1, "author_username": "buyer1", "text": "!помощь"},
     ])
     await w._poll_once_async()
     # asyncio.create_task внутри poll → даём task'у пробежать
     await asyncio.sleep(0.05)
+    # На первом реальном изменении preview мы видим last message
+    # (cursor_last_id == None → диспатчим только последнее)
     assert len(handled) == 1
     assert handled[0].text == "!помощь"
 
@@ -133,6 +145,15 @@ async def test_restart_does_not_replay_old_messages(db_factory):
     await w1._poll_once_async()
     assert handled1 == []
 
+    # Симулируем что у w1 уже был "первый цикл" + одно реальное изменение,
+    # курсор записан в БД.
+    admin.get_chats_snapshot = AsyncMock(return_value=[
+        {"chat_id": chat_id, "username": "buyer1", "preview": "x", "unread": True},
+    ])
+    await w1._poll_once_async()
+    await asyncio.sleep(0.05)
+
+    # Новый watcher (рестарт)
     _, _, w2 = _make_watcher_with_admin()
     w2._fp._admin = admin
     handled2: list = []
@@ -141,9 +162,19 @@ async def test_restart_does_not_replay_old_messages(db_factory):
         handled2.append(msg)
 
     w2._on_new_message = _on_new2
+
+    # На baseline — HTTP не вызывается
+    admin.get_chats_snapshot = AsyncMock(return_value=[
+        {"chat_id": chat_id, "username": "buyer1", "preview": "x", "unread": False},
+    ])
     await w2._poll_once_async()
     await asyncio.sleep(0.05)
     assert handled2 == []
+
+    # Теперь второй poll: preview НЕ изменился → нет HTTP → нет dispatch
+    await w2._poll_once_async()
+    await asyncio.sleep(0.05)
+    assert handled2 == [], "При неизменённом preview не должно быть dispatch"
 
 
 @pytest.mark.asyncio
@@ -159,6 +190,7 @@ async def test_new_chat_appears_after_first_run_processes_last_message(db_factor
 
     w._on_new_message = _on_new
 
+    # baseline c пустым snapshot
     await w._poll_once_async()
 
     chat_id = 555
@@ -168,6 +200,8 @@ async def test_new_chat_appears_after_first_run_processes_last_message(db_factor
     admin.get_chat_messages = AsyncMock(return_value=[
         {"message_id": 7777, "author_id": 1, "author_username": "K1kern", "text": "Привет"},
     ])
+    # Этот poll — НЕ baseline (он уже done в w). Чат новый → cursor=None →
+    # диспатчим только последнее сообщение из истории.
     await w._poll_once_async()
     await asyncio.sleep(0.05)
 

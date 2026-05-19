@@ -153,12 +153,23 @@ class ChatHandler:
         reply = templates.help_acknowledged(
             event.author_username, working_now=working_now, wh=self._wh
         )
+        ack_sent = False
         try:
-            await self._fp.send_message(event.chat_id, reply)
-            logger.info(
-                f"ChatHandler: help-ack отправлен в чат {event.chat_id} "
-                f"для @{event.author_username}"
+            result = await self._fp.send_message(event.chat_id, reply)
+            # send_message может вернуть dict с ok=False (fallback провалился)
+            ack_sent = not (
+                isinstance(result, dict) and result.get("ok") is False
             )
+            if ack_sent:
+                logger.info(
+                    f"ChatHandler: help-ack отправлен в чат {event.chat_id} "
+                    f"для @{event.author_username}"
+                )
+            else:
+                logger.warning(
+                    f"ChatHandler: help-ack НЕ доставлен в чат {event.chat_id} "
+                    f"(FunPay вернул ошибку), но Telegram-уведомление пошлём"
+                )
         except Exception as exc:
             logger.opt(exception=exc).warning(
                 f"Не отправил help-ack в чат {event.chat_id}: {exc}"

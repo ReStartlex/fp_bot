@@ -61,6 +61,58 @@ async def test_send_message_falls_back_to_admin_http_on_funpayapi_exception():
 
 
 @pytest.mark.asyncio
+async def test_send_message_treats_funpayapi_parser_glitch_as_success():
+    """
+    Известный bug FunPayAPI: POST /runner/ доставлен (сообщение отправлено),
+    а потом библиотека парсит HTML ответа: parser.find("div.message-text").text
+    → AttributeError 'NoneType' object has no attribute 'text'.
+
+    Сообщение УЖЕ доставлено. Делать fallback (повторно отправлять)
+    нельзя, иначе FunPay вернёт «Обновите страницу» на дубль.
+    """
+    fp = FunPayClient(_make_settings())
+
+    def _glitch(*args, **kwargs):
+        raise AttributeError("'NoneType' object has no attribute 'text'")
+
+    mock_account = MagicMock()
+    mock_account.send_message = MagicMock(side_effect=_glitch)
+    fp._account = mock_account
+
+    fake_admin = MagicMock()
+    fake_admin.send_chat_message = AsyncMock(return_value={"ok": True})
+    fp._admin_client_cache = fake_admin
+
+    result = await fp.send_message(42, "Привет!")
+
+    # Главное: fallback НЕ вызван (иначе будет дубль).
+    fake_admin.send_chat_message.assert_not_called()
+    assert isinstance(result, dict)
+    assert result.get("ok") is True
+
+
+@pytest.mark.asyncio
+async def test_send_message_falls_back_on_other_attribute_error():
+    """Прочие AttributeError (не glitch parser'а) → fallback всё-таки нужен."""
+    fp = FunPayClient(_make_settings())
+
+    def _other_attr_err(*args, **kwargs):
+        raise AttributeError("'FunPayClient' object has no attribute 'foo'")
+
+    mock_account = MagicMock()
+    mock_account.send_message = MagicMock(side_effect=_other_attr_err)
+    fp._account = mock_account
+
+    fake_admin = MagicMock()
+    fake_admin.send_chat_message = AsyncMock(return_value={"ok": True})
+    fp._admin_client_cache = fake_admin
+
+    result = await fp.send_message(42, "test")
+    fake_admin.send_chat_message.assert_awaited_once()
+    assert result["ok"] is True
+
+
+@pytest.mark.asyncio
 async def test_send_message_raises_when_both_paths_fail():
     fp = FunPayClient(_make_settings())
 

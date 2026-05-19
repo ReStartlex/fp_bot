@@ -142,10 +142,32 @@ class FunPayAdminClient:
 
     # ----- low-level -----
 
-    def _sync_get(self, url: str) -> requests.Response:
-        r = self._session.get(url, timeout=20, allow_redirects=True)
-        r.raise_for_status()
-        return r
+    def _sync_get(self, url: str, retries: int = 2) -> requests.Response:
+        """
+        GET к FunPay с обработкой rate-limit (429).
+        FunPay в горячий момент даёт 429 — нужна короткая backoff-пауза.
+        """
+        import time as _time
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                r = self._session.get(url, timeout=20, allow_redirects=True)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries:
+                    _time.sleep(0.5 * (2 ** attempt))
+                    continue
+                raise
+            if r.status_code == 429:
+                # Backoff: 1s, 2s
+                if attempt < retries:
+                    _time.sleep(1.0 * (2 ** attempt))
+                    continue
+            r.raise_for_status()
+            return r
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"_sync_get({url}): retries exhausted")
 
     def _sync_post(self, url: str, data: dict[str, str]) -> requests.Response:
         # POST формы — FunPay ожидает application/x-www-form-urlencoded

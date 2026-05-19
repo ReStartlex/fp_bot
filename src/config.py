@@ -96,11 +96,10 @@ class Settings(BaseSettings):
     chat_autogreeting_enabled: bool = True
     chat_greeting_cooldown_hours: int = Field(default=24, ge=1)
     chat_help_triggers: str = "!help,!помощь,!support,!оператор,!sos,!админ"
-    # Сколько секунд НЕ повторять help-ack и Telegram-нотификацию в одном чате.
-    # 180 = 3 минуты: покупатель может настойчиво писать !помощь, мы пишем
-    # «уже уведомил» один раз и потом молчим, чтобы не флудить ни покупателю,
-    # ни тебе в Telegram.
-    chat_help_cooldown_seconds: int = Field(default=180, ge=0)
+    # Cooldown между help-ack'ами в одном чате (0 = выключено).
+    # По умолчанию 0: каждое !помощь даёт ответ покупателю и нотификацию
+    # владельцу в Telegram. Если хочешь не флудить — поставь >0.
+    chat_help_cooldown_seconds: int = Field(default=0, ge=0)
     work_hours_start: int = Field(default=12, ge=0, le=23)
     work_hours_end: int = Field(default=23, ge=1, le=24)
     seller_display_name: str = "продавец"
