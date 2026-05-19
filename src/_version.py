@@ -4,6 +4,6 @@ deploy/stamp_version.py перед каждым push'ем.
 
 ВАЖНО: НЕ редактируй вручную — твои изменения будут перезаписаны.
 """
-SHA = "a4da7f4f1c078839c024968480ff33949dc91bb0"
-DATE = "2026-05-19T17:04:39+03:00"
-SUBJECT = "fix(chat): РєРѕСЂРµРЅСЊ РІСЃРµС… РїСЂРѕР±Р»РµРј СЃ РѕС‚РІРµС‚Р°РјРё РЅР° !РїРѕРјРѕС‰СЊ вЂ” СѓСЃС‚СЂР°РЅС‘РЅ"
+SHA = "9616d40e495806f0b7034823a8051b90d91bf37d"
+DATE = "2026-05-19T17:27:24+03:00"
+SUBJECT = "fix(watcher): process unread baseline messages after restart"
