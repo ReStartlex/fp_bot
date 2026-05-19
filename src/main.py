@@ -225,6 +225,7 @@ class App:
             on_new_message=self._on_new_message,
             poll_interval_seconds=self.settings.funpay_poll_interval_seconds,
             listen_enabled=self.settings.funpay_listen_enabled,
+            active_fetch_limit=self.settings.funpay_active_chats_poll_limit,
         )
         try:
             self.watcher.start()

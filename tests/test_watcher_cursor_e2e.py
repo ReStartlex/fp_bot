@@ -253,6 +253,48 @@ async def test_first_run_with_existing_cursor_catches_messages_missed_while_down
 
 
 @pytest.mark.asyncio
+async def test_repeated_same_preview_help_is_caught_by_active_poll(db_factory):
+    """
+    Реальный кейс с продакшена:
+    покупатель пишет !помощь, бот отвечает; через несколько минут покупатель
+    снова пишет точно такой же !помощь. В левой панели preview может остаться
+    тем же самым, поэтому diff по preview не срабатывает. Active poll верхних
+    чатов должен открыть историю и увидеть новый message_id.
+    """
+    fp, admin, w = _make_watcher_with_admin()
+    chat_id = 100
+
+    async with db_factory() as session:
+        await upsert_chat_cursor(session, chat_id=chat_id, last_message_id=9002)
+        await session.commit()
+
+    w._baseline_ready.set()
+    w._poll_snapshot[chat_id] = {"preview": "!помощь"}
+
+    admin.get_chats_snapshot = AsyncMock(return_value=[
+        {"chat_id": chat_id, "username": "buyer1", "preview": "!помощь", "unread": False},
+    ])
+    admin.get_chat_messages = AsyncMock(return_value=[
+        {"message_id": 9003, "author_id": 1, "author_username": "buyer1", "text": "!помощь"},
+    ])
+    handled: list = []
+
+    async def _on_new(msg):
+        handled.append(msg)
+
+    w._on_new_message = _on_new
+    await w._poll_once_async()
+    await asyncio.sleep(0.05)
+
+    assert len(handled) == 1
+    assert handled[0].text == "!помощь"
+
+    async with db_factory() as session:
+        cursor = await get_chat_cursor(session, chat_id)
+        assert cursor.last_message_id == 9003
+
+
+@pytest.mark.asyncio
 async def test_new_chat_appears_after_first_run_processes_last_message(db_factory):
     fp, admin, w = _make_watcher_with_admin()
 

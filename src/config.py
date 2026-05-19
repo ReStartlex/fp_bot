@@ -112,6 +112,11 @@ class Settings(BaseSettings):
     # По умолчанию выключаем listen-loop, чтобы не загрязнять логи.
     funpay_listen_enabled: bool = False
     funpay_poll_interval_seconds: float = Field(default=5.0, ge=1.0)
+    # Дополнительно к preview/unread watcher каждый poll ограниченно
+    # проверяет верхние активные чаты с уже известным БД-курcором. Это ловит
+    # повторные одинаковые сообщения вроде "!помощь" -> "!помощь", когда
+    # preview визуально не меняется.
+    funpay_active_chats_poll_limit: int = Field(default=5, ge=0, le=20)
 
     @field_validator("ns_api_secret")
     @classmethod

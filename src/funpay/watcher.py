@@ -76,6 +76,7 @@ class FunPayWatcher:
         dedup_cache_size: int = 1024,
         listen_enabled: bool = True,
         baseline_fetch_limit: int = 8,
+        active_fetch_limit: int = 5,
     ) -> None:
         self._fp = fp_client
         self._on_new_order = on_new_order
@@ -88,6 +89,7 @@ class FunPayWatcher:
         self._listen_restart_delay = listen_restart_delay_seconds
         self._listen_enabled = listen_enabled
         self._baseline_fetch_limit = max(1, int(baseline_fetch_limit))
+        self._active_fetch_limit = max(0, int(active_fetch_limit))
 
         # Дедуп по message_id (если есть) или по (chat_id, author_id, text)
         # как fallback. Хранит ограниченное число ключей.
@@ -379,10 +381,39 @@ class FunPayWatcher:
                 )
                 to_fetch.append((chat_id, username, preview))
 
-        candidates = [
-            (chat_id, username, preview, False, None)
-            for chat_id, username, preview in to_fetch
-        ]
+        candidates: list[tuple[int, str | None, str, bool, int | None]] = []
+        candidate_chat_ids: set[int] = set()
+        for chat_id, username, preview in to_fetch:
+            candidates.append((chat_id, username, preview, False, None))
+            candidate_chat_ids.add(int(chat_id))
+
+        # Preview на FunPay не всегда уникален: повторное "!помощь" после
+        # прошлого "!помощь" может оставить preview тем же самым. Чтобы такие
+        # сообщения не терялись, каждый цикл ограниченно проверяем верхние
+        # активные чаты, но только если по ним уже есть БД-курсор.
+        active_added = 0
+        if self._active_fetch_limit > 0:
+            for item in items:
+                if active_added >= self._active_fetch_limit:
+                    break
+                chat_id = int(item["chat_id"])
+                if chat_id in candidate_chat_ids:
+                    continue
+                cursor_last_id = await self._load_cursor(chat_id)
+                if cursor_last_id is None:
+                    continue
+                candidates.append(
+                    (
+                        chat_id,
+                        item.get("username"),
+                        item.get("preview", ""),
+                        bool(item.get("unread", False)),
+                        cursor_last_id,
+                    )
+                )
+                candidate_chat_ids.add(chat_id)
+                active_added += 1
+
         total_dispatched = await self._fetch_and_dispatch_chat_messages(
             admin=admin,
             candidates=candidates,
@@ -471,8 +502,8 @@ class FunPayWatcher:
         for chat_id, username, preview, unread, preloaded_cursor in candidates:
             cursor_last_id = (
                 preloaded_cursor
-                if baseline_mode
-                else await self._load_cursor(chat_id)
+                if preloaded_cursor is not None
+                else (None if baseline_mode else await self._load_cursor(chat_id))
             )
             try:
                 messages = await admin.get_chat_messages(
