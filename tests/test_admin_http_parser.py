@@ -103,3 +103,29 @@ def test_extract_author_id_from_nested_link():
     soup = BeautifulSoup(html, "html.parser")
     el = soup.select_one(".chat-msg-item")
     assert FunPayAdminClient._extract_author_id(el) == 42
+
+
+async def test_get_chats_snapshot_detects_unread_on_contact_item_class(monkeypatch):
+    """FunPay часто кладёт unread-класс на сам <a>, а не во вложенный узел."""
+    client = _admin()
+
+    class FakeResp:
+        text = """
+        <a class="contact-item unread" data-id="260477602" href="/chat/?node=260477602">
+          <div class="media-user-name">K1kern</div>
+          <div class="contact-item-message">!помощь</div>
+        </a>
+        """
+        status_code = 200
+
+    monkeypatch.setattr(client, "_sync_get", lambda _url: FakeResp())
+    items = await client.get_chats_snapshot()
+
+    assert items == [
+        {
+            "chat_id": 260477602,
+            "username": "K1kern",
+            "preview": "!помощь",
+            "unread": True,
+        }
+    ]

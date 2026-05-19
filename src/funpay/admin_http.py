@@ -430,7 +430,17 @@ class FunPayAdminClient:
             )
             preview = preview_el.get_text(strip=True) if preview_el else ""
 
-            unread = bool(a.find(class_=re.compile(r"unread")))
+            class_text = " ".join(str(c) for c in (a.get("class") or []))
+            unread = (
+                bool(re.search(r"unread|new", class_text, flags=re.IGNORECASE))
+                or bool(a.find(class_=re.compile(r"unread|new", re.IGNORECASE)))
+                or bool(
+                    a.select_one(
+                        ".badge, .badge-counter, .counter, "
+                        ".contact-item-unread, .unread"
+                    )
+                )
+            )
 
             items.append(
                 {

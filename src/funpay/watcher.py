@@ -75,6 +75,7 @@ class FunPayWatcher:
         listen_restart_delay_seconds: float = 5.0,
         dedup_cache_size: int = 1024,
         listen_enabled: bool = True,
+        baseline_fetch_limit: int = 8,
     ) -> None:
         self._fp = fp_client
         self._on_new_order = on_new_order
@@ -86,6 +87,7 @@ class FunPayWatcher:
         self._poll_interval = poll_interval_seconds
         self._listen_restart_delay = listen_restart_delay_seconds
         self._listen_enabled = listen_enabled
+        self._baseline_fetch_limit = max(1, int(baseline_fetch_limit))
 
         # Дедуп по message_id (если есть) или по (chat_id, author_id, text)
         # как fallback. Хранит ограниченное число ключей.
@@ -359,21 +361,7 @@ class FunPayWatcher:
 
         is_first_run = not self._baseline_ready.is_set()
         if is_first_run:
-            # На baseline НЕ тянем messages для каждого чата (50 запросов
-            # подряд → FunPay даёт 429 → следующие реальные сообщения
-            # теряются на минуту). Просто запоминаем preview, чтобы на
-            # следующем poll'е diff'ить от него. Курсоры в БД могут
-            # отсутствовать (in_memory baseline) — это OK, при первом
-            # реальном изменении preview мы возьмём last message.
-            logger.info(
-                f"FunPay poll: первый прогон, {len(items)} чатов в snapshot — "
-                f"запоминаю preview без HTTP-запросов (избегаем 429)"
-            )
-            for item in items:
-                self._poll_snapshot[item["chat_id"]] = {
-                    "preview": item.get("preview", "")
-                }
-            self._baseline_ready.set()
+            await self._handle_initial_baseline(admin, items)
             return
 
         to_fetch: list[tuple[int, str | None, str]] = []
@@ -391,9 +379,101 @@ class FunPayWatcher:
                 )
                 to_fetch.append((chat_id, username, preview))
 
-        total_dispatched = 0
-        for chat_id, username, preview in to_fetch:
+        candidates = [
+            (chat_id, username, preview, False, None)
+            for chat_id, username, preview in to_fetch
+        ]
+        total_dispatched = await self._fetch_and_dispatch_chat_messages(
+            admin=admin,
+            candidates=candidates,
+            baseline_mode=False,
+        )
+
+        if total_dispatched > 0:
+            logger.info(
+                f"FunPay poll: dispatched {total_dispatched} новое(ых) сообщение(й)"
+            )
+
+    async def _handle_initial_baseline(
+        self, admin: Any, items: list[dict[str, Any]]
+    ) -> None:
+        """
+        Первый poll после старта.
+
+        Важный баланс:
+        - Нельзя снова тянуть историю всех ~50 чатов подряд: FunPay даёт 429.
+        - Нельзя и просто запомнить preview всех чатов: если покупатель написал
+          !помощь прямо перед/во время рестарта, этот preview становится
+          "baseline" и сообщение больше никогда не попадёт в ChatHandler.
+
+        Поэтому:
+        - snapshot preview запоминаем для всех чатов;
+        - HTTP-историю тянем только ограниченно:
+          1) unread-чаты (самые важные);
+          2) свежие чаты, по которым уже есть БД-курсор, чтобы догнать
+             сообщения, пришедшие пока сервис был выключен.
+        """
+        logger.info(
+            f"FunPay poll: первый прогон, {len(items)} чатов в snapshot — "
+            f"обрабатываю до {self._baseline_fetch_limit} unread/known чатов "
+            f"без массового baseline-fetch"
+        )
+
+        for item in items:
+            self._poll_snapshot[item["chat_id"]] = {
+                "preview": item.get("preview", "")
+            }
+
+        candidates: list[tuple[int, str | None, str, bool, int | None]] = []
+        known_checked = 0
+        for item in items:
+            chat_id = int(item["chat_id"])
+            username = item.get("username")
+            preview = item.get("preview", "")
+            unread = bool(item.get("unread", False))
             cursor_last_id = await self._load_cursor(chat_id)
+
+            should_fetch = unread
+            if not should_fetch and cursor_last_id is not None:
+                # Догоняем только ограниченное число последних известных
+                # чатов. Это ловит сообщения, пришедшие во время update.sh,
+                # но не превращается обратно в 50 HTTP-запросов на старте.
+                should_fetch = known_checked < self._baseline_fetch_limit
+                known_checked += 1
+
+            if should_fetch:
+                candidates.append(
+                    (chat_id, username, preview, unread, cursor_last_id)
+                )
+            if len(candidates) >= self._baseline_fetch_limit:
+                break
+
+        dispatched = await self._fetch_and_dispatch_chat_messages(
+            admin=admin,
+            candidates=candidates,
+            baseline_mode=True,
+        )
+
+        self._baseline_ready.set()
+        logger.info(
+            f"FunPay poll: первый прогон завершён "
+            f"(кандидатов={len(candidates)}, dispatched={dispatched})"
+        )
+
+    async def _fetch_and_dispatch_chat_messages(
+        self,
+        *,
+        admin: Any,
+        candidates: list[tuple[int, str | None, str, bool, int | None]],
+        baseline_mode: bool,
+    ) -> int:
+        total_dispatched = 0
+        for chat_id, username, preview, unread, preloaded_cursor in candidates:
+            cursor_last_id = (
+                preloaded_cursor
+                if baseline_mode
+                else await self._load_cursor(chat_id)
+            )
             try:
                 messages = await admin.get_chat_messages(
                     chat_id, last_id=cursor_last_id
@@ -405,10 +485,16 @@ class FunPayWatcher:
                 )
                 continue
 
+            # На обычном runtime при cursor=None берём последнее сообщение.
+            # На baseline делаем это ТОЛЬКО для unread-чата. Иначе при первом
+            # деплое без курсоров бот может внезапно отвечать на старые чаты.
+            is_first_run_for_select = baseline_mode and not (
+                unread and cursor_last_id is None
+            )
             new_messages, new_last_id = self._select_new_messages(
                 messages=messages,
                 cursor_last_id=cursor_last_id,
-                is_first_run=False,  # baseline уже завершён выше
+                is_first_run=is_first_run_for_select,
             )
 
             self._poll_snapshot[chat_id] = {"preview": preview}
@@ -447,15 +533,10 @@ class FunPayWatcher:
                 )
                 total_dispatched += 1
                 if self._on_new_message is not None:
-                    # ВНУТРИ main loop → просто await/create_task
                     asyncio.create_task(
                         self._safe_call_message_handler(msg)
                     )
-
-        if total_dispatched > 0:
-            logger.info(
-                f"FunPay poll: dispatched {total_dispatched} новое(ых) сообщение(й)"
-            )
+        return total_dispatched
 
     async def _safe_call_message_handler(self, msg: FunPayMessageEvent) -> None:
         """Обёртка вокруг message-handler с логом исключений."""

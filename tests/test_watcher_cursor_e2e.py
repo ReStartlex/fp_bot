@@ -17,7 +17,7 @@ import pytest_asyncio
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.db.models import Base
-from src.db.repo import get_chat_cursor
+from src.db.repo import get_chat_cursor, upsert_chat_cursor
 from src.funpay.watcher import FunPayWatcher
 
 
@@ -43,11 +43,11 @@ def _make_watcher_with_admin():
 
 
 @pytest.mark.asyncio
-async def test_first_run_does_not_dispatch_and_does_not_http(db_factory):
+async def test_first_run_without_unread_does_not_dispatch_or_http(db_factory):
     """
-    На baseline watcher НЕ должен делать HTTP-запросы к сообщениям
-    каждого чата (иначе FunPay даёт 429 на 50 чатах подряд).
-    Просто запоминает preview в in-memory snapshot.
+    На baseline watcher НЕ должен делать HTTP-запросы к обычным
+    прочитанным чатам без БД-курсора (иначе FunPay даёт 429 на 50 чатах
+    подряд). Просто запоминает preview в in-memory snapshot.
     """
     fp, admin, w = _make_watcher_with_admin()
     chat_id = 100
@@ -80,6 +80,44 @@ async def test_first_run_does_not_dispatch_and_does_not_http(db_factory):
         cursor = await get_chat_cursor(session, chat_id)
         assert cursor is None, \
             "Курсор в БД на baseline НЕ создаётся (он появится при первом реальном изменении)"
+
+
+@pytest.mark.asyncio
+async def test_first_run_unread_help_is_dispatched(db_factory):
+    """
+    Критичная регрессия dad6423/a4da7f4:
+    если покупатель написал !помощь прямо перед рестартом, первый snapshot
+    видел preview='!помощь', сохранял его как baseline и НЕ заходил в чат.
+    После этого повторный такой же !помощь не менял preview — бот молчал.
+
+    Теперь unread-чат на baseline ограниченно fetch'ится и последнее
+    сообщение уходит в ChatHandler.
+    """
+    fp, admin, w = _make_watcher_with_admin()
+    chat_id = 100
+
+    admin.get_chats_snapshot = AsyncMock(return_value=[
+        {"chat_id": chat_id, "username": "buyer1", "preview": "!помощь", "unread": True},
+    ])
+    admin.get_chat_messages = AsyncMock(return_value=[
+        {"message_id": 9002, "author_id": 1, "author_username": "buyer1", "text": "!помощь"},
+    ])
+    handled: list = []
+
+    async def _on_new(msg):
+        handled.append(msg)
+
+    w._on_new_message = _on_new
+    await w._poll_once_async()
+    await asyncio.sleep(0.05)
+
+    assert len(handled) == 1
+    assert handled[0].text == "!помощь"
+
+    async with db_factory() as session:
+        cursor = await get_chat_cursor(session, chat_id)
+        assert cursor is not None
+        assert cursor.last_message_id == 9002
 
 
 @pytest.mark.asyncio
@@ -175,6 +213,43 @@ async def test_restart_does_not_replay_old_messages(db_factory):
     await w2._poll_once_async()
     await asyncio.sleep(0.05)
     assert handled2 == [], "При неизменённом preview не должно быть dispatch"
+
+
+@pytest.mark.asyncio
+async def test_first_run_with_existing_cursor_catches_messages_missed_while_down(db_factory):
+    """
+    Если сервис был выключен во время update.sh, БД-курсор уже есть.
+    Первый poll после старта должен ограниченно проверить такие чаты и
+    догнать сообщения с id > cursor, даже если unread-флаг в HTML не сработал.
+    """
+    fp, admin, w = _make_watcher_with_admin()
+    chat_id = 100
+
+    async with db_factory() as session:
+        await upsert_chat_cursor(session, chat_id=chat_id, last_message_id=9001)
+        await session.commit()
+
+    admin.get_chats_snapshot = AsyncMock(return_value=[
+        {"chat_id": chat_id, "username": "buyer1", "preview": "!помощь", "unread": False},
+    ])
+    admin.get_chat_messages = AsyncMock(return_value=[
+        {"message_id": 9002, "author_id": 1, "author_username": "buyer1", "text": "!помощь"},
+    ])
+    handled: list = []
+
+    async def _on_new(msg):
+        handled.append(msg)
+
+    w._on_new_message = _on_new
+    await w._poll_once_async()
+    await asyncio.sleep(0.05)
+
+    assert len(handled) == 1
+    assert handled[0].text == "!помощь"
+
+    async with db_factory() as session:
+        cursor = await get_chat_cursor(session, chat_id)
+        assert cursor.last_message_id == 9002
 
 
 @pytest.mark.asyncio
