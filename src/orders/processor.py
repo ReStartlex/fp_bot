@@ -361,6 +361,9 @@ async def _process_locked(
         await _mark_failed(
             existing.id, "pins_ready без сохранённых pins",
             telegram, event,
+            funpay_client=funpay_client,
+            funpay_lot_id=existing.funpay_lot_id,
+            log=log,
         )
         return {"status": "failed", "reason": "pins_ready без pins"}
 
@@ -374,6 +377,9 @@ async def _process_locked(
             else "маппинг выключен (enabled=false)"
         )
         log.error(reason)
+        lot_to_disable = (
+            mapping.funpay_lot_id if mapping is not None else event.funpay_lot_id
+        )
         async with session_factory()() as session:
             order = existing or await create_order(
                 session,
@@ -392,6 +398,13 @@ async def _process_locked(
             await telegram.order_failure(
                 funpay_order_id=event.funpay_order_id, reason=reason
             )
+        await _emergency_disable_lot(
+            lot_to_disable,
+            funpay_client,
+            telegram,
+            reason=reason,
+            log=log,
+        )
         return {"status": "failed", "reason": reason}
 
     # ─── 4. Создаём/находим Order в БД ───
@@ -449,7 +462,12 @@ async def _process_locked(
             except ValueError as exc:
                 error_text = f"Ошибка в шаблоне ns_fields_template: {exc}"
                 log.error(error_text)
-                await _mark_failed(db_order_id, error_text, telegram, event)
+                await _mark_failed(
+                    db_order_id, error_text, telegram, event,
+                    funpay_client=funpay_client,
+                    funpay_lot_id=effective_funpay_lot_id,
+                    log=log,
+                )
                 return {"status": "failed", "reason": error_text}
 
             try:
@@ -459,7 +477,12 @@ async def _process_locked(
             except NSError as exc:
                 error_text = f"NS create_order упал: {exc}"
                 log.error(error_text)
-                await _mark_failed(db_order_id, error_text, telegram, event)
+                await _mark_failed(
+                    db_order_id, error_text, telegram, event,
+                    funpay_client=funpay_client,
+                    funpay_lot_id=effective_funpay_lot_id,
+                    log=log,
+                )
                 return {"status": "failed", "reason": error_text}
 
             ns_custom_id = created.custom_id
@@ -500,12 +523,22 @@ async def _process_locked(
             except NSInsufficientFunds as exc:
                 error_text = f"Недостаточно средств на NS: balance={exc.balance}"
                 log.error(error_text)
-                await _mark_failed(db_order_id, error_text, telegram, event)
+                await _mark_failed(
+                    db_order_id, error_text, telegram, event,
+                    funpay_client=funpay_client,
+                    funpay_lot_id=effective_funpay_lot_id,
+                    log=log,
+                )
                 return {"status": "failed", "reason": error_text}
             except NSError as exc:
                 error_text = f"NS pay_order упал: {exc}"
                 log.error(error_text)
-                await _mark_failed(db_order_id, error_text, telegram, event)
+                await _mark_failed(
+                    db_order_id, error_text, telegram, event,
+                    funpay_client=funpay_client,
+                    funpay_lot_id=effective_funpay_lot_id,
+                    log=log,
+                )
                 return {"status": "failed", "reason": error_text}
             log.info(f"NS pay_order: status={pay_resp.status}")
             pins = list(pay_resp.pins or [])
@@ -523,20 +556,35 @@ async def _process_locked(
             except NSOrderTimeoutError as exc:
                 error_text = f"NS заказ не завершился по тайм-ауту: {exc}"
                 log.error(error_text)
-                await _mark_failed(db_order_id, error_text, telegram, event)
+                await _mark_failed(
+                    db_order_id, error_text, telegram, event,
+                    funpay_client=funpay_client,
+                    funpay_lot_id=effective_funpay_lot_id,
+                    log=log,
+                )
                 return {"status": "failed", "reason": error_text}
             if info.status_enum == OrderStatus.COMPLETED and info.pins:
                 pins = list(info.pins)
             elif info.status_enum in (OrderStatus.REFUNDED, OrderStatus.CANCELLED):
                 error_text = f"NS вернул возврат/отмену: {info.status_message}"
                 log.error(error_text)
-                await _mark_failed(db_order_id, error_text, telegram, event)
+                await _mark_failed(
+                    db_order_id, error_text, telegram, event,
+                    funpay_client=funpay_client,
+                    funpay_lot_id=effective_funpay_lot_id,
+                    log=log,
+                )
                 return {"status": "failed", "reason": error_text}
 
         if not pins:
             error_text = "NS заказ завершился, но pins пустой"
             log.error(error_text)
-            await _mark_failed(db_order_id, error_text, telegram, event)
+            await _mark_failed(
+                db_order_id, error_text, telegram, event,
+                funpay_client=funpay_client,
+                funpay_lot_id=effective_funpay_lot_id,
+                log=log,
+            )
             return {"status": "failed", "reason": error_text}
 
         # Сохраняем pins И помечаем pins_ready — это критическая точка:
@@ -588,6 +636,13 @@ async def _deliver_pins(
             "FunPay-клиент или chat_id отсутствуют — доставка отложена; "
             "статус остаётся pins_ready"
         )
+        await _emergency_disable_lot(
+            db_order.funpay_lot_id,
+            funpay_client,
+            telegram,
+            reason="pins_ready: нет FunPay-клиента или chat_id для доставки",
+            log=log,
+        )
         return {
             "status": "pins_ready",
             "ns_custom_id": ns_custom_id,
@@ -599,6 +654,13 @@ async def _deliver_pins(
         await funpay_client.send_message(event.chat_id, delivery_text)
     except Exception as exc:
         log.error(f"Доставка в чат FunPay упала: {exc}; статус остаётся pins_ready")
+        await _emergency_disable_lot(
+            db_order.funpay_lot_id,
+            funpay_client,
+            telegram,
+            reason=f"pins_ready: доставка в чат FunPay упала: {exc}",
+            log=log,
+        )
         if telegram is not None:
             await telegram.error(
                 f"⚠ Не доставил pins в чат FunPay (order "
@@ -642,6 +704,10 @@ async def _mark_failed(
     reason: str,
     telegram: TelegramNotifier | None,
     event: FunPayOrderEvent,
+    *,
+    funpay_client: FunPayClient | None = None,
+    funpay_lot_id: int | None = None,
+    log=None,
 ) -> None:
     if db_order_id is not None:
         async with session_factory()() as session:
@@ -649,7 +715,87 @@ async def _mark_failed(
             if order is not None:
                 await update_order(session, order, status="failed", error=reason)
                 await session.commit()
+                if funpay_lot_id is None:
+                    funpay_lot_id = order.funpay_lot_id
     if telegram is not None:
         await telegram.order_failure(
             funpay_order_id=event.funpay_order_id, reason=reason
         )
+    await _emergency_disable_lot(
+        funpay_lot_id if funpay_lot_id is not None else event.funpay_lot_id,
+        funpay_client,
+        telegram,
+        reason=reason,
+        log=log,
+    )
+
+
+async def _emergency_disable_lot(
+    funpay_lot_id: int | None,
+    funpay_client: FunPayClient | None,
+    telegram: TelegramNotifier | None,
+    *,
+    reason: str,
+    log=None,
+) -> bool:
+    """
+    Fail-safe: если автоматическая выдача по лоту сломалась, лот надо
+    немедленно убрать из продажи, чтобы следующие покупатели не продолжили
+    покупать проблемный товар.
+    """
+    if funpay_lot_id is None or funpay_lot_id <= 0:
+        if log is not None:
+            log.warning(
+                f"Не могу аварийно выключить лот: неизвестный lot_id "
+                f"(reason={reason})"
+            )
+        return False
+    if funpay_client is None:
+        if log is not None:
+            log.warning(
+                f"Не могу аварийно выключить лот {funpay_lot_id}: "
+                "FunPay-клиент отсутствует"
+            )
+        return False
+
+    try:
+        lot_fields = await funpay_client.get_lot_fields(funpay_lot_id)
+        if hasattr(lot_fields, "active"):
+            lot_fields.active = False
+        if hasattr(lot_fields, "amount"):
+            lot_fields.amount = 0
+        result = await funpay_client.save_lot(lot_fields)
+        if isinstance(result, dict) and result.get("ok") is False:
+            raise RuntimeError(result)
+        async with session_factory()() as session:
+            mapping = (
+                await session.execute(
+                    select(Mapping).where(Mapping.funpay_lot_id == funpay_lot_id)
+                )
+            ).scalar_one_or_none()
+            if mapping is not None and mapping.enabled:
+                mapping.enabled = False
+                await session.commit()
+    except Exception as exc:
+        if log is not None:
+            log.opt(exception=exc).error(
+                f"Не смог аварийно выключить FunPay-лот {funpay_lot_id}: {exc}"
+            )
+        if telegram is not None:
+            await telegram.error(
+                f"🚨 Не смог аварийно выключить FunPay-лот "
+                f"<code>{funpay_lot_id}</code>: <code>{str(exc)[:300]}</code>"
+            )
+        return False
+
+    if log is not None:
+        log.warning(
+            f"FunPay-лот {funpay_lot_id} аварийно выключен после ошибки: {reason}"
+        )
+    if telegram is not None:
+        await telegram.warning(
+            f"FunPay-лот <code>{funpay_lot_id}</code> аварийно выключен. "
+            f"Локальный маппинг тоже отключён, чтобы sync не включил лот "
+            f"обратно до ручной проверки. Причина: <code>{reason[:300]}</code>"
+        )
+    return True

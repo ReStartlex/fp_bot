@@ -126,12 +126,29 @@ class FakeFunPay:
         self._fail_times = fail_times
         self.account = self
         self._chat_by_name_id = chat_by_name_id
+        self.saved_lots: list[Any] = []
+        self.disabled_lots: list[int] = []
 
     async def send_message(self, chat_id: int, text: str):
         if self._fail or self._fail_times > 0:
             self._fail_times = max(0, self._fail_times - 1)
             raise RuntimeError("FunPay send_message моковый сбой")
         self.sent.append((chat_id, text))
+
+    async def get_lot_fields(self, lot_id: int):
+        class Lot:
+            def __init__(self, lot_id: int):
+                self.lot_id = lot_id
+                self.active = True
+                self.amount = 100
+                self.price = 147
+        return Lot(lot_id)
+
+    async def save_lot(self, lot_fields):
+        self.saved_lots.append(lot_fields)
+        if getattr(lot_fields, "active", True) is False:
+            self.disabled_lots.append(lot_fields.lot_id)
+        return {"ok": True}
 
     @staticmethod
     async def _to_thread(fn, *args, **kwargs):
@@ -148,10 +165,12 @@ class FakeFunPay:
 class FakeTelegram:
     def __init__(self):
         self.errors: list[str] = []
+        self.warnings: list[str] = []
         self.successes: list[dict] = []
         self.failures: list[dict] = []
 
     async def error(self, text: str): self.errors.append(text)
+    async def warning(self, text: str): self.warnings.append(text)
     async def order_success(self, **kw): self.successes.append(kw)
     async def order_failure(self, **kw): self.failures.append(kw)
 
@@ -177,12 +196,13 @@ async def _make_mapping(
     lot_id: int = 69300023,
     svc_id: int = 20,
     label: str = "Test Apple USA 2 USD",
+    ns_fields_template: str | None = '{"quantity":"@QUANTITY"}',
 ) -> None:
     async with factory() as s:
         await upsert_mapping(
             s, funpay_lot_id=lot_id, ns_service_id=svc_id,
             markup_percent=6.0, stock_cap=10,
-            ns_fields_template='{"quantity":"@QUANTITY"}',
+            ns_fields_template=ns_fields_template,
             enabled=True, label=label,
         )
         await s.commit()
@@ -477,6 +497,15 @@ async def test_delivery_failure_keeps_pins_ready_for_retry(
     )
     assert result["status"] == "pins_ready"
     assert ns.paid_calls == 1
+    assert fp_fail.disabled_lots == [69300023]
+    assert tg.warnings
+    async with db_session_factory() as s:
+        mapping = (
+            await s.execute(
+                proc.select(Mapping).where(Mapping.funpay_lot_id == 69300023)
+            )
+        ).scalar_one()
+        assert mapping.enabled is False
     db_order = await _order(db_session_factory, "fp-100")
     assert db_order is not None
     assert db_order.status == "pins_ready"
@@ -495,6 +524,68 @@ async def test_delivery_failure_keeps_pins_ready_for_retry(
     assert ns.paid_calls == 1
     # Клиенту в этот раз отправлено сообщение с кодом
     assert any("XXXX-YYYY" in body for _, body in fp_ok.sent)
+
+
+@pytest.mark.asyncio
+async def test_order_failure_disables_lot_before_more_buyers(
+    db_session_factory, settings,
+):
+    """
+    Если заказ не может быть продолжен до выдачи, лот надо аварийно выключить,
+    чтобы другие покупатели не купили тот же проблемный товар.
+    """
+    await _make_mapping(
+        db_session_factory,
+        ns_fields_template="{not json",
+    )
+    ns = FakeNS()
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    result = await process_funpay_order(
+        _event(), settings=settings, ns_client=ns,
+        funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "failed"
+    assert fp.disabled_lots == [69300023]
+    assert tg.failures
+    assert tg.warnings
+    async with db_session_factory() as s:
+        mapping = (
+            await s.execute(
+                proc.select(Mapping).where(Mapping.funpay_lot_id == 69300023)
+            )
+        ).scalar_one()
+        assert mapping.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_failure_with_unknown_lot_id_does_not_disable_random_lot(
+    db_session_factory, settings,
+):
+    ns = FakeNS()
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    event = FunPayOrderEvent(
+        funpay_order_id="fp-no-map",
+        funpay_lot_id=0,
+        buyer_username="alice",
+        buyer_user_id=42,
+        chat_id=555,
+        quantity=1,
+        funpay_price_rub=200.0,
+        description="unknown product",
+    )
+
+    result = await process_funpay_order(
+        event, settings=settings, ns_client=ns,
+        funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "failed"
+    assert fp.disabled_lots == []
 
 
 @pytest.mark.asyncio
