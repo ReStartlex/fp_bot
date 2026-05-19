@@ -130,17 +130,46 @@ class FunPayWatcher:
             return True
         return False
 
-    def _make_msg_dedup_key(
+    def _make_msg_dedup_keys(
         self,
         chat_id: int,
         message_id: Any,
         author_id: Any,
         text: str,
-    ) -> tuple[Any, ...]:
-        """Единый ключ дедупа сообщений (одинаковый для listen и poll loop)."""
+    ) -> list[tuple[Any, ...]]:
+        """
+        Возвращает СПИСОК ключей дедупа для сообщения.
+
+        Идея: одно и то же сообщение нужно регистрировать сразу по двум
+        измерениям — по `message_id` (если он есть) и по тексту. Тогда
+        если разные источники (listen-loop / poll-loop) видят это
+        сообщение по-разному (один с id, другой без), пересечение хотя
+        бы по одному ключу не даст обработать сообщение дважды.
+        """
+        keys: list[tuple[Any, ...]] = []
         if message_id is not None:
-            return ("msg", chat_id, "id", message_id)
-        return ("msg", chat_id, "text", author_id, hash(text[:200]))
+            keys.append(("msg", chat_id, "id", message_id))
+        # Хэш текста — стабилен между источниками, даже если
+        # message_id где-то теряется.
+        keys.append(("msg", chat_id, "text", author_id, hash(text[:200])))
+        return keys
+
+    def _seen_or_register(self, keys: list[tuple[Any, ...]]) -> bool:
+        """
+        True если хоть один из ключей уже встречался (=> дубль, пропустить).
+        False если ни одного не было — тогда регистрируем все ключи как
+        видимые.
+
+        Регистрация всех ключей сразу гарантирует, что если потом этот
+        же msg придёт от другого источника с другим набором ключей, мы
+        его всё равно опознаем как уже виденный.
+        """
+        with self._seen_lock:
+            if any(k in self._seen_keys for k in keys):
+                return True
+            for k in keys:
+                self._seen_keys.append(k)
+        return False
 
     # ---------- lifecycle ----------
 
@@ -393,13 +422,11 @@ class FunPayWatcher:
                 )
                 if not msg.text:
                     continue
-                key = self._make_msg_dedup_key(
+                keys = self._make_msg_dedup_keys(
                     chat_id, m.get("message_id"), author_id, msg.text
                 )
-                with self._seen_lock:
-                    if key in self._seen_keys:
-                        continue
-                    self._seen_keys.append(key)
+                if self._seen_or_register(keys):
+                    continue
                 logger.info(
                     f"FunPay poll: новое сообщение в чате {chat_id} от "
                     f"@{msg.author_username} (id={m.get('message_id')}): "
@@ -432,22 +459,20 @@ class FunPayWatcher:
         """Регистрирует ключ; True если ключ новый (= обрабатывать)."""
         if kind == "msg" and isinstance(payload, FunPayMessageEvent):
             # listen-loop обычно НЕ знает message_id (FunPayAPI его не
-            # отдаёт в этой версии), поэтому fallback на (chat_id, text).
-            # Чтобы синхронизироваться с poll-loop, используем общий
-            # формат ключа из _make_msg_dedup_key.
+            # отдаёт в этой версии), но poll-loop знает. Регистрируем по
+            # обоим ключам — text-hash совпадёт между источниками.
             msg_id = getattr(payload, "message_id", None)
-            key = self._make_msg_dedup_key(
+            keys = self._make_msg_dedup_keys(
                 payload.chat_id, msg_id, payload.author_id, payload.text
             )
-        elif kind == "order" and isinstance(payload, FunPayOrderEvent):
-            key = ("order", payload.funpay_order_id)
-        else:
+            return not self._seen_or_register(keys)
+        if kind == "order" and isinstance(payload, FunPayOrderEvent):
+            order_key = ("order", payload.funpay_order_id)
+            with self._seen_lock:
+                if order_key in self._seen_keys:
+                    return False
+                self._seen_keys.append(order_key)
             return True
-
-        with self._seen_lock:
-            if key in self._seen_keys:
-                return False
-            self._seen_keys.append(key)
         return True
 
     # ---------- event handling ----------

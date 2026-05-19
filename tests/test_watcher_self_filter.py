@@ -45,43 +45,64 @@ def test_is_my_message_handles_none_username_safely():
     assert w._is_my_message(author_id=None, author_username=None) is False
 
 
-def test_dedup_key_stable_across_listen_and_poll():
-    """Ключ дедупа должен быть одинаковым для listen и poll, чтобы
-    сообщение, увиденное обоими источниками, обрабатывалось один раз."""
+def test_dedup_dual_keys_listen_then_poll():
+    """
+    listen-loop: видит сообщение БЕЗ message_id (FunPayAPI его не отдаёт).
+    poll-loop: видит то же сообщение С message_id (HTML data-id).
+    Дедуп должен поймать второе обращение, потому что text-hash совпадает.
+    """
     w = _make_watcher()
-
     chat_id = 104433092
-    msg_id = 5_555_555
 
-    poll_key = w._make_msg_dedup_key(chat_id, msg_id, 1, "тест")
     listen_event = FunPayMessageEvent(
         chat_id=chat_id,
         chat_username="VOLT228822",
-        author_id=1,
+        author_id=2,
         author_username="VOLT228822",
-        text="тест",
+        text="!помощь",
         is_my_message=False,
     )
-    setattr(listen_event, "message_id", msg_id)
-
     assert w._dedup_register("msg", listen_event) is True
-    # listen уже зарегистрировал ключ — poll-фронт должен видеть его как дубль
-    with w._seen_lock:
-        assert poll_key in w._seen_keys
+
+    poll_keys = w._make_msg_dedup_keys(chat_id, 5_555_555, 2, "!помощь")
+    assert w._seen_or_register(poll_keys) is True
 
 
-def test_dedup_key_fallback_when_no_message_id_matches_text_hash():
+def test_dedup_dual_keys_poll_then_listen():
+    """Обратный порядок: poll первый, listen второй."""
     w = _make_watcher()
-    k1 = w._make_msg_dedup_key(123, None, 1, "тест")
-    k2 = w._make_msg_dedup_key(123, None, 1, "тест")
-    assert k1 == k2
-    # разный текст -> разный ключ
-    assert w._make_msg_dedup_key(123, None, 1, "другое") != k1
+    chat_id = 104433092
+
+    poll_keys = w._make_msg_dedup_keys(chat_id, 5_555_555, 2, "!помощь")
+    assert w._seen_or_register(poll_keys) is False
+
+    listen_event = FunPayMessageEvent(
+        chat_id=chat_id,
+        chat_username="VOLT228822",
+        author_id=2,
+        author_username="VOLT228822",
+        text="!помощь",
+        is_my_message=False,
+    )
+    assert w._dedup_register("msg", listen_event) is False
 
 
-def test_dedup_key_with_message_id_ignores_text():
-    """Если есть message_id, на текст не смотрим — это самое надёжное."""
+def test_dedup_different_messages_not_collapsed():
     w = _make_watcher()
-    k1 = w._make_msg_dedup_key(123, 999, 1, "тест")
-    k2 = w._make_msg_dedup_key(123, 999, 1, "совсем другой текст")
-    assert k1 == k2
+    k1 = w._make_msg_dedup_keys(123, None, 1, "тест")
+    k2 = w._make_msg_dedup_keys(123, None, 1, "другое")
+    assert w._seen_or_register(k1) is False
+    assert w._seen_or_register(k2) is False
+
+
+def test_dedup_same_text_different_message_ids_treated_as_dup():
+    """
+    Если text-hash совпадает, мы дедупим даже когда message_id разные.
+    Это позволяет защититься от того, что один и тот же msg попал через
+    оба источника, и они приписали ему разные id (или ни одного / какой-то).
+    """
+    w = _make_watcher()
+    k1 = w._make_msg_dedup_keys(123, 111, 1, "одинаковый текст")
+    assert w._seen_or_register(k1) is False
+    k2 = w._make_msg_dedup_keys(123, 222, 1, "одинаковый текст")
+    assert w._seen_or_register(k2) is True
