@@ -95,6 +95,33 @@ class RuntimeSetting(Base):
     )
 
 
+class FunpayChatCursor(Base):
+    """
+    Курсор последнего обработанного сообщения в FunPay-чате.
+
+    Зачем: watcher должен переживать рестарты. Без БД-курсора каждый
+    рестарт стартует с in-memory baseline'а, который не знает, какие
+    сообщения уже обработаны. Из-за этого после рестарта бот мог либо
+    проиграть старые `!помощь` ещё раз, либо пропустить новое сообщение.
+
+    Контракт:
+    - last_message_id — id ПОСЛЕДНЕГО успешно «увиденного» (диспатченного
+      в handler) сообщения. Все сообщения с id > last_message_id —
+      ещё не обработаны.
+    - При первом старте для нового чата запись создаётся с
+      last_message_id = id текущего самого свежего сообщения, и от него
+      бот двигается дальше.
+    """
+    __tablename__ = "funpay_chat_cursors"
+
+    chat_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    last_message_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_message_text_hash: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class KnownLot(Base):
     """
     FunPay-лоты, которые мы уже видели у нашего аккаунта. Сравнивая

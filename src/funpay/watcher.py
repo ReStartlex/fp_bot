@@ -88,9 +88,10 @@ class FunPayWatcher:
         # как fallback. Хранит ограниченное число ключей.
         self._seen_keys: deque[tuple[Any, ...]] = deque(maxlen=dedup_cache_size)
         self._seen_lock = threading.Lock()
-        # Snapshot для polling: {chat_id: {"preview": str, "last_id": int|None}}
+        # Preview snapshot для polling (для диффа preview между запусками).
+        # Source of truth для message_id курсора — таблица funpay_chat_cursors.
         self._poll_snapshot: dict[int, dict[str, Any]] = {}
-        # baseline = baseline установлен, начинаем нормальный polling
+        # Первый прогон poll_once завершён → нормальный режим.
         self._baseline_ready = threading.Event()
 
     def _is_my_message(
@@ -302,15 +303,24 @@ class FunPayWatcher:
 
     def _poll_once(self) -> None:
         """
-        Тянет страницу /chat/ через свой HTTP-клиент (admin_http),
-        ищет чаты с новым превью и для каждого такого чата вытаскивает
-        список сообщений с id > last_seen_message_id.
+        Прямой HTTP-poll FunPay /chat/.
 
-        Архитектура устроена так, чтобы:
-        - не реагировать на старые сообщения, попавшие в baseline;
-        - не пропустить ни одно НОВОЕ сообщение (включая повторы того
-          же текста — дедуп идёт по уникальному message_id);
-        - корректно работать с длинными сериями сообщений подряд.
+        Архитектура (после очередной итерации):
+
+        - Курсор для каждого чата живёт в БД (`funpay_chat_cursors`).
+          Это значит, что после рестарта мы знаем точную точку
+          возобновления и не реагируем повторно на старые сообщения.
+
+        - При первом запуске для нового чата (курсора нет):
+            * baseline-режим (первый poll, ещё не было flush): курсор
+              инициализируется текущим max(message_id) — историю не
+              разыгрываем, последующие новые сообщения ловим.
+            * runtime-режим (через 30 минут пришёл новый покупатель —
+              курсора в БД нет): обрабатываем последнее сообщение в
+              чате (это то самое, на которое сработал preview-change),
+              после этого записываем курсор.
+
+        - При повторном poll: тянем только id > cursor.last_message_id.
         """
         try:
             items = asyncio.run(self._fp._admin.get_chats_snapshot())  # type: ignore[attr-defined]
@@ -318,121 +328,57 @@ class FunPayWatcher:
             logger.debug(f"FunPay poll: get_chats_snapshot упал: {exc}")
             return
 
-        is_baseline = not self._baseline_ready.is_set()
+        is_first_run = not self._baseline_ready.is_set()
 
-        # Чаты, для которых надо тянуть историю:
-        # - на baseline тянем history для всех (чтобы записать last_seen);
-        # - на обычном poll — только те, чьё превью изменилось ИЛИ
-        #   которые имеют unread.
+        # Список чатов, для которых стоит сходить за историей.
+        # На первом запуске берём все, чтобы засинхронизировать курсоры.
+        # В runtime — только те, у которых preview изменился ИЛИ unread.
         to_fetch: list[tuple[int, str | None, str]] = []
-        new_previews: dict[int, str] = {}
         for item in items:
             chat_id = item["chat_id"]
             preview = item.get("preview", "")
             username = item.get("username")
             unread = item.get("unread", False)
-            new_previews[chat_id] = preview
-            if is_baseline:
-                to_fetch.append((chat_id, username, preview))
-                continue
             prev_state = self._poll_snapshot.get(chat_id) or {}
-            if prev_state.get("preview") != preview or unread:
+            if is_first_run:
+                to_fetch.append((chat_id, username, preview))
+            elif prev_state.get("preview") != preview or unread:
                 to_fetch.append((chat_id, username, preview))
 
-        if is_baseline:
-            # На первом запуске: записываем last_message_id, чтобы старые
-            # сообщения НЕ попали в обработку. Тяжёлая операция, но
-            # выполняется один раз за процесс.
-            baseline_chats_with_history = 0
-            for chat_id, _username, preview in to_fetch:
-                last_id = self._fetch_last_message_id(chat_id)
-                self._poll_snapshot[chat_id] = {
-                    "preview": preview,
-                    "last_id": last_id,
-                }
-                if last_id is not None:
-                    baseline_chats_with_history += 1
-            self._baseline_ready.set()
-            logger.info(
-                f"FunPay poll: baseline зафиксирован "
-                f"({len(new_previews)} чатов, "
-                f"{baseline_chats_with_history} с известным last_message_id)"
-            )
-            return
-
-        if not to_fetch:
-            return
-
+        # Обрабатываем чаты
         for chat_id, username, preview in to_fetch:
-            prev_state = self._poll_snapshot.get(chat_id) or {}
-            last_seen_id = prev_state.get("last_id")
+            cursor_last_id = asyncio.run(self._load_cursor(chat_id))
             try:
                 messages = asyncio.run(
                     self._fp._admin.get_chat_messages(  # type: ignore[attr-defined]
-                        chat_id, last_id=last_seen_id
+                        chat_id, last_id=cursor_last_id
                     )
                 )
             except Exception as exc:
                 logger.debug(
                     f"FunPay poll: get_chat_messages({chat_id}) упал: {exc}"
                 )
-                self._poll_snapshot[chat_id] = {
-                    "preview": preview,
-                    "last_id": last_seen_id,
-                }
                 continue
 
-            # Если baseline для этого чата не смог определить last_id
-            # (вернулся None — типичный случай, когда HTML-парсер не нашёл
-            # id у сообщений), мы НЕ можем отличить старые сообщения от
-            # новых. В этом случае ловим максимальный id из текущей
-            # выборки и пропускаем dispatch — это «отложенный baseline»
-            # для конкретного чата. С следующей итерации reads пойдут
-            # уже от известной точки.
-            if last_seen_id is None and messages:
-                new_last_id = max(
-                    (m.get("message_id") for m in messages if m.get("message_id") is not None),
-                    default=None,
-                )
-                self._poll_snapshot[chat_id] = {
-                    "preview": preview,
-                    "last_id": new_last_id,
-                }
-                logger.debug(
-                    f"FunPay poll: отложенный baseline для chat={chat_id}, "
-                    f"last_id={new_last_id} (старые {len(messages)} сообщений пропущены)"
-                )
-                continue
+            new_messages, new_last_id = self._select_new_messages(
+                messages=messages,
+                cursor_last_id=cursor_last_id,
+                is_first_run=is_first_run,
+            )
 
-            new_messages: list[dict[str, Any]] = []
-            new_last_id = last_seen_id
-            for m in messages:
-                mid = m.get("message_id")
-                if mid is not None:
-                    if last_seen_id is not None and mid <= last_seen_id:
-                        continue
-                    if new_last_id is None or mid > new_last_id:
-                        new_last_id = mid
-                new_messages.append(m)
-
-            # Обновляем snapshot ДО обработки сообщений — даже если
-            # handler упадёт, мы не зациклимся на тех же сообщениях.
-            self._poll_snapshot[chat_id] = {
-                "preview": preview,
-                "last_id": new_last_id,
-            }
+            # Обновляем in-memory preview snapshot (для diff на следующих poll).
+            self._poll_snapshot[chat_id] = {"preview": preview}
+            # Курсор в БД сразу — даже если handler упадёт, мы не
+            # зациклимся на тех же сообщениях.
+            if new_last_id is not None and new_last_id != cursor_last_id:
+                asyncio.run(self._save_cursor(chat_id, new_last_id))
 
             for m in new_messages:
                 author_id = m.get("author_id")
                 author_username = m.get("author_username")
-                # Username собеседника берём из карточки списка чатов
-                # (более надёжно, чем парсинг из HTML сообщения).
                 if not author_username:
                     author_username = username
                 if self._is_my_message(author_id, author_username):
-                    # Своё сообщение — обязательно пропускаем, иначе бот
-                    # триггерится на свои же шаблоны (например, на
-                    # "!помощь" в тексте приветствия).
                     continue
                 msg = FunPayMessageEvent(
                     chat_id=chat_id,
@@ -457,23 +403,85 @@ class FunPayWatcher:
                 if self._on_new_message is not None:
                     self._dispatch_async(self._on_new_message(msg))
 
-    def _fetch_last_message_id(self, chat_id: int) -> int | None:
-        """Возвращает message_id последнего сообщения в чате (для baseline)."""
+        if is_first_run:
+            self._baseline_ready.set()
+            logger.info(
+                f"FunPay poll: первый прогон завершён, "
+                f"{len(to_fetch)} чатов синхронизированы с БД-курсорами"
+            )
+
+    def _select_new_messages(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        cursor_last_id: int | None,
+        is_first_run: bool,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        """
+        Возвращает (новые_сообщения_для_handler, новый_last_id_для_курсора).
+
+        Правила:
+        - cursor_last_id известен — диспатчим всё с id > cursor_last_id.
+          Это золотой стандарт, гарантия от replay'а.
+        - cursor_last_id is None, is_first_run=True — это самый первый
+          запуск watcher'а для этого чата. Историю не разыгрываем,
+          просто пишем max(id) в курсор. На следующем poll начнём
+          ловить новое.
+        - cursor_last_id is None, is_first_run=False — runtime сценарий
+          (новый покупатель). Обрабатываем последнее сообщение из
+          выборки (это и есть тот msg, на который сработал
+          preview-change), курсор пишем максимальным id.
+        """
+        if not messages:
+            return [], cursor_last_id
+
+        max_id = max(
+            (m.get("message_id") for m in messages if m.get("message_id") is not None),
+            default=None,
+        )
+
+        if cursor_last_id is not None:
+            # Обычный путь
+            new = [
+                m for m in messages
+                if m.get("message_id") is not None
+                and m["message_id"] > cursor_last_id
+            ]
+            return new, max_id or cursor_last_id
+
+        if is_first_run:
+            # baseline: историю не диспатчим
+            return [], max_id
+
+        # Новый чат после baseline — диспатчим только последнее
+        return [messages[-1]], max_id
+
+    async def _load_cursor(self, chat_id: int) -> int | None:
+        """Курсор из БД (last_message_id или None)."""
+        from src.db.repo import get_chat_cursor
+        from src.db.session import session_factory
         try:
-            messages = asyncio.run(
-                self._fp._admin.get_chat_messages(chat_id)  # type: ignore[attr-defined]
-            )
+            async with session_factory()() as session:
+                cursor = await get_chat_cursor(session, chat_id)
+                return cursor.last_message_id if cursor else None
         except Exception as exc:
-            logger.debug(
-                f"FunPay poll baseline: get_chat_messages({chat_id}) упал: {exc}"
-            )
+            logger.debug(f"_load_cursor({chat_id}) упал: {exc}")
             return None
-        last_id: int | None = None
-        for m in messages:
-            mid = m.get("message_id")
-            if mid is not None and (last_id is None or mid > last_id):
-                last_id = mid
-        return last_id
+
+    async def _save_cursor(self, chat_id: int, last_message_id: int) -> None:
+        """Сохраняет курсор в БД (двигаем только вперёд)."""
+        from src.db.repo import upsert_chat_cursor
+        from src.db.session import session_factory
+        try:
+            async with session_factory()() as session:
+                await upsert_chat_cursor(
+                    session,
+                    chat_id=chat_id,
+                    last_message_id=last_message_id,
+                )
+                await session.commit()
+        except Exception as exc:
+            logger.debug(f"_save_cursor({chat_id}, {last_message_id}) упал: {exc}")
 
     # ---------- dedup ----------
 

@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import ChatState, FxRate, Mapping, Order, SyncRun
+from src.db.models import ChatState, FunpayChatCursor, FxRate, Mapping, Order, SyncRun
 
 
 # ---------- Mappings ----------
@@ -184,3 +184,54 @@ async def mark_help_requested(session: AsyncSession, state: ChatState) -> None:
     state.last_help_request_at = datetime.utcnow()
     state.help_requests_count = (state.help_requests_count or 0) + 1
     await session.flush()
+
+
+# ---------- FunPay chat cursors ----------
+
+async def get_chat_cursor(
+    session: AsyncSession, chat_id: int
+) -> FunpayChatCursor | None:
+    """Курсор последнего обработанного сообщения для чата (или None)."""
+    stmt = select(FunpayChatCursor).where(FunpayChatCursor.chat_id == chat_id)
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def upsert_chat_cursor(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    last_message_id: int | None,
+    last_message_text_hash: int | None = None,
+) -> FunpayChatCursor:
+    """
+    Записать/обновить курсор. Если запись существует — обновляем,
+    но НЕ откатываем last_message_id назад (это защита от случайного
+    «забывания» — мы должны двигаться только вперёд).
+    """
+    cursor = await get_chat_cursor(session, chat_id)
+    if cursor is None:
+        cursor = FunpayChatCursor(
+            chat_id=chat_id,
+            last_message_id=last_message_id,
+            last_message_text_hash=last_message_text_hash,
+        )
+        session.add(cursor)
+        await session.flush()
+        return cursor
+
+    if last_message_id is not None and (
+        cursor.last_message_id is None
+        or last_message_id > cursor.last_message_id
+    ):
+        cursor.last_message_id = last_message_id
+    if last_message_text_hash is not None:
+        cursor.last_message_text_hash = last_message_text_hash
+    await session.flush()
+    return cursor
+
+
+async def list_chat_cursors(
+    session: AsyncSession,
+) -> list[FunpayChatCursor]:
+    stmt = select(FunpayChatCursor)
+    return list((await session.execute(stmt)).scalars().all())

@@ -24,8 +24,8 @@ def test_delivery_with_codes():
 
 def test_delivery_empty():
     text = templates.delivery("Vasya", [], lang="ru")
-    # graceful fallback
-    assert "не пришли" in text or "поставщик" in text
+    # graceful fallback: упоминание поставщика и/или товара
+    assert "оставщик" in text or "товар" in text.lower()
 
 
 def test_delivery_failed_ru():

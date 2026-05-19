@@ -257,36 +257,41 @@ class FunPayAdminClient:
         Возвращает список словарей вида:
             {message_id, author_id, author_username, text, is_my, when}
         Самое свежее — в конце списка (по порядку на странице FunPay).
+
+        Парсер устойчив к разным версиям FunPay-HTML:
+        - сообщение ищется в любом из контейнеров `.chat-msg-item`,
+          `.chat-msg`, `.chat-message`, `.message`;
+        - message_id ищется в data-id, id="msg-NNN" или в любом
+          атрибуте, содержащем число;
+        - текст сообщения берётся из `.chat-msg-text`/`.message-text`/
+          `.chat-msg-body` или, если их нет, — из самого узла после
+          вычитания author-link/timestamp.
         """
         url = f"{self.BASE}/chat/?node={int(chat_id)}"
         r = await asyncio.to_thread(self._sync_get, url)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # FunPay рендерит сообщения как <div class="chat-msg-item"
-        # data-id="123" data-author="456">
         out: list[dict[str, Any]] = []
-        for el in soup.select(".chat-msg-item, .chat-msg, .chat-message"):
-            mid_raw = el.get("data-id") or el.get("id") or ""
-            try:
-                mid = int(re.sub(r"\D", "", mid_raw)) if mid_raw else None
-            except (TypeError, ValueError):
-                mid = None
+        # Расширенный список селекторов — FunPay периодически меняет
+        # классы темы. Главное: один и тот же узел не сматчится дважды,
+        # потому что мы дедупим по выраженному id внутри узла.
+        message_nodes = soup.select(
+            ".chat-msg-item, .chat-msg, .chat-message, "
+            ".message-item, .message"
+        )
+        seen_ids: set[int] = set()
+        for el in message_nodes:
+            mid = self._extract_message_id(el)
+            if mid is not None:
+                if mid in seen_ids:
+                    continue
+                seen_ids.add(mid)
             if last_id is not None and mid is not None and mid <= last_id:
                 continue
 
-            author_raw = el.get("data-author") or el.get("data-user-id") or ""
-            try:
-                author_id = int(author_raw) if author_raw else None
-            except (TypeError, ValueError):
-                author_id = None
-
-            user_link = el.select_one(".chat-msg-author-link, a.media-user-name")
-            author_username = (
-                user_link.get_text(strip=True) if user_link else None
-            )
-
-            body_el = el.select_one(".chat-msg-text, .message-text, .chat-msg-body")
-            text = body_el.get_text(separator=" ", strip=True) if body_el else ""
+            author_id = self._extract_author_id(el)
+            author_username = self._extract_author_username(el)
+            text = self._extract_message_text(el)
             if not text:
                 continue
 
@@ -299,6 +304,101 @@ class FunPayAdminClient:
                 }
             )
         return out
+
+    @staticmethod
+    def _extract_message_id(el: Any) -> int | None:
+        """Достаёт message_id из узла любыми доступными способами."""
+        for attr in ("data-id", "data-message-id", "data-msg-id"):
+            v = el.get(attr)
+            if v:
+                m = re.search(r"\d+", str(v))
+                if m:
+                    try:
+                        return int(m.group(0))
+                    except ValueError:
+                        pass
+        # id="msg-12345" / id="message-12345"
+        node_id = el.get("id") or ""
+        m = re.search(r"\d+", node_id)
+        if m:
+            try:
+                return int(m.group(0))
+            except ValueError:
+                pass
+        return None
+
+    @staticmethod
+    def _extract_author_id(el: Any) -> int | None:
+        for attr in ("data-author", "data-user-id", "data-author-id"):
+            v = el.get(attr)
+            if v:
+                try:
+                    return int(re.sub(r"\D", "", str(v)))
+                except (TypeError, ValueError):
+                    pass
+        # Иногда автор зашит во вложенный <a data-id="USER_ID">
+        link = el.select_one("a[data-user-id], a[data-id]")
+        if link is not None:
+            v = link.get("data-user-id") or link.get("data-id")
+            if v:
+                try:
+                    return int(re.sub(r"\D", "", str(v)))
+                except (TypeError, ValueError):
+                    pass
+        return None
+
+    @staticmethod
+    def _extract_author_username(el: Any) -> str | None:
+        for sel in (
+            ".chat-msg-author-link",
+            "a.media-user-name",
+            ".chat-msg-author",
+            ".message-author",
+            ".chat-msg-username",
+        ):
+            link = el.select_one(sel)
+            if link is not None:
+                text = link.get_text(strip=True)
+                if text:
+                    return text
+        return None
+
+    @staticmethod
+    def _extract_message_text(el: Any) -> str:
+        """
+        Достаёт текст сообщения. Сначала через явный body-селектор,
+        если нет — берём весь текст узла минус ссылку на автора и
+        timestamp.
+        """
+        for sel in (
+            ".chat-msg-text",
+            ".message-text",
+            ".chat-msg-body",
+            ".message-body",
+            ".chat-msg-content",
+        ):
+            body_el = el.select_one(sel)
+            if body_el is not None:
+                text = body_el.get_text(separator=" ", strip=True)
+                if text:
+                    return text
+
+        # Fallback: целиком текст узла, выкидывая author/time.
+        copy = BeautifulSoup(str(el), "html.parser")
+        for junk_sel in (
+            ".chat-msg-author-link",
+            ".chat-msg-author",
+            "a.media-user-name",
+            ".chat-msg-username",
+            ".chat-msg-date",
+            ".chat-msg-time",
+            ".message-time",
+            ".message-date",
+            "time",
+        ):
+            for j in copy.select(junk_sel):
+                j.decompose()
+        return copy.get_text(separator=" ", strip=True)
 
     async def get_lot_fields(
         self, lot_id: int, node_id: int | None = None
