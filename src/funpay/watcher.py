@@ -84,13 +84,13 @@ class FunPayWatcher:
         self._poll_interval = poll_interval_seconds
         self._listen_restart_delay = listen_restart_delay_seconds
 
-        # Дедуп: помним недавно обработанные ключи сообщений/заказов.
-        # Ключ для сообщения: (chat_id, author_id, hash(text[:200])).
+        # Дедуп по message_id (если есть) или по (chat_id, author_id, text)
+        # как fallback. Хранит ограниченное число ключей.
         self._seen_keys: deque[tuple[Any, ...]] = deque(maxlen=dedup_cache_size)
         self._seen_lock = threading.Lock()
-        # Snapshot чатов для polling: {chat_id: last_msg_signature}
-        self._poll_snapshot: dict[int, str] = {}
-        # Уже видели ли мы хотя бы один INITIAL_CHAT snapshot (=> baseline есть)
+        # Snapshot для polling: {chat_id: {"preview": str, "last_id": int|None}}
+        self._poll_snapshot: dict[int, dict[str, Any]] = {}
+        # baseline = baseline установлен, начинаем нормальный polling
         self._baseline_ready = threading.Event()
 
     # ---------- lifecycle ----------
@@ -225,13 +225,14 @@ class FunPayWatcher:
     def _poll_once(self) -> None:
         """
         Тянет страницу /chat/ через свой HTTP-клиент (admin_http),
-        диффает превью сообщений с предыдущим снимком.
+        ищет чаты с новым превью и для каждого такого чата вытаскивает
+        список сообщений с id > last_seen_message_id.
 
-        Почему ходим напрямую, а не через FunPayAPI: `account.get_chats()`
-        в этой версии библиотеки возвращает кэшированный INITIAL_CHAT
-        снимок и не обновляется. Только прямой HTTP к /chat/ даёт
-        свежие данные. Это **гарантированный** путь — браузер FunPay
-        работает так же.
+        Архитектура устроена так, чтобы:
+        - не реагировать на старые сообщения, попавшие в baseline;
+        - не пропустить ни одно НОВОЕ сообщение (включая повторы того
+          же текста — дедуп идёт по уникальному message_id);
+        - корректно работать с длинными сериями сообщений подряд.
         """
         try:
             items = asyncio.run(self._fp._admin.get_chats_snapshot())  # type: ignore[attr-defined]
@@ -242,65 +243,87 @@ class FunPayWatcher:
         my_id = getattr(self._fp.account, "id", None)
         is_baseline = not self._baseline_ready.is_set()
 
-        new_snapshot: dict[int, str] = {}
-        changes: list[tuple[int, str, str | None]] = []  # (chat_id, preview, username)
+        # Чаты, для которых надо тянуть историю:
+        # - на baseline тянем history для всех (чтобы записать last_seen);
+        # - на обычном poll — только те, чьё превью изменилось ИЛИ
+        #   которые имеют unread.
+        to_fetch: list[tuple[int, str | None, str]] = []
+        new_previews: dict[int, str] = {}
         for item in items:
             chat_id = item["chat_id"]
             preview = item.get("preview", "")
             username = item.get("username")
-            new_snapshot[chat_id] = preview
+            unread = item.get("unread", False)
+            new_previews[chat_id] = preview
             if is_baseline:
+                to_fetch.append((chat_id, username, preview))
                 continue
-            prev = self._poll_snapshot.get(chat_id)
-            if prev == preview:
-                continue
-            changes.append((chat_id, preview, username))
-
-        self._poll_snapshot = new_snapshot
+            prev_state = self._poll_snapshot.get(chat_id) or {}
+            if prev_state.get("preview") != preview or unread:
+                to_fetch.append((chat_id, username, preview))
 
         if is_baseline:
+            # На первом запуске: записываем last_message_id, чтобы старые
+            # сообщения НЕ попали в обработку. Тяжёлая операция, но
+            # выполняется один раз за процесс.
+            baseline_chats_with_history = 0
+            for chat_id, _username, preview in to_fetch:
+                last_id = self._fetch_last_message_id(chat_id)
+                self._poll_snapshot[chat_id] = {
+                    "preview": preview,
+                    "last_id": last_id,
+                }
+                if last_id is not None:
+                    baseline_chats_with_history += 1
             self._baseline_ready.set()
             logger.info(
                 f"FunPay poll: baseline зафиксирован "
-                f"({len(new_snapshot)} чатов)"
+                f"({len(new_previews)} чатов, "
+                f"{baseline_chats_with_history} с известным last_message_id)"
             )
             return
 
-        if not changes:
+        if not to_fetch:
             return
 
-        # Для каждого изменившегося чата — забираем актуальную историю
-        # и берём сообщения, которых ещё не видели (по message_id).
-        for chat_id, preview, username in changes:
+        for chat_id, username, preview in to_fetch:
+            prev_state = self._poll_snapshot.get(chat_id) or {}
+            last_seen_id = prev_state.get("last_id")
             try:
                 messages = asyncio.run(
-                    self._fp._admin.get_chat_messages(chat_id)  # type: ignore[attr-defined]
+                    self._fp._admin.get_chat_messages(  # type: ignore[attr-defined]
+                        chat_id, last_id=last_seen_id
+                    )
                 )
             except Exception as exc:
                 logger.debug(
                     f"FunPay poll: get_chat_messages({chat_id}) упал: {exc}"
                 )
-                # Фолбэк: конструируем events на основе превью.
-                msg = FunPayMessageEvent(
-                    chat_id=chat_id,
-                    chat_username=username,
-                    author_id=None,
-                    author_username=username,
-                    text=preview,
-                    is_my_message=False,
-                )
-                if self._dedup_register("msg", msg):
-                    logger.info(
-                        f"FunPay poll: новое сообщение (preview) в чате "
-                        f"{chat_id} от @{username}: {preview[:80]!r}"
-                    )
-                    if self._on_new_message is not None:
-                        self._dispatch_async(self._on_new_message(msg))
+                self._poll_snapshot[chat_id] = {
+                    "preview": preview,
+                    "last_id": last_seen_id,
+                }
                 continue
 
-            # messages — список сообщений в чате; нам интересны только
-            # последние, и только НЕ свои.
-            for m in messages[-10:]:
+            new_messages: list[dict[str, Any]] = []
+            new_last_id = last_seen_id
+            for m in messages:
+                mid = m.get("message_id")
+                if mid is not None:
+                    if last_seen_id is not None and mid <= last_seen_id:
+                        continue
+                    if new_last_id is None or mid > new_last_id:
+                        new_last_id = mid
+                new_messages.append(m)
+
+            # Обновляем snapshot ДО обработки сообщений — даже если
+            # handler упадёт, мы не зациклимся на тех же сообщениях.
+            self._poll_snapshot[chat_id] = {
+                "preview": preview,
+                "last_id": new_last_id,
+            }
+
+            for m in new_messages:
                 author_id = m.get("author_id")
                 is_my = bool(
                     my_id is not None
@@ -319,14 +342,43 @@ class FunPayWatcher:
                 )
                 if not msg.text:
                     continue
-                if not self._dedup_register("msg", msg):
-                    continue
+                # Дедуп по message_id (если есть) — гарантирует, что
+                # одно и то же сообщение не обработается дважды (например,
+                # если оно пришло и через listen, и через poll).
+                key: tuple[Any, ...] = (
+                    "msg",
+                    chat_id,
+                    m.get("message_id") or f"text:{hash(msg.text[:200])}",
+                )
+                with self._seen_lock:
+                    if key in self._seen_keys:
+                        continue
+                    self._seen_keys.append(key)
                 logger.info(
                     f"FunPay poll: новое сообщение в чате {chat_id} от "
-                    f"@{msg.author_username}: {msg.text[:80]!r}"
+                    f"@{msg.author_username} (id={m.get('message_id')}): "
+                    f"{msg.text[:80]!r}"
                 )
                 if self._on_new_message is not None:
                     self._dispatch_async(self._on_new_message(msg))
+
+    def _fetch_last_message_id(self, chat_id: int) -> int | None:
+        """Возвращает message_id последнего сообщения в чате (для baseline)."""
+        try:
+            messages = asyncio.run(
+                self._fp._admin.get_chat_messages(chat_id)  # type: ignore[attr-defined]
+            )
+        except Exception as exc:
+            logger.debug(
+                f"FunPay poll baseline: get_chat_messages({chat_id}) упал: {exc}"
+            )
+            return None
+        last_id: int | None = None
+        for m in messages:
+            mid = m.get("message_id")
+            if mid is not None and (last_id is None or mid > last_id):
+                last_id = mid
+        return last_id
 
     # ---------- dedup ----------
 
