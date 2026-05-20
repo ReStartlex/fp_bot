@@ -34,8 +34,13 @@ from sqlalchemy import desc, select
 from src.alerts import ui
 from src.alerts.sessions import PAGE_SIZE, PaginationStore, paginate
 from src.config import Settings, get_settings
-from src.db.models import Mapping, Order, SyncRun
-from src.db.repo import upsert_mapping
+from src.db.models import LotGroup, Mapping, Order, SyncRun
+from src.db.repo import (
+    assign_mapping_group,
+    classify_lot_group,
+    list_lot_groups,
+    upsert_mapping,
+)
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
 from src.mapping.rules import compute_pricing
@@ -492,6 +497,12 @@ class TelegramBot:
                 return
             await self._do_mappings(msg)
 
+        @dp.message(Command("groups"))
+        async def cmd_groups(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_groups(msg)
+
         @dp.message(Command("map"))
         async def cmd_map(msg: Message) -> None:
             if not self._is_owner(msg):
@@ -655,6 +666,13 @@ class TelegramBot:
                 await cq.answer()
                 return
             await self._on_settings_click(cq)
+
+        @dp.callback_query(F.data.startswith("group:"))
+        async def cb_group(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await self._on_group_click(cq)
 
     # ─────────────── общие хелперы ───────────────
 
@@ -873,6 +891,8 @@ class TelegramBot:
             await self._show_lots_via_cq(cq)
         elif action == ui.MENU_KIND_MAPS:
             await self._show_mappings_via_cq(cq)
+        elif action == ui.MENU_KIND_GROUPS:
+            await self._show_groups_via_cq(cq)
         elif action == ui.MENU_KIND_NS_CATS:
             await self._show_ns_cats_via_cq(cq)
         elif action == ui.MENU_KIND_NS_SEARCH:
@@ -952,6 +972,12 @@ class TelegramBot:
             await self._act_map_toggle(cq, item)
         elif kind == "map_delete":
             await self._act_map_delete(cq, item)
+        elif kind == "group_open":
+            await self._act_group_open(cq, item)
+        elif kind == "map_group":
+            await self._act_map_group(cq, item)
+        elif kind == "group_assign":
+            await self._act_group_assign(cq, item)
         else:
             await cq.answer(f"Неизвестное действие: {kind}")
 
@@ -988,6 +1014,16 @@ class TelegramBot:
             text, kb = self._build_lots_page(sess, sid, page_items, page, total_pages)
         elif kind == "mappings":
             text, kb = self._build_mappings_page(sess, sid, page_items, page, total_pages)
+        elif kind == "groups":
+            text, kb = self._build_groups_page(sess, sid, page_items, page, total_pages)
+        elif kind == "group_mappings":
+            text, kb = self._build_group_mappings_page(
+                sess, sid, page_items, page, total_pages
+            )
+        elif kind == "group_assign":
+            text, kb = self._build_group_assign_page(
+                sess, sid, page_items, page, total_pages
+            )
         elif kind == "orders":
             text, kb = self._build_orders_page(sess, sid, page_items, page, total_pages)
         else:
@@ -1186,6 +1222,10 @@ class TelegramBot:
                     callback_data=f"act:map_toggle:{sid}:{global_idx}",
                 ),
                 InlineKeyboardButton(
+                    text="📁",
+                    callback_data=f"act:map_group:{sid}:{global_idx}",
+                ),
+                InlineKeyboardButton(
                     text="🗑",
                     callback_data=f"act:map_delete:{sid}:{global_idx}",
                 ),
@@ -1197,6 +1237,130 @@ class TelegramBot:
             page=page,
             total_pages=total_pages,
             item_buttons=item_buttons,
+        )
+        return text, kb
+
+    def _build_groups_page(self, sess, sid, page_items, page, total_pages):
+        text = ui.render_list(
+            page_items=page_items,
+            formatter=ui.format_lot_group_line,
+            title="📁 Группы лотов",
+            page=page,
+            total_pages=total_pages,
+            total_items=len(sess.items),
+            empty_text="Группы ещё не созданы.",
+        )
+        from aiogram.types import InlineKeyboardButton
+
+        item_buttons: list[list[InlineKeyboardButton]] = []
+        for local_idx, group in enumerate(page_items):
+            global_idx = page * PAGE_SIZE + local_idx
+            item_buttons.append([
+                InlineKeyboardButton(
+                    text=f"📁 {ui.short_title(group.name, 28)}",
+                    callback_data=f"act:group_open:{sid}:{global_idx}",
+                ),
+                InlineKeyboardButton(
+                    text="−1%",
+                    callback_data=f"group:markup_delta:{group.id}:-1",
+                ),
+                InlineKeyboardButton(
+                    text="+1%",
+                    callback_data=f"group:markup_delta:{group.id}:1",
+                ),
+            ])
+            item_buttons.append([
+                InlineKeyboardButton(
+                    text="5%",
+                    callback_data=f"group:markup_set:{group.id}:5",
+                ),
+                InlineKeyboardButton(
+                    text="6%",
+                    callback_data=f"group:markup_set:{group.id}:6",
+                ),
+                InlineKeyboardButton(
+                    text="12.5%",
+                    callback_data=f"group:markup_set:{group.id}:12.5",
+                ),
+                InlineKeyboardButton(
+                    text="default",
+                    callback_data=f"group:markup_default:{group.id}",
+                ),
+            ])
+        kb = ui.list_keyboard(
+            kind="groups",
+            sid=sid,
+            page=page,
+            total_pages=total_pages,
+            item_buttons=item_buttons,
+        )
+        return text, kb
+
+    def _build_group_mappings_page(self, sess, sid, page_items, page, total_pages):
+        group_name = sess.meta.get("group_name", "Группа")
+        text = ui.render_list(
+            page_items=page_items,
+            formatter=ui.format_mapping_line,
+            title=f"📁 {group_name}",
+            page=page,
+            total_pages=total_pages,
+            total_items=len(sess.items),
+            empty_text="В этой группе пока нет маппингов.",
+        )
+        from aiogram.types import InlineKeyboardButton
+
+        extra_rows = [[
+            InlineKeyboardButton(
+                text="↩ К группам",
+                callback_data=f"menu:{ui.MENU_KIND_GROUPS}",
+            )
+        ]]
+        kb = ui.list_keyboard(
+            kind="group_mappings",
+            sid=sid,
+            page=page,
+            total_pages=total_pages,
+            item_buttons=[],
+            extra_rows=extra_rows,
+        )
+        return text, kb
+
+    def _build_group_assign_page(self, sess, sid, page_items, page, total_pages):
+        mapping_id = sess.meta.get("mapping_id")
+        label = sess.meta.get("mapping_label", "mapping")
+        text = ui.render_list(
+            page_items=page_items,
+            formatter=ui.format_lot_group_line,
+            title=f"📁 Выбор группы для {label}",
+            page=page,
+            total_pages=total_pages,
+            total_items=len(sess.items),
+            empty_text="Группы ещё не созданы.",
+        )
+        from aiogram.types import InlineKeyboardButton
+
+        item_buttons: list[list[InlineKeyboardButton]] = []
+        for local_idx, group in enumerate(page_items):
+            global_idx = page * PAGE_SIZE + local_idx
+            item_buttons.append([
+                InlineKeyboardButton(
+                    text=f"✅ {ui.short_title(group.name, 32)}",
+                    callback_data=f"act:group_assign:{sid}:{global_idx}",
+                )
+            ])
+        extra_rows = [[
+            InlineKeyboardButton(
+                text="Без группы",
+                callback_data=f"group:assign_none:{mapping_id}",
+            )
+        ]]
+        kb = ui.list_keyboard(
+            kind="group_assign",
+            sid=sid,
+            page=page,
+            total_pages=total_pages,
+            item_buttons=item_buttons,
+            extra_rows=extra_rows,
         )
         return text, kb
 
@@ -1463,6 +1627,18 @@ class TelegramBot:
         await self._render_paginated_from_cmd(msg, kind="mappings", sid=sid, page=0)
 
     @_guard
+    async def _do_groups(self, msg: Message) -> None:
+        sid, total = await self._collect_groups()
+        if total == 0:
+            await self._send_view(
+                msg.chat.id,
+                "Группы ещё не созданы.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        await self._render_paginated_from_cmd(msg, kind="groups", sid=sid, page=0)
+
+    @_guard
     async def _show_mappings_via_cq(self, cq: CallbackQuery) -> None:
         sid, total = await self._collect_mappings()
         if total == 0:
@@ -1476,12 +1652,47 @@ class TelegramBot:
             return
         await self._render_paginated(cq, kind="mappings", sid=sid, page=0)
 
+    @_guard
+    async def _show_groups_via_cq(self, cq: CallbackQuery) -> None:
+        sid, total = await self._collect_groups()
+        if total == 0:
+            await self._edit_or_answer(
+                cq, "Группы ещё не созданы.", reply_markup=ui.single_close_kb()
+            )
+            return
+        await self._render_paginated(cq, kind="groups", sid=sid, page=0)
+
     async def _collect_mappings(self) -> tuple[str, int]:
         async with session_factory()() as session:
             stmt = select(Mapping).order_by(Mapping.funpay_lot_id)
             mappings = list((await session.execute(stmt)).scalars().all())
+            groups = {
+                group.id: group.name
+                for group in (await session.execute(select(LotGroup))).scalars().all()
+            }
+            for mapping in mappings:
+                if mapping.group_id is not None:
+                    setattr(mapping, "_group_name", groups.get(mapping.group_id))
         sid = self._sessions.put(mappings, title="mappings")
         return sid, len(mappings)
+
+    async def _collect_groups(self) -> tuple[str, int]:
+        async with session_factory()() as session:
+            groups = await list_lot_groups(session)
+            await session.commit()
+            counts = {group.id: [0, 0] for group in groups}
+            mappings = list((await session.execute(select(Mapping))).scalars().all())
+            for mapping in mappings:
+                if mapping.group_id in counts:
+                    counts[mapping.group_id][0] += 1
+                    if mapping.enabled:
+                        counts[mapping.group_id][1] += 1
+            for group in groups:
+                count, active = counts.get(group.id, [0, 0])
+                setattr(group, "_mappings_count", count)
+                setattr(group, "_active_mappings_count", active)
+        sid = self._sessions.put(groups, title="groups")
+        return sid, len(groups)
 
     @_guard
     async def _do_ns_cats(self, msg: Message) -> None:
@@ -1642,6 +1853,11 @@ class TelegramBot:
         async with session_factory()() as session:
             stmt = select(Mapping).where(Mapping.funpay_lot_id == funpay_lot_id)
             mapping = (await session.execute(stmt)).scalar_one_or_none()
+            group = (
+                await session.get(LotGroup, mapping.group_id)
+                if mapping is not None and mapping.group_id is not None
+                else None
+            )
         if mapping is None:
             return (
                 f"Маппинга для лота <code>{funpay_lot_id}</code> нет.\n"
@@ -1682,6 +1898,8 @@ class TelegramBot:
             fx_rate_usd_to_target=rate.effective,
             default_markup=eff_markup,
             default_stock_cap=eff_stock_cap,
+            group_markup_percent=group.markup_percent if group is not None else None,
+            group_stock_cap=group.stock_cap if group is not None else None,
         )
         current_seller: float | None = None
         if self._funpay_client is not None:
@@ -1717,6 +1935,12 @@ class TelegramBot:
                 f"<b>{pricing.markup_percent}%</b> "
                 f"(зашита в маппинге, глобально сейчас "
                 f"{eff_markup:.2f}%)"
+            )
+        elif group is not None and group.markup_percent is not None:
+            markup_source = (
+                f"<b>{pricing.markup_percent}%</b> "
+                f"(группа <b>{html.escape(group.name)}</b>; "
+                f"глобально сейчас {eff_markup:.2f}%)"
             )
         else:
             env_default = self._settings.markup_percent
@@ -1918,6 +2142,64 @@ class TelegramBot:
                     await cq.message.delete()
             except Exception:
                 pass
+
+    async def _on_group_click(self, cq: CallbackQuery) -> None:
+        parts = (cq.data or "").split(":")
+        if len(parts) < 3:
+            await cq.answer("Некорректная команда группы", show_alert=True)
+            return
+        action = parts[1]
+        try:
+            target_id = int(parts[2])
+        except ValueError:
+            await cq.answer("Некорректный id", show_alert=True)
+            return
+
+        if action == "assign_none":
+            async with session_factory()() as session:
+                mapping = await session.get(Mapping, target_id)
+                if mapping is None:
+                    await cq.answer("Маппинг не найден", show_alert=True)
+                    return
+                await assign_mapping_group(session, mapping, None)
+                await session.commit()
+            await cq.answer("Группа сброшена", show_alert=False)
+            await self._show_mappings_via_cq(cq)
+            return
+
+        async with session_factory()() as session:
+            group = await session.get(LotGroup, target_id)
+            if group is None:
+                await cq.answer("Группа не найдена", show_alert=True)
+                return
+
+            if action == "markup_default":
+                group.markup_percent = None
+            elif action == "markup_set":
+                if len(parts) < 4:
+                    await cq.answer("Не указан процент", show_alert=True)
+                    return
+                group.markup_percent = float(parts[3].replace(",", "."))
+            elif action == "markup_delta":
+                if len(parts) < 4:
+                    await cq.answer("Не указан шаг", show_alert=True)
+                    return
+                base = group.markup_percent
+                if base is None:
+                    base = self._settings.markup_percent
+                group.markup_percent = max(0.0, base + float(parts[3].replace(",", ".")))
+            else:
+                await cq.answer("Неизвестная команда группы", show_alert=True)
+                return
+            await session.commit()
+            shown = format_percent(group.markup_percent)
+            group_name = group.name
+
+        await cq.answer(
+            f"{group_name}: markup {shown if shown != '—' else 'global'}",
+            show_alert=False,
+        )
+        await self._show_groups_via_cq(cq)
 
     @_guard
     async def _do_setmarkup(self, msg: Message) -> None:
@@ -2270,6 +2552,11 @@ class TelegramBot:
             mapping = (await session.execute(
                 select(Mapping).where(Mapping.funpay_lot_id == lot_id)
             )).scalar_one_or_none()
+            group = (
+                await session.get(LotGroup, mapping.group_id)
+                if mapping is not None and mapping.group_id is not None
+                else None
+            )
 
         if mapping is None:
             await msg.answer(
@@ -2318,6 +2605,7 @@ class TelegramBot:
             self._funpay_client,
             effective_markup=eff_markup,
             effective_stock_cap=eff_stock_cap,
+            group=group,
         )
         if decision is None:
             await msg.answer(
@@ -2704,6 +2992,65 @@ class TelegramBot:
         await cq.answer("🗑 Маппинг удалён", show_alert=False)
         await self._refresh_mappings_view(cq)
 
+    @_guard
+    async def _act_group_open(self, cq: CallbackQuery, group: LotGroup) -> None:
+        async with session_factory()() as session:
+            groups = {
+                row.id: row.name
+                for row in (await session.execute(select(LotGroup))).scalars().all()
+            }
+            mappings = await list_mappings(
+                session, only_enabled=False, group_id=group.id
+            )
+            for mapping in mappings:
+                setattr(mapping, "_group_name", groups.get(mapping.group_id))
+        sid = self._sessions.put(
+            mappings,
+            title=group.name,
+            meta={"group_id": group.id, "group_name": group.name},
+        )
+        await self._render_paginated(cq, kind="group_mappings", sid=sid, page=0)
+
+    @_guard
+    async def _act_map_group(self, cq: CallbackQuery, mapping: Mapping) -> None:
+        async with session_factory()() as session:
+            groups = await list_lot_groups(session)
+            await session.commit()
+        sid = self._sessions.put(
+            groups,
+            title="assign group",
+            meta={
+                "mapping_id": mapping.id,
+                "mapping_label": ui.mapping_label(mapping, max_len=32),
+            },
+        )
+        await self._render_paginated(cq, kind="group_assign", sid=sid, page=0)
+
+    @_guard
+    async def _act_group_assign(self, cq: CallbackQuery, group: LotGroup) -> None:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 4:
+            await cq.answer("Некорректная команда группы", show_alert=True)
+            return
+        sid = parts[2]
+        sess = self._sessions.get(sid)
+        if sess is None:
+            await cq.answer("Сессия устарела", show_alert=True)
+            return
+        mapping_id = sess.meta.get("mapping_id")
+        if mapping_id is None:
+            await cq.answer("Не найден mapping_id", show_alert=True)
+            return
+        async with session_factory()() as session:
+            mapping = await session.get(Mapping, int(mapping_id))
+            if mapping is None:
+                await cq.answer("Маппинг не найден", show_alert=True)
+                return
+            await assign_mapping_group(session, mapping, group.id)
+            await session.commit()
+        await cq.answer(f"📁 Группа: {group.name}", show_alert=False)
+        await self._show_mappings_via_cq(cq)
+
     async def _refresh_mappings_view(self, cq: CallbackQuery) -> None:
         sid, total = await self._collect_mappings()
         if total == 0:
@@ -2717,6 +3064,11 @@ class TelegramBot:
         self, cq: CallbackQuery, *, funpay_lot_id: int, ns_service
     ) -> None:
         async with session_factory()() as session:
+            fp_label = self._target_labels.get(cq.from_user.id) or f"#{funpay_lot_id}"
+            group = await classify_lot_group(
+                session,
+                f"{fp_label} {getattr(ns_service, 'service_name', '')}",
+            )
             obj = await upsert_mapping(
                 session,
                 funpay_lot_id=funpay_lot_id,
@@ -2726,11 +3078,16 @@ class TelegramBot:
                 ns_fields_template='{"quantity":"@QUANTITY"}',
                 enabled=True,
                 label=str(ns_service.service_name)[:80],
+                group_id=group.id if group is not None else None,
             )
             await session.commit()
         svc_label = ui.short_title(ns_service.service_name, limit=40)
-        fp_label = self._target_labels.get(cq.from_user.id) or f"#{funpay_lot_id}"
         self._clear_target(cq.from_user.id)
+        group_line = (
+            f"📁 Группа: <b>{html.escape(group.name)}</b>\n"
+            if group is not None
+            else "📁 Группа: <i>не определена</i>\n"
+        )
         await cq.answer(
             f"✅ Замаппил «{fp_label}» → {svc_label}",
             show_alert=True,
@@ -2743,6 +3100,7 @@ class TelegramBot:
                 f"     ↓\n"
                 f"NS#{obj.ns_service_id} · "
                 f"<i>{html.escape(svc_label)}</i>\n\n"
+                f"{group_line}"
                 f"Markup: default ({self._settings.markup_percent}%)\n"
                 f"🎯 Цель сброшена — можно выбирать следующий лот.\n"
                 f"Запусти 🔄 Синхронизация чтобы применить.",
@@ -2759,6 +3117,7 @@ class TelegramBot:
         label: str | None,
     ) -> None:
         async with session_factory()() as session:
+            group = await classify_lot_group(session, label)
             obj = await upsert_mapping(
                 session,
                 funpay_lot_id=funpay_lot_id,
@@ -2768,6 +3127,7 @@ class TelegramBot:
                 ns_fields_template='{"quantity":"@QUANTITY"}',
                 enabled=True,
                 label=label,
+                group_id=group.id if group is not None else None,
             )
             await session.commit()
         markup_text = (
@@ -2777,6 +3137,7 @@ class TelegramBot:
             f"✅ <b>Маппинг сохранён</b>\n"
             f"FunPay <code>{obj.funpay_lot_id}</code> → NS#{obj.ns_service_id}\n"
             f"Markup: {markup_text}\n"
+            f"Группа: {html.escape(group.name) if group is not None else '—'}\n"
             f"Label: {html.escape(obj.label or '—')}\n\n"
             f"Запусти /sync чтобы применить.",
             reply_markup=ui.single_close_kb(),
@@ -2800,6 +3161,9 @@ class TelegramBot:
             "ns_cat_services": self._build_ns_cat_services_page,
             "lots": self._build_lots_page,
             "mappings": self._build_mappings_page,
+            "groups": self._build_groups_page,
+            "group_mappings": self._build_group_mappings_page,
+            "group_assign": self._build_group_assign_page,
             "orders": self._build_orders_page,
         }.get(kind)
         if builder is None:

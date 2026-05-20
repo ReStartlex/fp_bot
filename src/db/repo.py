@@ -8,15 +8,35 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import ChatState, FunpayChatCursor, FxRate, Mapping, Order, SyncRun
+from src.db.models import (
+    ChatState,
+    FunpayChatCursor,
+    FxRate,
+    LotGroup,
+    Mapping,
+    Order,
+    SyncRun,
+)
+from src.mapping.groups import (
+    DEFAULT_LOT_GROUPS,
+    group_keywords_to_text,
+    group_match_score,
+)
 
 
 # ---------- Mappings ----------
 
-async def list_mappings(session: AsyncSession, *, only_enabled: bool = True) -> list[Mapping]:
+async def list_mappings(
+    session: AsyncSession,
+    *,
+    only_enabled: bool = True,
+    group_id: int | None = None,
+) -> list[Mapping]:
     stmt = select(Mapping)
     if only_enabled:
         stmt = stmt.where(Mapping.enabled.is_(True))
+    if group_id is not None:
+        stmt = stmt.where(Mapping.group_id == group_id)
     stmt = stmt.order_by(Mapping.funpay_lot_id)
     result = await session.execute(stmt)
     return list(result.scalars().all())
@@ -32,6 +52,7 @@ async def upsert_mapping(
     ns_fields_template: str | None = None,
     enabled: bool = True,
     label: str | None = None,
+    group_id: int | None = None,
 ) -> Mapping:
     existing = await session.execute(
         select(Mapping).where(Mapping.funpay_lot_id == funpay_lot_id)
@@ -46,8 +67,89 @@ async def upsert_mapping(
     obj.ns_fields_template = ns_fields_template
     obj.enabled = enabled
     obj.label = label
+    if group_id is not None:
+        obj.group_id = group_id
     await session.flush()
     return obj
+
+
+# ---------- Lot groups ----------
+
+async def ensure_default_lot_groups(session: AsyncSession) -> list[LotGroup]:
+    result = await session.execute(select(LotGroup))
+    existing = {row.slug: row for row in result.scalars().all()}
+    changed: list[LotGroup] = []
+    for item in DEFAULT_LOT_GROUPS:
+        group = existing.get(item.slug)
+        if group is None:
+            group = LotGroup(
+                slug=item.slug,
+                name=item.name,
+                match_keywords=group_keywords_to_text(item.keywords),
+                markup_percent=item.markup_percent,
+                stock_cap=item.stock_cap,
+                sort_order=item.sort_order,
+                enabled=True,
+            )
+            session.add(group)
+            changed.append(group)
+            continue
+        group.name = group.name or item.name
+        if not group.match_keywords:
+            group.match_keywords = group_keywords_to_text(item.keywords)
+        group.sort_order = group.sort_order or item.sort_order
+    await session.flush()
+    return changed
+
+
+async def list_lot_groups(
+    session: AsyncSession, *, only_enabled: bool = False
+) -> list[LotGroup]:
+    await ensure_default_lot_groups(session)
+    stmt = select(LotGroup)
+    if only_enabled:
+        stmt = stmt.where(LotGroup.enabled.is_(True))
+    stmt = stmt.order_by(LotGroup.sort_order, LotGroup.name)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def find_lot_group_by_id(session: AsyncSession, group_id: int) -> LotGroup | None:
+    return await session.get(LotGroup, group_id)
+
+
+async def classify_lot_group(
+    session: AsyncSession, text: str | None
+) -> LotGroup | None:
+    groups = await list_lot_groups(session, only_enabled=True)
+    scored = [
+        (group_match_score(text, group.match_keywords), group)
+        for group in groups
+    ]
+    scored = [(score, group) for score, group in scored if score > 0]
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (item[0], -item[1].sort_order), reverse=True)
+    return scored[0][1]
+
+
+async def assign_mapping_group(
+    session: AsyncSession, mapping: Mapping, group_id: int | None
+) -> Mapping:
+    mapping.group_id = group_id
+    await session.flush()
+    return mapping
+
+
+async def set_lot_group_markup(
+    session: AsyncSession, group_id: int, markup_percent: float | None
+) -> LotGroup | None:
+    group = await find_lot_group_by_id(session, group_id)
+    if group is None:
+        return None
+    group.markup_percent = markup_percent
+    await session.flush()
+    return group
 
 
 # ---------- FX rates ----------

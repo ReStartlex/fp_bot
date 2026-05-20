@@ -26,6 +26,7 @@ MENU_KIND_STATUS = "status"
 MENU_KIND_BALANCE = "balance"
 MENU_KIND_LOTS = "lots"
 MENU_KIND_MAPS = "mappings"
+MENU_KIND_GROUPS = "groups"
 MENU_KIND_NS_CATS = "ns_cats"
 MENU_KIND_NS_SEARCH = "ns_search_hint"
 MENU_KIND_SYNC = "sync"
@@ -58,19 +59,22 @@ def main_menu(target_lot_label: str | None = None) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🗺 Маппинги", callback_data=f"menu:{MENU_KIND_MAPS}"),
         ],
         [
+            InlineKeyboardButton(text="📁 Группы лотов", callback_data=f"menu:{MENU_KIND_GROUPS}"),
             InlineKeyboardButton(text="🗂 Каталог NS", callback_data=f"menu:{MENU_KIND_NS_CATS}"),
+        ],
+        [
             InlineKeyboardButton(
                 text="🔍 Поиск NS", callback_data=f"menu:{MENU_KIND_NS_SEARCH}"
             ),
-        ],
-        [
             InlineKeyboardButton(text="🔄 Синхронизация", callback_data=f"menu:{MENU_KIND_SYNC}"),
-            InlineKeyboardButton(text="📦 Заказы", callback_data=f"menu:{MENU_KIND_ORDERS}"),
         ],
         [
+            InlineKeyboardButton(text="📦 Заказы", callback_data=f"menu:{MENU_KIND_ORDERS}"),
             InlineKeyboardButton(
                 text="🔌 FunPay reconnect", callback_data=f"menu:{MENU_KIND_RECONNECT}"
             ),
+        ],
+        [
             InlineKeyboardButton(text="❓ Помощь", callback_data=f"menu:{MENU_KIND_HELP}"),
         ],
     ])
@@ -317,9 +321,25 @@ def format_mapping_line(m: Any) -> str:
     markup = _format_markup_percent(m.markup_percent)
     label = short_title(getattr(m, "label", None), limit=60)
     title = f" — {label}" if label else ""
+    group = getattr(m, "_group_name", None)
+    group_text = f" · group <b>{short_title(group, 24)}</b>" if group else ""
     return (
         f"{status} <code>{m.funpay_lot_id}</code> → "
-        f"NS#{m.ns_service_id}{title} · markup <b>{markup}</b>"
+        f"NS#{m.ns_service_id}{title} · markup <b>{markup}</b>{group_text}"
+    )
+
+
+def format_lot_group_line(group: Any) -> str:
+    status = "✅" if getattr(group, "enabled", True) else "⏸"
+    name = short_title(getattr(group, "name", None), limit=48)
+    markup = _format_markup_percent(getattr(group, "markup_percent", None))
+    stock_cap = getattr(group, "stock_cap", None)
+    count = getattr(group, "_mappings_count", 0)
+    active = getattr(group, "_active_mappings_count", 0)
+    stock = stock_cap if stock_cap is not None else "global"
+    return (
+        f"{status} <b>{name}</b>\n"
+        f"   markup <b>{markup}</b> · stock <b>{stock}</b> · lots <b>{active}/{count}</b>"
     )
 
 

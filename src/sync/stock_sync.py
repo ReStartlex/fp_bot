@@ -18,9 +18,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from loguru import logger
+from sqlalchemy import select
 
 from src.config import Settings, get_settings
 from src.config_runtime import get_global_markup_percent, get_stock_cap
+from src.db.models import LotGroup
 from src.db.repo import finish_sync_run, list_mappings, start_sync_run
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
@@ -62,6 +64,7 @@ async def _decide_for_one(
     *,
     effective_markup: float | None = None,
     effective_stock_cap: int | None = None,
+    group: LotGroup | None = None,
 ) -> LotSyncDecision | None:
     """Решить что делать с конкретным лотом."""
     if ns_service is None:
@@ -85,6 +88,8 @@ async def _decide_for_one(
         fx_rate_usd_to_target=fx_rate,
         default_markup=effective_markup,
         default_stock_cap=effective_stock_cap,
+        group_markup_percent=group.markup_percent if group is not None else None,
+        group_stock_cap=group.stock_cap if group is not None else None,
     )
 
     # Читаем текущее состояние лота на FunPay
@@ -264,6 +269,13 @@ async def sync_once(
     try:
         async with session_factory()() as session:
             mappings = await list_mappings(session, only_enabled=True)
+            group_ids = {m.group_id for m in mappings if m.group_id is not None}
+            groups_by_id: dict[int, LotGroup] = {}
+            if group_ids:
+                result = await session.execute(
+                    select(LotGroup).where(LotGroup.id.in_(group_ids))
+                )
+                groups_by_id = {g.id: g for g in result.scalars().all()}
 
         if not mappings:
             logger.debug("Маппингов нет — нечего синхронизировать.")
@@ -293,6 +305,9 @@ async def sync_once(
                 ns_service, mapping, settings, fx_rate, funpay_client,
                 effective_markup=effective_markup,
                 effective_stock_cap=effective_stock_cap,
+                group=groups_by_id.get(mapping.group_id)
+                if mapping.group_id is not None
+                else None,
             )
             if decision is not None:
                 decisions.append(decision)

@@ -40,6 +40,8 @@ def compute_pricing(
     fx_rate_usd_to_target: float,
     default_markup: float | None = None,
     default_stock_cap: int | None = None,
+    group_markup_percent: float | None = None,
+    group_stock_cap: int | None = None,
 ) -> PricingResult:
     """
     Рассчитать что нужно выставить на FunPay для данного NS service + mapping.
@@ -53,6 +55,8 @@ def compute_pricing(
     """
     if mapping.markup_percent is not None:
         markup = mapping.markup_percent
+    elif group_markup_percent is not None:
+        markup = group_markup_percent
     elif default_markup is not None:
         markup = default_markup
     else:
@@ -60,6 +64,8 @@ def compute_pricing(
 
     if mapping.stock_cap is not None:
         stock_cap = mapping.stock_cap
+    elif group_stock_cap is not None:
+        stock_cap = group_stock_cap
     elif default_stock_cap is not None:
         stock_cap = default_stock_cap
     else:

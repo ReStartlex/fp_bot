@@ -13,6 +13,23 @@ class Base(DeclarativeBase):
     pass
 
 
+class LotGroup(Base):
+    """Группа лотов: промежуточный уровень правил между global и mapping."""
+    __tablename__ = "lot_groups"
+    __table_args__ = (UniqueConstraint("slug", name="uq_lot_groups_slug"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    match_keywords: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    markup_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    stock_cap: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
 class Mapping(Base):
     """Связка FunPay лот -> NS service_id + правила цены/стока."""
     __tablename__ = "mappings"
@@ -25,6 +42,7 @@ class Mapping(Base):
     # Опциональные override глобальных настроек:
     markup_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     stock_cap: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    group_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     # Шаблон fields для NS create_order. JSON-строка.
     # Например: '{"quantity": "@QUANTITY"}'. @QUANTITY = количество из FunPay-заказа.

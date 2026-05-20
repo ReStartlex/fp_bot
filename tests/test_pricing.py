@@ -60,6 +60,44 @@ def test_pricing_mapping_overrides_markup():
     assert res.markup_percent == 20.0
 
 
+def test_pricing_group_markup_between_mapping_and_global():
+    res = compute_pricing(
+        ns_service=_svc(price=2.0),
+        mapping=_map(markup=None),
+        settings=_S(),  # type: ignore[arg-type]
+        fx_rate_usd_to_target=90.0,
+        default_markup=6.0,
+        group_markup_percent=12.5,
+    )
+    assert res.price_target == pytest.approx(2 * 90 * 1.125)
+    assert res.markup_percent == 12.5
+
+
+def test_pricing_mapping_markup_overrides_group_markup():
+    res = compute_pricing(
+        ns_service=_svc(price=2.0),
+        mapping=_map(markup=5.0),
+        settings=_S(),  # type: ignore[arg-type]
+        fx_rate_usd_to_target=90.0,
+        default_markup=6.0,
+        group_markup_percent=12.5,
+    )
+    assert res.price_target == pytest.approx(2 * 90 * 1.05)
+    assert res.markup_percent == 5.0
+
+
+def test_pricing_group_stock_cap_between_mapping_and_global():
+    res = compute_pricing(
+        ns_service=_svc(in_stock=500),
+        mapping=_map(cap=None),
+        settings=_S(),  # type: ignore[arg-type]
+        fx_rate_usd_to_target=90.0,
+        default_stock_cap=100,
+        group_stock_cap=20,
+    )
+    assert res.stock == 20
+
+
 def test_pricing_stock_cap_override():
     res = compute_pricing(
         ns_service=_svc(in_stock=10),

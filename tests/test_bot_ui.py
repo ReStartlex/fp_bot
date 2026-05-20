@@ -55,6 +55,17 @@ class FakeOrder:
     ns_custom_id: str | None
 
 
+@dataclass
+class FakeGroup:
+    id: int
+    name: str
+    enabled: bool = True
+    markup_percent: float | None = None
+    stock_cap: int | None = None
+    _mappings_count: int = 0
+    _active_mappings_count: int = 0
+
+
 # ─────────────── главное меню ───────────────
 
 
@@ -81,6 +92,7 @@ def test_main_menu_without_target_has_no_clear_button():
     kb = ui.main_menu(target_lot_label=None)
     flat = [b for row in kb.inline_keyboard for b in row]
     assert not any(b.callback_data == "target:clear" for b in flat)
+    assert any(b.callback_data == f"menu:{ui.MENU_KIND_GROUPS}" for b in flat)
 
 
 def test_pagination_row_when_single_page():
@@ -271,6 +283,29 @@ def test_lots_page_name_button_is_noop_not_target():
     assert rows[0][0].callback_data == "noop"
     callbacks = [button.callback_data for row in rows for button in row]
     assert "act:fp_target:abcd:0" in callbacks
+
+
+def test_groups_page_has_markup_controls():
+    bot = object.__new__(TelegramBot)
+    sess = type("Sess", (), {"items": [
+        FakeGroup(
+            id=1,
+            name="Battle.net",
+            markup_percent=12.5,
+            _mappings_count=3,
+            _active_mappings_count=2,
+        )
+    ]})()
+
+    text, kb = bot._build_groups_page(  # type: ignore[attr-defined]
+        sess, "abcd", sess.items, 0, 1
+    )
+
+    assert "Battle.net" in text
+    callbacks = [button.callback_data for row in kb.inline_keyboard for button in row]
+    assert "act:group_open:abcd:0" in callbacks
+    assert "group:markup_set:1:12.5" in callbacks
+    assert "group:markup_default:1" in callbacks
 
 
 def test_clear_target_removes_menu_target_state():
