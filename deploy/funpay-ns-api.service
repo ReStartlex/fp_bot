@@ -1,0 +1,33 @@
+[Unit]
+Description=NS.gifts <-> FunPay admin Web API
+After=network-online.target
+Wants=network-online.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+[Service]
+Type=simple
+User=bot
+Group=bot
+WorkingDirectory=/opt/funpay-ns-bot
+EnvironmentFile=/opt/funpay-ns-bot/.env
+ExecStart=/opt/funpay-ns-bot/.venv/bin/python -m src.api.main
+Restart=always
+RestartSec=10
+KillSignal=SIGTERM
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+# Безопасность
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/funpay-ns-bot/data /opt/funpay-ns-bot/logs
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

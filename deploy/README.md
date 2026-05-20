@@ -15,7 +15,8 @@ bash /opt/funpay-ns-bot/deploy/bootstrap.sh
 ```
 
 `bootstrap.sh` ставит python, venv, зависимости, создаёт пользователя `bot`,
-настраивает `ufw` (22/tcp, 443/tcp) и `fail2ban`, регистрирует systemd-unit.
+настраивает `ufw` (22/tcp, 443/tcp) и `fail2ban`, регистрирует systemd-units
+для бота и отдельного Web API.
 
 ### `.env` на сервере
 
@@ -56,6 +57,36 @@ journalctl -u funpay-ns-bot -f
 В Telegram должно прийти сообщение `Бот запущен ✅`. После этого писать боту
 `/help` — он отвечает справкой.
 
+## Web API для будущего сайта
+
+API запускается отдельным сервисом `funpay-ns-api` и не влияет на основной
+бот. По умолчанию он слушает только `127.0.0.1:8080`; не открывай порт наружу
+напрямую. Для публичного сайта позже ставим reverse proxy с HTTPS.
+
+В `.env` должны быть:
+
+```bash
+WEB_API_ENABLED=true
+WEB_API_HOST=127.0.0.1
+WEB_API_PORT=8080
+WEB_API_TOKEN=<длинный_случайный_токен>
+```
+
+Запуск:
+
+```bash
+systemctl daemon-reload
+systemctl enable --now funpay-ns-api
+systemctl status funpay-ns-api --no-pager
+sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.check_web_api
+```
+
+Логи:
+
+```bash
+journalctl -u funpay-ns-api -f
+```
+
 ## Обновление кода
 
 ```bash
@@ -64,6 +95,8 @@ bash /opt/funpay-ns-bot/deploy/update.sh
 
 Скрипт скачивает свежий tarball через `gh-proxy.com` (обход блокировки
 GitHub с Timeweb), обновляет зависимости, перезапускает systemd-сервис.
+Если `funpay-ns-api` уже был включён или запущен, `update.sh` также аккуратно
+остановит и поднимет API после обновления.
 
 ## Обновление cookies FunPay
 

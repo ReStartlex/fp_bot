@@ -44,9 +44,13 @@ chmod 600 "${ENV_FILE}"
 echo "==> Установка systemd-юнита"
 if [[ -f "${APP_DIR}/deploy/funpay-ns-bot.service" ]]; then
     cp "${APP_DIR}/deploy/funpay-ns-bot.service" /etc/systemd/system/funpay-ns-bot.service
-    systemctl daemon-reload
     echo "    Юнит установлен. Для автозапуска: systemctl enable --now funpay-ns-bot"
 fi
+if [[ -f "${APP_DIR}/deploy/funpay-ns-api.service" ]]; then
+    cp "${APP_DIR}/deploy/funpay-ns-api.service" /etc/systemd/system/funpay-ns-api.service
+    echo "    API-юнит установлен. Для запуска: systemctl enable --now funpay-ns-api"
+fi
+systemctl daemon-reload
 
 echo
 echo "============================================================"

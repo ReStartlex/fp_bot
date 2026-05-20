@@ -44,6 +44,12 @@ fi
 # фоновой подмены файлов SQLite видит "файл удалён" и переключается
 # в read-only режим (отсюда наш "attempt to write a readonly database").
 SERVICE_WAS_RUNNING=0
+API_WAS_RUNNING=0
+if systemctl is-active --quiet funpay-ns-api 2>/dev/null; then
+    echo "==> Останавливаю funpay-ns-api до обновления кода"
+    systemctl stop funpay-ns-api
+    API_WAS_RUNNING=1
+fi
 if systemctl is-active --quiet funpay-ns-bot 2>/dev/null; then
     echo "==> Останавливаю funpay-ns-bot до обновления кода"
     systemctl stop funpay-ns-bot
@@ -87,6 +93,15 @@ chmod 600 "${APP_DIR}/.env" 2>/dev/null || true
 find "${APP_DIR}/data" -type f \( -name 'bridge.db' -o -name 'bridge.db-*' \) \
     -exec chmod 600 {} \; 2>/dev/null || true
 
+# Обновляем systemd units, если они появились/изменились в свежем коде.
+if [[ -f "${APP_DIR}/deploy/funpay-ns-bot.service" ]]; then
+    cp "${APP_DIR}/deploy/funpay-ns-bot.service" /etc/systemd/system/funpay-ns-bot.service
+fi
+if [[ -f "${APP_DIR}/deploy/funpay-ns-api.service" ]]; then
+    cp "${APP_DIR}/deploy/funpay-ns-api.service" /etc/systemd/system/funpay-ns-api.service
+fi
+systemctl daemon-reload
+
 # 5. Запускаем (или перезапускаем) сервис.
 if systemctl is-enabled --quiet funpay-ns-bot 2>/dev/null \
    || [[ "${SERVICE_WAS_RUNNING}" -eq 1 ]]; then
@@ -98,6 +113,19 @@ if systemctl is-enabled --quiet funpay-ns-bot 2>/dev/null \
         echo "── ВНИМАНИЕ: сервис не поднялся, последние 60 строк лога ──"
         journalctl -u funpay-ns-bot -n 60 --no-pager
         echo "──────────────────────────────────────────────────────────"
+    fi
+fi
+
+if systemctl is-enabled --quiet funpay-ns-api 2>/dev/null \
+   || [[ "${API_WAS_RUNNING}" -eq 1 ]]; then
+    systemctl start funpay-ns-api
+    echo "Сервис funpay-ns-api запущен."
+    sleep 2
+    if ! systemctl is-active --quiet funpay-ns-api; then
+        echo
+        echo "── ВНИМАНИЕ: API сервис не поднялся, последние 60 строк лога ──"
+        journalctl -u funpay-ns-api -n 60 --no-pager
+        echo "────────────────────────────────────────────────────────────"
     fi
 fi
 

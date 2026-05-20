@@ -62,8 +62,11 @@ systemctl restart fail2ban
 echo "==> 6/6 systemd-юнит"
 if [[ -f "${APP_DIR}/deploy/funpay-ns-bot.service" ]]; then
     cp "${APP_DIR}/deploy/funpay-ns-bot.service" /etc/systemd/system/funpay-ns-bot.service
-    systemctl daemon-reload
 fi
+if [[ -f "${APP_DIR}/deploy/funpay-ns-api.service" ]]; then
+    cp "${APP_DIR}/deploy/funpay-ns-api.service" /etc/systemd/system/funpay-ns-api.service
+fi
+systemctl daemon-reload
 
 echo
 echo "============================================================"

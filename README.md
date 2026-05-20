@@ -40,6 +40,7 @@
 - `httpx`, `pydantic-settings`, `SQLAlchemy 2 async + aiosqlite`, `APScheduler`,
   `loguru`, `pyotp`
 - `aiogram 3.x` — Telegram-бот
+- `FastAPI + uvicorn` — отдельный Web API для будущей админки
 - `FunPayAPI` (неофициальная) — взаимодействие с FunPay через cookies
 
 ## Структура
@@ -58,6 +59,8 @@
 │   ├── mapping/          # связки funpay_lot_id ⇄ ns_service_id, цены
 │   ├── sync/             # синхронизатор каталога, курс
 │   ├── orders/           # пайплайн заказов
+│   ├── services/         # application services для Telegram/Web API
+│   ├── api/              # FastAPI backend для будущего сайта
 │   ├── chat/             # шаблоны, рабочие часы, реакции на сообщения
 │   ├── alerts/           # Telegram: нотификации и интерактивный бот
 │   └── tools/            # CLI-утилиты (проверки, импорт, диагностика)
@@ -85,6 +88,7 @@ copy .env.example .env
 - `MARKUP_PERCENT`, `FUNPAY_CURRENCY`, `USD_RUB_RATE_MODE`, `USD_RUB_RATE` —
   ценообразование.
 - `TELEGRAM_*` — bot token, chat id, прокси при необходимости.
+- `WEB_API_*` — отдельный защищённый API для будущего сайта.
 - `CHAT_*`, `WORK_HOURS_*` — поведение чата с покупателем.
 - `ENABLE_REAL_ACTIONS` — главный предохранитель. Пока `false`, все «опасные»
   действия (оплата на NS, изменения на FunPay) идут в dry-run.
@@ -106,6 +110,9 @@ python -m src.tools.discover_chat_id
 # полный процесс (sync + watcher + Telegram-бот)
 python -m src.main
 
+# отдельный Web API для будущего сайта
+python -m src.api.main
+
 # тесты
 python -m pytest tests/ -q
 ```
@@ -118,6 +125,7 @@ python -m pytest tests/ -q
 | `src.tools.check_funpay` | Авторизация FunPay, проверка cookies, диагностика API |
 | `src.tools.check_fx` | Курс USD→RUB (auto/manual) |
 | `src.tools.check_telegram` | Тестовое сообщение в Telegram |
+| `src.tools.check_web_api` | Smoke-проверка локального Web API |
 | `src.tools.discover_chat_id` | Узнать свой chat_id по первому сообщению боту |
 | `src.tools.list_funpay_lots` | Список твоих лотов на FunPay (для маппингов) |
 | `src.tools.import_mappings <csv>` | Импорт маппингов из CSV в БД |
@@ -197,6 +205,14 @@ bash /opt/funpay-ns-bot/deploy/update.sh        # обновить код
 systemctl daemon-reload
 systemctl enable --now funpay-ns-bot
 journalctl -u funpay-ns-bot -f
+```
+
+Web API запускается отдельным сервисом и по умолчанию слушает только
+`127.0.0.1:8080`; наружу его нужно выпускать только через reverse proxy с TLS:
+
+```bash
+systemctl enable --now funpay-ns-api
+sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.check_web_api
 ```
 
 ## Безопасность
