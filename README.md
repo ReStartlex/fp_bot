@@ -217,12 +217,15 @@ sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.check_web_api
 
 Админка сайта уже встроена в этот же сервис: открой `/` на Web API, вставь
 `WEB_API_TOKEN` и увидишь Dashboard, Orders, Problems, Mappings и Profit.
-До настройки reverse proxy безопасный доступ удобнее делать через SSH tunnel:
+Если прямой SSH/туннель к VPS режется оператором, подними Cloudflare Tunnel:
 
 ```bash
-ssh -L 8080:127.0.0.1:8080 root@VPS_IP
-# затем локально открыть http://127.0.0.1:8080
+CLOUDFLARE_TUNNEL_TOKEN='<token_из_Cloudflare>' \
+  bash /opt/funpay-ns-bot/deploy/install_cloudflare_tunnel.sh
 ```
+
+В Cloudflare Public Hostname service должен указывать на
+`http://127.0.0.1:8080`.
 
 ## Безопасность
 

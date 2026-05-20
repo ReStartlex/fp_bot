@@ -31,3 +31,22 @@ def test_deploy_docs_include_api_smoke_check():
     assert "funpay-ns-api" in docs
     assert "src.tools.check_web_api" in docs
     assert "WEB_API_TOKEN" in docs
+
+
+def test_cloudflare_tunnel_script_installs_cloudflared_service():
+    script = (ROOT / "deploy" / "install_cloudflare_tunnel.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "CLOUDFLARE_TUNNEL_TOKEN" in script
+    assert "cloudflared service install" in script
+    assert "http://127.0.0.1:8080" in script
+    assert "src.tools.check_web_api" in script
+
+
+def test_deploy_docs_explain_cloudflare_tunnel_access():
+    docs = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
+
+    assert "Cloudflare Tunnel" in docs
+    assert "deploy/install_cloudflare_tunnel.sh" in docs
+    assert "http://127.0.0.1:8080" in docs

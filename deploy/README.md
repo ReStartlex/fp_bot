@@ -61,7 +61,7 @@ journalctl -u funpay-ns-bot -f
 
 API запускается отдельным сервисом `funpay-ns-api` и не влияет на основной
 бот. По умолчанию он слушает только `127.0.0.1:8080`; не открывай порт наружу
-напрямую. Для публичного сайта позже ставим reverse proxy с HTTPS.
+напрямую.
 
 В `.env` должны быть:
 
@@ -85,12 +85,34 @@ sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.check_web_api
 браузер сохраняет `WEB_API_TOKEN` в localStorage и отправляет его как
 `Authorization: Bearer ...`.
 
-До reverse proxy можно открыть панель через SSH tunnel:
+### Доступ без SSH через Cloudflare Tunnel
 
-```bash
-ssh -L 8080:127.0.0.1:8080 root@VPS_IP
-# на локальном компьютере: http://127.0.0.1:8080
-```
+Если твой оператор режет SSH/прямые подключения к VPS, используй Cloudflare
+Tunnel. Это безопаснее для текущей схемы: входящие порты на VPS не нужны,
+`funpay-ns-api` остаётся на `127.0.0.1`, а наружу выходит только домен
+Cloudflare.
+
+1. В Cloudflare добавь домен и включи Zero Trust.
+2. Zero Trust → Networks → Tunnels → Create tunnel → Cloudflared.
+3. Создай Public Hostname, например `panel.example.com`.
+4. В Service укажи:
+   ```text
+   http://127.0.0.1:8080
+   ```
+5. Скопируй tunnel token и на VPS выполни:
+   ```bash
+   cd /opt/funpay-ns-bot
+   CLOUDFLARE_TUNNEL_TOKEN='<token_из_Cloudflare>' \
+     bash deploy/install_cloudflare_tunnel.sh
+   ```
+6. Проверка:
+   ```bash
+   systemctl status cloudflared --no-pager -l
+   journalctl -u cloudflared -f
+   ```
+
+После этого открывай `https://panel.example.com`, вставляй `WEB_API_TOKEN`
+в админке и работай через сайт.
 
 Логи:
 
