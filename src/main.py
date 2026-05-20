@@ -364,11 +364,11 @@ class App:
             order = await find_order_by_funpay_id(session, funpay_order_id)
             if order is None:
                 return {"status": "not_found", "reason": "order not found"}
-            if order.status != "pins_ready":
+            if order.status not in ("pins_ready", "manual_hold"):
                 return {
                     "status": "skipped",
                     "reason": (
-                        "retry поддержан только для pins_ready, "
+                        "retry поддержан только для pins_ready/manual_hold, "
                         f"сейчас {order.status}"
                     ),
                 }
@@ -389,6 +389,7 @@ class App:
             ns_client=self.ns,
             funpay_client=self.fp,
             telegram=self.tg,
+            force_delivery=True,
         )
 
     # ---------- Health ----------

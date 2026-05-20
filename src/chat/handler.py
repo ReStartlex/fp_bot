@@ -21,6 +21,7 @@ from src.chat.schedule import WorkingHours
 from src.config import Settings, get_settings
 from src.db.repo import (
     get_or_create_chat_state,
+    hold_active_orders_for_chat,
     mark_greeted,
     mark_help_requested,
 )
@@ -310,17 +311,33 @@ class ChatHandler:
                 buyer_username=event.author_username,
             )
             await mark_help_requested(session, state)
+            held_orders = await hold_active_orders_for_chat(
+                session,
+                chat_id=event.chat_id,
+                reason=(
+                    "manual_hold: покупатель вызвал !помощь; "
+                    "автовыдача остановлена, чтобы не продублировать ручную выдачу"
+                ),
+            )
             await session.commit()
 
         # Telegram-алерт владельцу
         if self._tg is not None:
             urgency = "" if working_now else " 🌙 (вне рабочих часов!)"
             link = _shortlink(event.chat_id, event.author_username)
+            hold_line = ""
+            if held_orders:
+                ids = ", ".join(f"#{order.funpay_order_id}" for order in held_orders[:5])
+                hold_line = (
+                    "\n🛑 <b>Автовыдача остановлена</b> для активных заказов: "
+                    f"<code>{ids}</code>\n"
+                    "Проверь /problems перед повторной выдачей."
+                )
             await self._tg.send(
                 f"🆘 <b>Покупатель просит помощь</b>{urgency}\n"
                 f"От: @{event.author_username or '—'}\n"
                 f"Сообщение: <code>{event.text[:300]}</code>\n"
-                f"Чат: {link}"
+                f"Чат: {link}{hold_line}"
             )
 
     async def _maybe_greet(

@@ -253,7 +253,7 @@ async def update_order(session: AsyncSession, order: Order, **fields: Any) -> Or
     return order
 
 
-ACTIVE_ORDER_STATUSES = ("received", "ns_created", "ns_paid", "pins_ready")
+ACTIVE_ORDER_STATUSES = ("received", "ns_created", "ns_paid", "pins_ready", "manual_hold")
 
 
 async def reserved_quantities_by_service(
@@ -289,6 +289,34 @@ async def list_reconcilable_orders(
     )
     result = await session.execute(stmt)
     return list(result.scalars().all())
+
+
+async def hold_active_orders_for_chat(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    reason: str,
+) -> list[Order]:
+    """
+    Перевести активные заказы чата в ручной hold.
+
+    Это защита от двойной выдачи: если покупатель написал !помощь и оператор
+    подключился вручную, автоматическая доставка больше не должна "догонять"
+    этот чат без явного решения оператора.
+    """
+    stmt = (
+        select(Order)
+        .where(Order.chat_id == chat_id)
+        .where(Order.status.in_(ACTIVE_ORDER_STATUSES))
+        .order_by(Order.updated_at.desc())
+    )
+    orders = list((await session.execute(stmt)).scalars().all())
+    for order in orders:
+        if order.status != "manual_hold":
+            order.status = "manual_hold"
+        order.error = reason
+    await session.flush()
+    return orders
 
 
 # ---------- Chat state ----------

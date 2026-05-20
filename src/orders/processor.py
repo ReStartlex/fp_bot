@@ -291,6 +291,28 @@ def _pins_from_order(order: Order) -> list:
     return data if isinstance(data, list) else []
 
 
+async def _should_hold_delivery(session, order: Order) -> bool:
+    """
+    True если перед доставкой нужно остановиться и отдать заказ оператору.
+
+    Защита от двойной выдачи: покупатель пишет !помощь, оператор может уже
+    выдать товар руками, поэтому автодоставка после этого запрещена.
+    """
+    if order.status == "manual_hold":
+        return True
+    if order.chat_id is None:
+        return False
+    from src.db.models import ChatState
+
+    state = await session.get(ChatState, order.chat_id)
+    if state is None or state.last_help_request_at is None:
+        return False
+    created_at = order.created_at
+    # SQLite server_default в тестах иногда отдаёт naive datetime — сравниваем
+    # naive UTC, как и остальной код в проекте.
+    return state.last_help_request_at >= created_at
+
+
 async def process_funpay_order(
     event: FunPayOrderEvent,
     *,
@@ -299,6 +321,7 @@ async def process_funpay_order(
     funpay_client: FunPayClient | None = None,
     telegram: TelegramNotifier | None = None,
     dry_run: bool | None = None,
+    force_delivery: bool = False,
 ) -> dict:
     """
     Главный pipeline. Идемпотентный и сериализованный по funpay_order_id.
@@ -311,7 +334,8 @@ async def process_funpay_order(
 
     async with _lock_for(event.funpay_order_id):
         return await _process_locked(
-            event, settings, ns_client, funpay_client, telegram, dry_run, log
+            event, settings, ns_client, funpay_client, telegram, dry_run, log,
+            force_delivery=force_delivery,
         )
 
 
@@ -323,6 +347,8 @@ async def _process_locked(
     telegram: TelegramNotifier | None,
     dry_run: bool,
     log,
+    *,
+    force_delivery: bool = False,
 ) -> dict:
     if event.chat_id is None:
         resolved_chat_id = await _resolve_chat_id(event, funpay_client, log)
@@ -345,18 +371,27 @@ async def _process_locked(
             "skipped": True,
             "ns_custom_id": existing.ns_custom_id,
         }
+    if existing is not None and existing.status == "manual_hold" and not force_delivery:
+        log.warning("Заказ на ручной проверке, автоматическую выдачу не продолжаю")
+        return {
+            "status": "manual_hold",
+            "skipped": True,
+            "reason": existing.error or "manual hold",
+            "ns_custom_id": existing.ns_custom_id,
+        }
 
     # ─── 2. Доставка только-pins (без обращения к NS) ───
     # Случай: pins_ready — деньги списаны, коды есть, но send_message
     # клиенту в прошлый раз упал. Просто повторяем доставку.
-    if existing is not None and existing.status == "pins_ready":
+    if existing is not None and existing.status in ("pins_ready", "manual_hold"):
         pins = _pins_from_order(existing)
         if pins:
             log.warning(
-                f"Повторная доставка pins_ready: {len(pins)} код(а/ов)"
+                f"Повторная доставка {existing.status}: {len(pins)} код(а/ов)"
             )
             return await _deliver_pins(
-                event, existing, pins, funpay_client, telegram, log
+                event, existing, pins, funpay_client, telegram, log,
+                force_delivery=force_delivery,
             )
         log.error("pins_ready без pins_json — пометить failed")
         await _mark_failed(
@@ -593,6 +628,30 @@ async def _process_locked(
         async with session_factory()() as session:
             db_order = await find_order_by_funpay_id(session, event.funpay_order_id)
             assert db_order is not None
+            if not force_delivery and await _should_hold_delivery(session, db_order):
+                await update_order(
+                    session,
+                    db_order,
+                    pins=pins,
+                    status="manual_hold",
+                    error=(
+                        "manual_hold: покупатель вызвал !помощь до доставки; "
+                        "pins сохранены, автоматическая выдача остановлена"
+                    ),
+                )
+                await session.commit()
+                if telegram is not None:
+                    await telegram.warning(
+                        f"🛑 Заказ <code>{event.funpay_order_id}</code> "
+                        "поставлен на ручную проверку после !помощь. "
+                        "Pins сохранены, покупателю автоматически не отправлены."
+                    )
+                return {
+                    "status": "manual_hold",
+                    "ns_custom_id": ns_custom_id,
+                    "pins_count": len(pins),
+                    "reason": "help requested before delivery",
+                }
             await update_order(session, db_order, status="pins_ready", pins=pins)
             await session.commit()
         log.info(f"NS pins получены ({len(pins)} шт), статус pins_ready")
@@ -604,6 +663,7 @@ async def _process_locked(
         return await _deliver_pins(
             event, db_order, pins, funpay_client, telegram, log,
             ns_custom_id=ns_custom_id, ns_price_usd=ns_price_usd,
+            force_delivery=force_delivery,
         )
 
     finally:
@@ -621,6 +681,7 @@ async def _deliver_pins(
     *,
     ns_custom_id: str | None = None,
     ns_price_usd: float | None = None,
+    force_delivery: bool = False,
 ) -> dict:
     """
     Шаг доставки: отправляет коды в чат FunPay, обновляет статус.
@@ -629,6 +690,35 @@ async def _deliver_pins(
     """
     ns_custom_id = ns_custom_id or db_order.ns_custom_id
     ns_price_usd = ns_price_usd if ns_price_usd is not None else db_order.ns_price_usd
+
+    async with session_factory()() as session:
+        latest = await find_order_by_funpay_id(session, event.funpay_order_id)
+        if (
+            latest is not None
+            and not force_delivery
+            and await _should_hold_delivery(session, latest)
+        ):
+            await update_order(
+                session,
+                latest,
+                status="manual_hold",
+                error=(
+                    latest.error
+                    or "manual_hold: покупатель вызвал !помощь; автодоставка остановлена"
+                ),
+            )
+            await session.commit()
+            if telegram is not None:
+                await telegram.warning(
+                    f"🛑 Не отправляю pins по заказу "
+                    f"<code>{event.funpay_order_id}</code>: активна ручная проверка."
+                )
+            return {
+                "status": "manual_hold",
+                "ns_custom_id": ns_custom_id,
+                "pins_count": len(pins),
+                "reason": "manual hold",
+            }
 
     delivery_text = templates.delivery(event.buyer_username or "друг", pins)
 

@@ -38,6 +38,7 @@ from src.db.models import KnownLot, LotGroup, Mapping, Order, SyncRun
 from src.db.repo import (
     assign_mapping_group,
     classify_lot_group,
+    find_order_by_funpay_id,
     list_mappings,
     list_lot_groups,
     upsert_mapping,
@@ -1028,6 +1029,8 @@ class TelegramBot:
             await self._act_group_assign(cq, item)
         elif kind == "order_retry":
             await self._act_order_retry(cq, item)
+        elif kind == "order_manual_done":
+            await self._act_order_manual_done(cq, item)
         elif kind == "problem_force_sync":
             await self._act_problem_force_sync(cq, item)
         elif kind == "problem_enable_mapping":
@@ -1465,11 +1468,18 @@ class TelegramBot:
         for local_idx, order in enumerate(page_items):
             global_idx = page * PAGE_SIZE + local_idx
             row: list[InlineKeyboardButton] = []
-            if order.status == "pins_ready":
+            if order.status in ("pins_ready", "manual_hold"):
                 row.append(
                     InlineKeyboardButton(
                         text=f"🔁 Retry #{order.funpay_order_id}",
                         callback_data=f"act:order_retry:{sid}:{global_idx}",
+                    )
+                )
+            if order.status == "manual_hold":
+                row.append(
+                    InlineKeyboardButton(
+                        text="✅ Уже выдал руками",
+                        callback_data=f"act:order_manual_done:{sid}:{global_idx}",
                     )
                 )
             row.append(
@@ -1515,7 +1525,7 @@ class TelegramBot:
                 for status, count in (
                     await session.execute(
                         select(Order.status, func.count(Order.id))
-                        .where(Order.status.in_(("received", "ns_created", "ns_paid", "pins_ready")))
+                        .where(Order.status.in_(("received", "ns_created", "ns_paid", "pins_ready", "manual_hold")))
                         .group_by(Order.status)
                     )
                 ).all()
@@ -1560,7 +1570,8 @@ class TelegramBot:
             f"  Active orders: <b>{active_total}</b> "
             f"(created={active_orders.get('ns_created', 0)}, "
             f"paid={active_orders.get('ns_paid', 0)}, "
-            f"pins_ready={active_orders.get('pins_ready', 0)})",
+            f"pins_ready={active_orders.get('pins_ready', 0)}, "
+            f"hold={active_orders.get('manual_hold', 0)})",
             f"  Disabled mappings: <b>{disabled_mappings}</b>",
             f"  Guardrails: margin ≥ <b>{self._settings.sync_min_margin_percent:.1f}%</b>, "
             f"max price jump <b>{self._settings.sync_max_price_change_percent:.0f}%</b>, "
@@ -1633,7 +1644,7 @@ class TelegramBot:
         if total == 0:
             await self._send_view(
                 msg.chat.id,
-                "🧯 Проблем нет: failed/pins_ready заказов и выключенных mappings не найдено.",
+                "🧯 Проблем нет: failed/pins_ready/manual_hold заказов и выключенных mappings не найдено.",
                 reply_markup=ui.single_close_kb(),
             )
             return
@@ -1660,7 +1671,7 @@ class TelegramBot:
         if total == 0:
             await self._edit_or_answer(
                 cq,
-                "🧯 Проблем нет: failed/pins_ready заказов и выключенных mappings не найдено.",
+                "🧯 Проблем нет: failed/pins_ready/manual_hold заказов и выключенных mappings не найдено.",
                 reply_markup=ui.single_close_kb(),
             )
             return
@@ -1682,7 +1693,7 @@ class TelegramBot:
         async with session_factory()() as session:
             stmt = (
                 select(Order)
-                .where(Order.status.in_(("failed", "pins_ready")))
+                .where(Order.status.in_(("failed", "pins_ready", "manual_hold")))
                 .order_by(desc(Order.updated_at))
                 .limit(50)
             )
@@ -3599,8 +3610,8 @@ class TelegramBot:
         if self._order_retry is None:
             await cq.answer("Retry не подключён", show_alert=True)
             return
-        if getattr(order, "status", None) != "pins_ready":
-            await cq.answer("Retry доступен только для pins_ready", show_alert=True)
+        if getattr(order, "status", None) not in ("pins_ready", "manual_hold"):
+            await cq.answer("Retry доступен только для pins_ready/manual_hold", show_alert=True)
             return
         await cq.answer("Пробую доставить повторно...", show_alert=False)
         result = await self._order_retry(order.funpay_order_id)
@@ -3610,6 +3621,22 @@ class TelegramBot:
             f"Результат: <code>{html.escape(str(result))[:800]}</code>"
         )
         await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
+
+    @_guard
+    async def _act_order_manual_done(self, cq: CallbackQuery, order) -> None:
+        if getattr(order, "status", None) != "manual_hold":
+            await cq.answer("Доступно только для manual_hold", show_alert=True)
+            return
+        async with session_factory()() as session:
+            db_order = await find_order_by_funpay_id(session, order.funpay_order_id)
+            if db_order is None:
+                await cq.answer("Заказ не найден", show_alert=True)
+                return
+            db_order.status = "delivered"
+            db_order.error = "manual_delivered: оператор подтвердил ручную выдачу"
+            await session.commit()
+        await cq.answer("Отмечено как выданное вручную", show_alert=False)
+        await self._show_problems_via_cq(cq)
 
     @_guard
     async def _act_problem_force_sync(self, cq: CallbackQuery, item) -> None:

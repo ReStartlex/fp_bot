@@ -361,6 +361,27 @@ def test_problems_page_has_retry_and_recovery_buttons():
     assert "act:problem_enable_mapping:abcd:0" in callbacks
 
 
+def test_problems_page_has_manual_done_for_manual_hold():
+    bot = object.__new__(TelegramBot)
+    order = FakeOrder(
+        created_at=datetime(2026, 1, 1, 12, 0, 0),
+        funpay_order_id="fp-2",
+        status="manual_hold",
+        ns_custom_id="ns-2",
+        funpay_lot_id=69300023,
+        error="help requested",
+    )
+    sess = type("Sess", (), {"items": [order]})()
+
+    _, kb = bot._build_problems_page(  # type: ignore[attr-defined]
+        sess, "abcd", sess.items, 0, 1
+    )
+
+    callbacks = [button.callback_data for row in kb.inline_keyboard for button in row]
+    assert "act:order_retry:abcd:0" in callbacks
+    assert "act:order_manual_done:abcd:0" in callbacks
+
+
 def test_clear_target_removes_menu_target_state():
     bot = object.__new__(TelegramBot)
     bot._target_lots = {123: 69300023}

@@ -19,7 +19,7 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.config import Settings
-from src.db.models import Base, KnownLot, Mapping, Order
+from src.db.models import Base, ChatState, KnownLot, Mapping, Order
 from src.db.repo import find_order_by_funpay_id, upsert_mapping
 from src.ns.models import (
     CreateOrderResponse,
@@ -584,6 +584,52 @@ async def test_delivery_failure_keeps_pins_ready_for_retry(
     assert ns.paid_calls == 1
     # Клиенту в этот раз отправлено сообщение с кодом
     assert any("XXXX-YYYY" in body for _, body in fp_ok.sent)
+
+
+@pytest.mark.asyncio
+async def test_help_request_holds_order_before_auto_delivery(db_session_factory, settings):
+    await _make_mapping(db_session_factory)
+    async with db_session_factory() as session:
+        state = ChatState(chat_id=555, buyer_username="alice")
+        session.add(state)
+        order = Order(
+            funpay_order_id="fp-help-hold",
+            funpay_lot_id=69300023,
+            ns_service_id=20,
+            ns_custom_id="ns-help-hold",
+            buyer_username="alice",
+            buyer_user_id=42,
+            chat_id=555,
+            quantity=1,
+            funpay_price_rub=200.0,
+            ns_price_usd=1.93,
+            status="ns_paid",
+        )
+        session.add(order)
+        await session.flush()
+        state.last_help_request_at = order.created_at
+        await session.commit()
+
+    ns = FakeNS(wait_pins=["HOLD-PIN"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    result = await process_funpay_order(
+        _event(order_id="fp-help-hold"),
+        settings=settings,
+        ns_client=ns,
+        funpay_client=fp,
+        telegram=tg,
+    )
+
+    assert result["status"] == "manual_hold"
+    assert fp.sent == []
+    assert tg.warnings
+    db_order = await _order(db_session_factory, "fp-help-hold")
+    assert db_order is not None
+    assert db_order.status == "manual_hold"
+    assert db_order.pins_json is not None
+    assert "HOLD-PIN" in db_order.pins_json
 
 
 @pytest.mark.asyncio

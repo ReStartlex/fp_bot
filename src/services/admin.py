@@ -13,8 +13,8 @@ from src.mapping.rules import estimate_profit_rub
 from src.sync.fx import get_rate_breakdown
 
 
-ORDER_ACTIVE_STATUSES = ("received", "ns_created", "ns_paid", "pins_ready")
-ORDER_PROBLEM_STATUSES = ("failed", "pins_ready")
+ORDER_ACTIVE_STATUSES = ("received", "ns_created", "ns_paid", "pins_ready", "manual_hold")
+ORDER_PROBLEM_STATUSES = ("failed", "pins_ready", "manual_hold")
 
 
 def _dt(value: datetime | None) -> str | None:
