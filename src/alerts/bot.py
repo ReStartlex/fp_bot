@@ -29,7 +29,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from loguru import logger
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 
 from src.alerts import ui
 from src.alerts.sessions import PAGE_SIZE, PaginationStore, paginate
@@ -480,6 +480,12 @@ class TelegramBot:
 
         @dp.message(Command("status"))
         async def cmd_status(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_status(msg)
+
+        @dp.message(Command("health"))
+        async def cmd_health(msg: Message) -> None:
             if not self._is_owner(msg):
                 return
             await self._do_status(msg)
@@ -1504,6 +1510,24 @@ class TelegramBot:
         async with session_factory()() as session:
             stmt = select(SyncRun).order_by(desc(SyncRun.started_at)).limit(1)
             last_run = (await session.execute(stmt)).scalar_one_or_none()
+            active_orders = {
+                status: int(count or 0)
+                for status, count in (
+                    await session.execute(
+                        select(Order.status, func.count(Order.id))
+                        .where(Order.status.in_(("received", "ns_created", "ns_paid", "pins_ready")))
+                        .group_by(Order.status)
+                    )
+                ).all()
+            }
+            disabled_mappings = int(
+                (
+                    await session.execute(
+                        select(func.count(Mapping.id)).where(Mapping.enabled.is_(False))
+                    )
+                ).scalar_one()
+                or 0
+            )
         ns_bal = await self._safe_ns_balance()
         fp_status = await self._safe_fp_status()
         # эффективный курс с премией
@@ -1524,9 +1548,25 @@ class TelegramBot:
                 )
         except Exception as exc:
             rate_line = f"💱 Курс: <i>n/a ({html.escape(str(exc))[:60]})</i>"
-        return _format_status_text(
+        text = _format_status_text(
             self._settings, last_run, ns_bal, fp_status, rate_line
         )
+        active_total = sum(active_orders.values())
+        health_lines = [
+            "",
+            "🩺 <b>Операционный health</b>",
+            f"  Reconciler: <b>{'on' if self._settings.order_reconcile_enabled else 'off'}</b> "
+            f"каждые {self._settings.order_reconcile_interval_seconds}с",
+            f"  Active orders: <b>{active_total}</b> "
+            f"(created={active_orders.get('ns_created', 0)}, "
+            f"paid={active_orders.get('ns_paid', 0)}, "
+            f"pins_ready={active_orders.get('pins_ready', 0)})",
+            f"  Disabled mappings: <b>{disabled_mappings}</b>",
+            f"  Guardrails: margin ≥ <b>{self._settings.sync_min_margin_percent:.1f}%</b>, "
+            f"max price jump <b>{self._settings.sync_max_price_change_percent:.0f}%</b>, "
+            f"reserve stock <b>{'on' if self._settings.sync_reserve_pending_orders else 'off'}</b>",
+        ]
+        return text + "\n".join(health_lines)
 
     @_guard
     async def _do_balance(self, msg: Message) -> None:

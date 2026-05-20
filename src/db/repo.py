@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import (
@@ -251,6 +251,44 @@ async def update_order(session: AsyncSession, order: Order, **fields: Any) -> Or
             setattr(order, key, value)
     await session.flush()
     return order
+
+
+ACTIVE_ORDER_STATUSES = ("received", "ns_created", "ns_paid", "pins_ready")
+
+
+async def reserved_quantities_by_service(
+    session: AsyncSession,
+    *,
+    statuses: tuple[str, ...] = ACTIVE_ORDER_STATUSES,
+) -> dict[int, int]:
+    """Сколько единиц уже занято активными заказами по NS service_id."""
+    stmt = (
+        select(Order.ns_service_id, func.coalesce(func.sum(Order.quantity), 0))
+        .where(Order.status.in_(statuses))
+        .where(Order.ns_service_id > 0)
+        .group_by(Order.ns_service_id)
+    )
+    result = await session.execute(stmt)
+    return {int(service_id): int(quantity or 0) for service_id, quantity in result.all()}
+
+
+async def list_reconcilable_orders(
+    session: AsyncSession,
+    *,
+    stale_after_seconds: int,
+    limit: int,
+) -> list[Order]:
+    """Заказы, которые можно безопасно повторно прогнать через processor."""
+    cutoff = datetime.utcnow() - timedelta(seconds=stale_after_seconds)
+    stmt = (
+        select(Order)
+        .where(Order.status.in_(("ns_created", "ns_paid", "pins_ready")))
+        .where(Order.updated_at <= cutoff)
+        .order_by(Order.updated_at, Order.id)
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
 
 
 # ---------- Chat state ----------

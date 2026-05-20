@@ -31,6 +31,7 @@ from src.funpay.events import FunPayMessageEvent
 from src.funpay.watcher import FunPayWatcher
 from src.logging_setup import setup_logging
 from src.ns import NSClient
+from src.orders.reconciler import reconcile_orders_once
 from src.orders.processor import FunPayOrderEvent, process_funpay_order
 from src.sync.stock_sync import sync_once
 
@@ -132,6 +133,16 @@ class App:
             max_instances=1,
             coalesce=True,
         )
+        if self.settings.order_reconcile_enabled:
+            self.scheduler.add_job(
+                self._safe_reconcile_orders,
+                "interval",
+                seconds=self.settings.order_reconcile_interval_seconds,
+                id="order_reconciler",
+                next_run_time=datetime.now() + timedelta(seconds=30),
+                max_instances=1,
+                coalesce=True,
+            )
         if self.settings.new_lots_notify_enabled:
             self.scheduler.add_job(
                 self._safe_discover_new_lots,
@@ -299,6 +310,19 @@ class App:
             )
         except Exception as exc:
             logger.exception(f"discover_new_lots упал: {exc}")
+
+    async def _safe_reconcile_orders(self) -> None:
+        try:
+            result = await reconcile_orders_once(
+                settings=self.settings,
+                ns_client=self.ns,
+                funpay_client=self.fp,
+                telegram=self.tg,
+            )
+            if result.get("checked", 0):
+                logger.info(f"order reconciler: {result}")
+        except Exception as exc:
+            logger.exception(f"order reconciler упал: {exc}")
 
     # ---------- FunPay events ----------
 

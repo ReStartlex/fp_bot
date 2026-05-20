@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     usd_rub_premium_percent: float = Field(default=2.0, ge=0, le=50)
     price_update_threshold_percent: float = Field(default=2.0, ge=0)
     funpay_stock_cap: int = Field(default=100, ge=1)
+    sync_min_margin_percent: float = Field(default=1.0)
+    sync_max_price_change_percent: float = Field(default=50.0, ge=0)
+    sync_reserve_pending_orders: bool = True
     # Комиссия FunPay для оценки цены клиента: чисто справочно для /calc.
     # Не влияет на то, какую цену мы записываем (мы пишем цену продавца, FunPay
     # сам добавит комиссию). Реальная комиссия зависит от категории.
@@ -95,6 +98,10 @@ class Settings(BaseSettings):
     ns_retry_delay_seconds: float = Field(default=5.0, gt=0)
     ns_order_poll_interval_seconds: float = Field(default=5.0, gt=0)
     ns_order_timeout_seconds: float = Field(default=600.0, gt=0)
+    order_reconcile_enabled: bool = True
+    order_reconcile_interval_seconds: int = Field(default=120, ge=30)
+    order_reconcile_stale_after_seconds: int = Field(default=60, ge=0)
+    order_reconcile_max_per_run: int = Field(default=10, ge=1, le=100)
 
     chat_autogreeting_enabled: bool = True
     chat_greeting_cooldown_hours: int = Field(default=24, ge=1)

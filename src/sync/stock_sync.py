@@ -23,7 +23,12 @@ from sqlalchemy import select
 from src.config import Settings, get_settings
 from src.config_runtime import get_global_markup_percent, get_stock_cap
 from src.db.models import LotGroup
-from src.db.repo import finish_sync_run, list_mappings, start_sync_run
+from src.db.repo import (
+    finish_sync_run,
+    list_mappings,
+    reserved_quantities_by_service,
+    start_sync_run,
+)
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
 from src.mapping.rules import PricingResult, compute_pricing, should_update_price
@@ -53,6 +58,42 @@ def _flatten_services(stock: StockResponse) -> dict[int, Service]:
         for svc in cat.services:
             out[svc.service_id] = svc
     return out
+
+
+def _service_with_reserved_stock(service: Service, reserved: int) -> Service:
+    if reserved <= 0:
+        return service
+    return service.model_copy(update={"in_stock": max(0, service.in_stock - reserved)})
+
+
+def _risk_skip_reason(
+    *,
+    target: PricingResult,
+    current_price: float | None,
+    settings: Settings,
+) -> str | None:
+    cost = target.ns_price_usd * target.fx_rate
+    if target.price_target <= 0:
+        return "guardrail: целевая цена <= 0"
+    margin = (target.price_target - cost) / target.price_target * 100.0
+    if margin < settings.sync_min_margin_percent:
+        return (
+            "guardrail: маржа ниже минимума "
+            f"({margin:.2f}% < {settings.sync_min_margin_percent:.2f}%)"
+        )
+    if (
+        current_price is not None
+        and current_price > 0
+        and settings.sync_max_price_change_percent > 0
+    ):
+        new_price = target.round_price()
+        change = abs(new_price - current_price) / current_price * 100.0
+        if change > settings.sync_max_price_change_percent:
+            return (
+                "guardrail: слишком большое изменение цены "
+                f"({change:.1f}% > {settings.sync_max_price_change_percent:.1f}%)"
+            )
+    return None
 
 
 async def _decide_for_one(
@@ -117,6 +158,23 @@ async def _decide_for_one(
     current_price = _extract_price(lot_fields)
     current_stock = _extract_stock(lot_fields)
     current_active = _extract_active(lot_fields)
+
+    risk_reason = _risk_skip_reason(
+        target=target, current_price=current_price, settings=settings
+    )
+    if risk_reason is not None:
+        return LotSyncDecision(
+            funpay_lot_id=mapping.funpay_lot_id,
+            ns_service_id=mapping.ns_service_id,
+            label=mapping.label,
+            current_price=current_price,
+            target=target,
+            will_update_price=False,
+            will_update_stock=False,
+            will_activate=False,
+            will_deactivate=False,
+            skip_reason=risk_reason,
+        )
 
     new_price = target.round_price()
     new_stock = target.stock
@@ -276,6 +334,11 @@ async def sync_once(
                     select(LotGroup).where(LotGroup.id.in_(group_ids))
                 )
                 groups_by_id = {g.id: g for g in result.scalars().all()}
+            reserved_by_service = (
+                await reserved_quantities_by_service(session)
+                if settings.sync_reserve_pending_orders
+                else {}
+            )
 
         if not mappings:
             logger.debug("Маппингов нет — нечего синхронизировать.")
@@ -301,6 +364,9 @@ async def sync_once(
         decisions: list[LotSyncDecision] = []
         for mapping in mappings:
             ns_service = services_index.get(mapping.ns_service_id)
+            if ns_service is not None:
+                reserved = reserved_by_service.get(mapping.ns_service_id, 0)
+                ns_service = _service_with_reserved_stock(ns_service, reserved)
             decision = await _decide_for_one(
                 ns_service, mapping, settings, fx_rate, funpay_client,
                 effective_markup=effective_markup,
