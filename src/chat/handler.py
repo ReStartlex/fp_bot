@@ -22,6 +22,7 @@ from src.config import Settings, get_settings
 from src.db.repo import (
     get_or_create_chat_state,
     hold_active_orders_for_chat,
+    list_active_orders_for_chat,
     mark_greeted,
     mark_help_requested,
 )
@@ -279,9 +280,28 @@ class ChatHandler:
                 await session.commit()
 
         working_now = self._wh.is_working_now()
-        reply = templates.help_acknowledged(
-            event.author_username, working_now=working_now, wh=self._wh
+        grace_seconds = int(self._settings.chat_help_auto_delivery_grace_seconds)
+        grace_minutes = max(1, (grace_seconds + 59) // 60)
+        active_orders = []
+        async with session_factory()() as session:
+            active_orders = await list_active_orders_for_chat(
+                session, chat_id=event.chat_id
+            )
+        now = datetime.utcnow()
+        has_order_in_grace = any(
+            order.status != "manual_hold"
+            and grace_seconds > 0
+            and (now - order.created_at).total_seconds() < grace_seconds
+            for order in active_orders
         )
+        if has_order_in_grace:
+            reply = templates.help_order_grace(
+                event.author_username, grace_minutes=grace_minutes
+            )
+        else:
+            reply = templates.help_acknowledged(
+                event.author_username, working_now=working_now, wh=self._wh
+            )
         ack_sent = False
         try:
             result = await self._fp.send_message(event.chat_id, reply)
@@ -314,15 +334,16 @@ class ChatHandler:
             held_orders = await hold_active_orders_for_chat(
                 session,
                 chat_id=event.chat_id,
+                grace_seconds=grace_seconds,
                 reason=(
                     "manual_hold: покупатель вызвал !помощь; "
-                    "автовыдача остановлена, чтобы не продублировать ручную выдачу"
+                    "окно автовыдачи истекло, заказ передан оператору"
                 ),
             )
             await session.commit()
 
         # Telegram-алерт владельцу
-        if self._tg is not None:
+        if self._tg is not None and (held_orders or not has_order_in_grace):
             urgency = "" if working_now else " 🌙 (вне рабочих часов!)"
             link = _shortlink(event.chat_id, event.author_username)
             hold_line = ""

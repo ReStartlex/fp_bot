@@ -115,6 +115,10 @@ class Settings(BaseSettings):
     # По умолчанию 0: каждое !помощь даёт ответ покупателю и нотификацию
     # владельцу в Telegram. Если хочешь не флудить — поставь >0.
     chat_help_cooldown_seconds: int = Field(default=0, ge=0)
+    # После покупки !помощь не останавливает автовыдачу сразу: даём боту
+    # время завершить нормальную выдачу. Если товар не выдан после этого окна,
+    # заказ уходит в manual_hold и оператор решает вручную.
+    chat_help_auto_delivery_grace_seconds: int = Field(default=420, ge=0)
     work_hours_start: int = Field(default=12, ge=0, le=23)
     work_hours_end: int = Field(default=23, ge=1, le=24)
     seller_display_name: str = "продавец"

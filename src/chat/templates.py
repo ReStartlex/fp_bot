@@ -119,6 +119,28 @@ def delivery_delayed(buyer: str | None, lang: Lang | None = None) -> str:
     )
 
 
+def help_order_grace(
+    buyer: str | None,
+    *,
+    grace_minutes: int,
+    lang: Lang | None = None,
+) -> str:
+    """Шлём на !помощь, если активный заказ ещё в окне автовыдачи."""
+    lang = lang or _lang()
+    name = _addr(buyer)
+    if lang == "en":
+        return (
+            f"⏳ {name}, I see your paid order and I'm still trying to deliver it automatically.\n"
+            f"Delivery can take up to {grace_minutes} minutes. If the goods still don't arrive, "
+            f"the chat will be passed to an operator and I'll stop automatic delivery to avoid duplicates."
+        )
+    return (
+        f"⏳ {name}, вижу ваш оплаченный заказ и ещё пробую выдать его автоматически.\n"
+        f"Выдача может занять до {grace_minutes} минут. Если товар так и не придёт, "
+        f"чат будет передан оператору, а автовыдача остановится, чтобы не было дубля."
+    )
+
+
 def delivery_failed(buyer: str | None, lang: Lang | None = None) -> str:
     """Шлём, если NS отказал в заказе."""
     lang = lang or _lang()

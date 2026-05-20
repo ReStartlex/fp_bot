@@ -291,11 +291,27 @@ async def list_reconcilable_orders(
     return list(result.scalars().all())
 
 
+async def list_active_orders_for_chat(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+) -> list[Order]:
+    """Активные заказы покупателя в чате, включая ручной hold."""
+    stmt = (
+        select(Order)
+        .where(Order.chat_id == chat_id)
+        .where(Order.status.in_(ACTIVE_ORDER_STATUSES))
+        .order_by(Order.updated_at.desc())
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
 async def hold_active_orders_for_chat(
     session: AsyncSession,
     *,
     chat_id: int,
     reason: str,
+    grace_seconds: int = 0,
 ) -> list[Order]:
     """
     Перевести активные заказы чата в ручной hold.
@@ -304,19 +320,20 @@ async def hold_active_orders_for_chat(
     подключился вручную, автоматическая доставка больше не должна "догонять"
     этот чат без явного решения оператора.
     """
-    stmt = (
-        select(Order)
-        .where(Order.chat_id == chat_id)
-        .where(Order.status.in_(ACTIVE_ORDER_STATUSES))
-        .order_by(Order.updated_at.desc())
-    )
-    orders = list((await session.execute(stmt)).scalars().all())
+    orders = await list_active_orders_for_chat(session, chat_id=chat_id)
+    now = datetime.utcnow()
+    held: list[Order] = []
     for order in orders:
+        if grace_seconds > 0:
+            age_seconds = (now - order.created_at).total_seconds()
+            if age_seconds < grace_seconds and order.status != "manual_hold":
+                continue
         if order.status != "manual_hold":
             order.status = "manual_hold"
         order.error = reason
+        held.append(order)
     await session.flush()
-    return orders
+    return held
 
 
 # ---------- Chat state ----------

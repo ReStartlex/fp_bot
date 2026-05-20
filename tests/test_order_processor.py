@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -587,7 +588,9 @@ async def test_delivery_failure_keeps_pins_ready_for_retry(
 
 
 @pytest.mark.asyncio
-async def test_help_request_holds_order_before_auto_delivery(db_session_factory, settings):
+async def test_help_request_holds_order_after_grace_before_auto_delivery(
+    db_session_factory, settings,
+):
     await _make_mapping(db_session_factory)
     async with db_session_factory() as session:
         state = ChatState(chat_id=555, buyer_username="alice")
@@ -607,7 +610,8 @@ async def test_help_request_holds_order_before_auto_delivery(db_session_factory,
         )
         session.add(order)
         await session.flush()
-        state.last_help_request_at = order.created_at
+        order.created_at = datetime.utcnow() - timedelta(minutes=8)
+        state.last_help_request_at = order.created_at + timedelta(minutes=1)
         await session.commit()
 
     ns = FakeNS(wait_pins=["HOLD-PIN"])
@@ -630,6 +634,52 @@ async def test_help_request_holds_order_before_auto_delivery(db_session_factory,
     assert db_order.status == "manual_hold"
     assert db_order.pins_json is not None
     assert "HOLD-PIN" in db_order.pins_json
+
+
+@pytest.mark.asyncio
+async def test_help_request_allows_auto_delivery_during_grace(
+    db_session_factory, settings,
+):
+    await _make_mapping(db_session_factory)
+    async with db_session_factory() as session:
+        state = ChatState(chat_id=555, buyer_username="alice")
+        session.add(state)
+        order = Order(
+            funpay_order_id="fp-help-grace",
+            funpay_lot_id=69300023,
+            ns_service_id=20,
+            ns_custom_id="ns-help-grace",
+            buyer_username="alice",
+            buyer_user_id=42,
+            chat_id=555,
+            quantity=1,
+            funpay_price_rub=200.0,
+            ns_price_usd=1.93,
+            status="ns_paid",
+        )
+        session.add(order)
+        await session.flush()
+        state.last_help_request_at = order.created_at
+        await session.commit()
+
+    ns = FakeNS(wait_pins=["GRACE-PIN"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    result = await process_funpay_order(
+        _event(order_id="fp-help-grace"),
+        settings=settings,
+        ns_client=ns,
+        funpay_client=fp,
+        telegram=tg,
+    )
+
+    assert result["status"] == "delivered"
+    assert any("GRACE-PIN" in body for _, body in fp.sent)
+    assert tg.warnings == []
+    db_order = await _order(db_session_factory, "fp-help-grace")
+    assert db_order is not None
+    assert db_order.status == "delivered"
 
 
 @pytest.mark.asyncio
