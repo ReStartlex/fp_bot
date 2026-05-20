@@ -284,6 +284,8 @@ def format_ns_category_line(cat: Any) -> str:
 
 
 def format_funpay_lot_line(lot: Any) -> str:
+    idx = getattr(lot, "_ui_index", None)
+    prefix = f"<b>#{idx}</b> · " if idx is not None else ""
     lot_id = (
         getattr(lot, "id", None)
         or getattr(lot, "lot_id", None)
@@ -295,7 +297,7 @@ def format_funpay_lot_line(lot: Any) -> str:
         or getattr(lot, "title", None)
         or getattr(lot, "name", None)
         or "",
-        limit=60,
+        limit=110,
     )
     price = (
         getattr(lot, "price", None)
@@ -303,7 +305,7 @@ def format_funpay_lot_line(lot: Any) -> str:
         or "—"
     )
     return (
-        f"<code>{lot_id}</code> · <b>{format_money(price)}</b>\n"
+        f"{prefix}<code>{lot_id}</code> · <b>{format_money(price)}</b>\n"
         f"   {title}"
     )
 

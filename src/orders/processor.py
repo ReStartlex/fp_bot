@@ -48,6 +48,7 @@ from src.db.repo import (
 )
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
+from src.mapping.rules import estimate_profit_rub
 from src.ns import NSClient
 from src.ns.exceptions import (
     NSError,
@@ -55,6 +56,7 @@ from src.ns.exceptions import (
     NSOrderTimeoutError,
 )
 from src.ns.models import OrderStatus
+from src.sync.fx import get_usd_rub_rate
 
 
 # Per-key мьютекс: гарантирует, что одновременно над одним заказом
@@ -675,10 +677,27 @@ async def _deliver_pins(
         }
 
     log.success(f"Доставил {len(pins)} код(а/ов) в чат {event.chat_id}")
+    fx_rate_at_sale: float | None = None
+    profit_rub: float | None = None
+    profit_margin_percent: float | None = None
+    try:
+        fx_rate_at_sale = await get_usd_rub_rate(get_settings())
+        estimated = estimate_profit_rub(event.funpay_price_rub, ns_price_usd, fx_rate_at_sale)
+        if estimated is not None:
+            _, _, profit_rub, profit_margin_percent = estimated
+    except Exception as exc:
+        log.warning(f"Не смог посчитать точную прибыль заказа: {exc}")
     async with session_factory()() as session:
         order = await find_order_by_funpay_id(session, event.funpay_order_id)
         assert order is not None
-        await update_order(session, order, status="delivered")
+        await update_order(
+            session,
+            order,
+            status="delivered",
+            fx_rate_at_sale=fx_rate_at_sale,
+            profit_rub=profit_rub,
+            profit_margin_percent=profit_margin_percent,
+        )
         await session.commit()
 
     if telegram is not None:

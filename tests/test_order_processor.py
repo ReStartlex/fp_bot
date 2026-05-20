@@ -223,7 +223,13 @@ async def _order(factory, fp_order_id: str) -> Order | None:
 
 
 @pytest.mark.asyncio
-async def test_happy_path_pay_returns_pins_immediately(db_session_factory, settings):
+async def test_happy_path_pay_returns_pins_immediately(
+    db_session_factory, settings, monkeypatch
+):
+    async def fake_rate(_settings=None):
+        return 100.0
+
+    monkeypatch.setattr(proc, "get_usd_rub_rate", fake_rate)
     await _make_mapping(db_session_factory)
     ns = FakeNS(pay_pins=["AAAA-AAAA"])
     fp = FakeFunPay()
@@ -244,6 +250,13 @@ async def test_happy_path_pay_returns_pins_immediately(db_session_factory, setti
     assert db_order is not None
     assert db_order.status == "delivered"
     assert db_order.ns_custom_id == "ns-custom-1"
+    assert db_order.fx_rate_at_sale == 100.0
+    assert db_order.profit_rub == pytest.approx(
+        db_order.funpay_price_rub - db_order.ns_price_usd * 100.0
+    )
+    assert db_order.profit_margin_percent == pytest.approx(
+        db_order.profit_rub / db_order.funpay_price_rub * 100.0
+    )
 
 
 @pytest.mark.asyncio

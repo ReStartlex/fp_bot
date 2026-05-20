@@ -75,6 +75,12 @@ def _migrate_sqlite_schema(sync_conn) -> None:
         if "group_id" not in columns:
             sync_conn.execute(text("ALTER TABLE mappings ADD COLUMN group_id INTEGER"))
             logger.info("init_db: добавлена колонка mappings.group_id")
+    if "orders" in tables:
+        columns = {col["name"] for col in inspector.get_columns("orders")}
+        for name in ("fx_rate_at_sale", "profit_rub", "profit_margin_percent"):
+            if name not in columns:
+                sync_conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} FLOAT"))
+                logger.info(f"init_db: добавлена колонка orders.{name}")
 
 
 async def close_db() -> None:

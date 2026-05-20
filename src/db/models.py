@@ -177,6 +177,9 @@ class Order(Base):
     quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     funpay_price_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     ns_price_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    fx_rate_at_sale: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    profit_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    profit_margin_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="received")
     # Возможные статусы: received, ns_created, ns_paid, delivered, failed, refunded
     pins_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

@@ -45,6 +45,7 @@ from src.db.repo import (
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
 from src.mapping.rules import compute_pricing, estimate_profit_rub
+from src.mapping.safety import mapping_risk_warnings
 from src.ns import NSClient
 from src.ns.models import StockResponse
 from src.sync.fx import get_rate_breakdown
@@ -688,6 +689,13 @@ class TelegramBot:
                 return
             await self._on_newlot_click(cq)
 
+        @dp.callback_query(F.data.startswith("mapconfirm:"))
+        async def cb_mapconfirm(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await self._on_mapconfirm_click(cq)
+
         @dp.callback_query(F.data.startswith("settings:"))
         async def cb_settings(cq: CallbackQuery) -> None:
             if not self._is_owner(cq):
@@ -1000,6 +1008,8 @@ class TelegramBot:
             await self._act_lot_calc(cq, item)
         elif kind == "lot_inspect":
             await self._act_lot_inspect(cq, item)
+        elif kind == "lot_card":
+            await self._act_lot_card(cq, item)
         elif kind == "map_toggle":
             await self._act_map_toggle(cq, item)
         elif kind == "map_delete":
@@ -1191,6 +1201,11 @@ class TelegramBot:
         return text, kb
 
     def _build_lots_page(self, sess, sid, page_items, page, total_pages):
+        for local_idx, lot in enumerate(page_items):
+            try:
+                setattr(lot, "_ui_index", page * PAGE_SIZE + local_idx + 1)
+            except Exception:
+                pass
         text = ui.render_list(
             page_items=page_items,
             formatter=ui.format_funpay_lot_line,
@@ -1205,23 +1220,24 @@ class TelegramBot:
         item_buttons: list[list[InlineKeyboardButton]] = []
         for local_idx, lot in enumerate(page_items):
             global_idx = page * PAGE_SIZE + local_idx
+            shown_idx = global_idx + 1
             row_top = [
                 InlineKeyboardButton(
-                    text=f"ℹ️ {ui.funpay_lot_label(lot, max_len=34)}",
-                    callback_data="noop",
+                    text=f"ℹ️ Открыть карточку #{shown_idx}",
+                    callback_data=f"act:lot_card:{sid}:{global_idx}",
                 ),
             ]
             row_bot = [
                 InlineKeyboardButton(
-                    text="📊 Расчёт",
+                    text=f"📊 #{shown_idx}",
                     callback_data=f"act:lot_calc:{sid}:{global_idx}",
                 ),
                 InlineKeyboardButton(
-                    text="🔬 Inspect",
+                    text=f"🔬 #{shown_idx}",
                     callback_data=f"act:lot_inspect:{sid}:{global_idx}",
                 ),
                 InlineKeyboardButton(
-                    text="🎯 Цель",
+                    text=f"🎯 #{shown_idx}",
                     callback_data=f"act:fp_target:{sid}:{global_idx}",
                 ),
             ]
@@ -1683,13 +1699,17 @@ class TelegramBot:
         revenue = cost = profit = 0.0
         counted = 0
         by_group: dict[str, list[float]] = {}
+        exact_count = 0
         for order in orders:
-            estimated = estimate_profit_rub(
-                order.funpay_price_rub, order.ns_price_usd, rate.effective
-            )
+            fx = getattr(order, "fx_rate_at_sale", None) or rate.effective
+            estimated = estimate_profit_rub(order.funpay_price_rub, order.ns_price_usd, fx)
             if estimated is None:
                 continue
             order_revenue, order_cost, order_profit, _ = estimated
+            if getattr(order, "profit_rub", None) is not None:
+                order_profit = float(order.profit_rub)
+                order_cost = order_revenue - order_profit
+                exact_count += 1
             revenue += order_revenue
             cost += order_cost
             profit += order_profit
@@ -1712,7 +1732,8 @@ class TelegramBot:
             f"Себестоимость NS: <b>{cost:.0f} ₽</b>",
             f"Прибыль: <b>{profit:.0f} ₽</b>",
             f"Маржа: <b>{margin:.1f}%</b>",
-            f"Курс оценки: <b>{rate.effective:.4f}</b>",
+            f"Точный курс в заказах: <b>{exact_count}/{counted}</b>",
+            f"Курс для старых заказов: <b>{rate.effective:.4f}</b>",
         ]
         if by_group:
             lines.append("")
@@ -1727,7 +1748,7 @@ class TelegramBot:
                     f"({int(count)} шт, {group_margin:.1f}%)"
                 )
         lines.append("")
-        lines.append("<i>Важно: прибыль считается по текущему курсу USD/RUB, исторический курс заказа пока не сохраняется.</i>")
+        lines.append("<i>Новые заказы считаются по курсу на момент доставки; старые без сохранённого курса — по текущему курсу.</i>")
         return "\n".join(lines)
 
     async def _render_group_preview(self, group_id: int) -> str:
@@ -1794,6 +1815,75 @@ class TelegramBot:
                 lines.append(f"• {label}: <code>{html.escape(decision.skip_reason or '')[:90]}</code>")
         lines.append("")
         lines.append("Нажми 🔄 Синхронизация, чтобы применить эти изменения на FunPay.")
+        return "\n".join(lines)
+
+    async def _render_lot_card(self, funpay_lot_id: int, *, lot=None) -> str:
+        title = (
+            getattr(lot, "description", None)
+            or getattr(lot, "title", None)
+            or getattr(lot, "name", None)
+            or ""
+        )
+        price = getattr(lot, "price", None) or getattr(lot, "cost", None) or "—"
+        async with session_factory()() as session:
+            mapping = (
+                await session.execute(
+                    select(Mapping).where(Mapping.funpay_lot_id == funpay_lot_id)
+                )
+            ).scalar_one_or_none()
+            group = (
+                await session.get(LotGroup, mapping.group_id)
+                if mapping is not None and mapping.group_id is not None
+                else None
+            )
+            orders = list(
+                (
+                    await session.execute(
+                        select(Order)
+                        .where(Order.funpay_lot_id == funpay_lot_id)
+                        .order_by(desc(Order.created_at))
+                        .limit(5)
+                    )
+                ).scalars().all()
+            )
+
+        lines = [
+            f"🧾 <b>Карточка лота</b> <code>{funpay_lot_id}</code>",
+            "",
+            f"<b>Название:</b>\n{html.escape(title or '—')}",
+            f"<b>Цена FunPay:</b> {html.escape(str(price))}",
+        ]
+        if mapping is None:
+            lines.append("\n<b>Маппинг:</b> <i>не настроен</i>")
+        else:
+            markup = (
+                f"{format_percent(mapping.markup_percent)}%"
+                if mapping.markup_percent is not None else "default"
+            )
+            lines.extend([
+                "",
+                "<b>Маппинг:</b>",
+                f"NS service: <code>{mapping.ns_service_id}</code>",
+                f"Label: {html.escape(mapping.label or '—')}",
+                f"Группа: {html.escape(group.name) if group is not None else '—'}",
+                f"Markup: <b>{markup}</b>",
+                f"Status: {'✅ enabled' if mapping.enabled else '⏸ disabled'}",
+            ])
+        if orders:
+            lines.append("")
+            lines.append("<b>Последние заказы:</b>")
+            for order in orders:
+                created = _to_moscow(order.created_at)
+                when = "—" if created is None else created.strftime("%m-%d %H:%M")
+                profit = (
+                    f", profit {order.profit_rub:.0f} ₽"
+                    if getattr(order, "profit_rub", None) is not None
+                    else ""
+                )
+                lines.append(
+                    f"• <code>{when}</code> #{html.escape(order.funpay_order_id)} "
+                    f"{html.escape(order.status)}{profit}"
+                )
         return "\n".join(lines)
 
     @_guard
@@ -2299,6 +2389,16 @@ class TelegramBot:
         чтобы он начал использовать глобальный default.
         """
         parts = (cq.data or "").split(":")
+        if len(parts) == 3 and parts[1] == "open":
+            try:
+                funpay_lot_id = int(parts[2])
+            except ValueError:
+                await cq.answer("Некорректный lot_id", show_alert=True)
+                return
+            text, kb = await self._render_calc(funpay_lot_id)
+            await self._edit_or_answer(cq, text, reply_markup=kb)
+            return
+
         if len(parts) != 3 or parts[1] != "reset_markup":
             await cq.answer("Неизвестная команда расчёта", show_alert=True)
             return
@@ -2418,6 +2518,41 @@ class TelegramBot:
             return
 
         await cq.answer(f"Неизвестное newlot-действие: {action}", show_alert=True)
+
+    async def _on_mapconfirm_click(self, cq: CallbackQuery) -> None:
+        parts = (cq.data or "").split(":")
+        if len(parts) != 3:
+            await cq.answer("Некорректное подтверждение", show_alert=True)
+            return
+        try:
+            funpay_lot_id = int(parts[1])
+            service_id = int(parts[2])
+        except ValueError:
+            await cq.answer("Некорректные id", show_alert=True)
+            return
+        try:
+            stock = await self._get_stock()
+        except Exception as exc:
+            await cq.answer(f"NS stock упал: {str(exc)[:120]}", show_alert=True)
+            return
+        svc = None
+        for cat in stock.categories:
+            for item in cat.services:
+                if item.service_id == service_id:
+                    svc = item
+                    break
+            if svc is not None:
+                break
+        if svc is None:
+            await cq.answer("NS-услуга больше не найдена", show_alert=True)
+            return
+        async with session_factory()() as session:
+            row = await session.get(KnownLot, funpay_lot_id)
+            if row is not None and row.title:
+                self._target_labels[cq.from_user.id] = row.title[:120]
+        await self._save_mapping_via_cq(
+            cq, funpay_lot_id=funpay_lot_id, ns_service=svc, force=True
+        )
 
     async def _on_settings_click(self, cq: CallbackQuery) -> None:
         """
@@ -3301,6 +3436,36 @@ class TelegramBot:
             )
 
     @_guard
+    async def _act_lot_card(self, cq: CallbackQuery, lot) -> None:
+        lot_id = _lot_id_of(lot)
+        try:
+            lot_id_int = int(lot_id)
+        except (TypeError, ValueError):
+            await cq.answer("Не могу прочитать lot_id", show_alert=True)
+            return
+        await cq.answer("Открываю карточку...", show_alert=False)
+        text = await self._render_lot_card(lot_id_int, lot=lot)
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📊 Расчёт",
+                    callback_data=f"calc:open:{lot_id_int}",
+                ),
+                InlineKeyboardButton(
+                    text="🔬 Inspect",
+                    callback_data=f"newlot:inspect:{lot_id_int}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(text="🏠 Меню", callback_data="menu:home"),
+                InlineKeyboardButton(text="✖ Закрыть", callback_data="close"),
+            ],
+        ])
+        await self._edit_or_answer(cq, text, reply_markup=kb)
+
+    @_guard
     async def _act_map_toggle(self, cq: CallbackQuery, mapping) -> None:
         async with session_factory()() as session:
             stmt = select(Mapping).where(Mapping.id == mapping.id)
@@ -3450,10 +3615,37 @@ class TelegramBot:
         await self._render_paginated(cq, kind="mappings", sid=sid, page=0)
 
     async def _save_mapping_via_cq(
-        self, cq: CallbackQuery, *, funpay_lot_id: int, ns_service
+        self, cq: CallbackQuery, *, funpay_lot_id: int, ns_service, force: bool = False
     ) -> None:
+        fp_label = self._target_labels.get(cq.from_user.id) or f"#{funpay_lot_id}"
+        warnings = mapping_risk_warnings(fp_label, getattr(ns_service, "service_name", None))
+        if warnings and not force:
+            from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+            text = (
+                "⚠️ <b>Проверь маппинг перед сохранением</b>\n\n"
+                f"FunPay <code>{funpay_lot_id}</code>\n"
+                f"<i>{html.escape(fp_label)}</i>\n\n"
+                f"NS#{ns_service.service_id}\n"
+                f"<i>{html.escape(str(ns_service.service_name))}</i>\n\n"
+                "<b>Почему остановил:</b>\n"
+                + "\n".join(f"• {html.escape(item)}" for item in warnings)
+                + "\n\nЕсли это точно правильная пара, нажми «✅ Подтвердить»."
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="✅ Подтвердить",
+                        callback_data=f"mapconfirm:{funpay_lot_id}:{ns_service.service_id}",
+                    ),
+                    InlineKeyboardButton(text="✖ Отмена", callback_data="target:clear"),
+                ],
+            ])
+            await cq.answer("Нужно подтверждение", show_alert=True)
+            if cq.message is not None:
+                await cq.message.answer(text, reply_markup=kb)
+            return
         async with session_factory()() as session:
-            fp_label = self._target_labels.get(cq.from_user.id) or f"#{funpay_lot_id}"
             group = await classify_lot_group(
                 session,
                 f"{fp_label} {getattr(ns_service, 'service_name', '')}",

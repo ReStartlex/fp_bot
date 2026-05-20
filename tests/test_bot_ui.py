@@ -9,6 +9,7 @@ from aiogram.types import InlineKeyboardMarkup
 
 from src.alerts import ui
 from src.alerts.bot import TelegramBot, _format_order_line, format_percent
+from src.mapping.safety import mapping_risk_warnings
 
 
 # ─────────────── фейковые объекты (как в FunPayAPI / NS) ───────────────
@@ -268,7 +269,7 @@ def test_funpay_lot_label_uses_title_not_id():
     assert "Apple" in out
 
 
-def test_lots_page_name_button_is_noop_not_target():
+def test_lots_page_name_button_opens_card_not_target():
     """
     Нажатие на название лота не должно случайно переназначать target.
     Для назначения оставляем отдельную явную кнопку "🎯 Цель".
@@ -283,9 +284,35 @@ def test_lots_page_name_button_is_noop_not_target():
         1,
     )
     rows = kb.inline_keyboard
-    assert rows[0][0].callback_data == "noop"
+    assert rows[0][0].callback_data == "act:lot_card:abcd:0"
+    assert "#1" in rows[0][0].text
     callbacks = [button.callback_data for row in rows for button in row]
     assert "act:fp_target:abcd:0" in callbacks
+
+
+def test_lots_page_text_shows_full_numbered_title():
+    bot = object.__new__(TelegramBot)
+    title = "АВТОВЫДАЧА Подарочная карта Apple App Store США, USD, 25 USD"
+    sess = type("Sess", (), {"items": [FakeLot(69300023, title, "2500")]})()
+
+    text, _ = bot._build_lots_page(  # type: ignore[attr-defined]
+        sess,
+        "abcd",
+        sess.items,
+        0,
+        1,
+    )
+
+    assert "#1" in text
+    assert "25 USD" in text
+
+
+def test_mapping_risk_warns_on_currency_mismatch():
+    warnings = mapping_risk_warnings(
+        "Подарочная карта Apple USA 25 USD",
+        "Apple Gift Card USA 25 EUR",
+    )
+    assert any("валюта отличается" in item for item in warnings)
 
 
 def test_groups_page_has_markup_controls():
