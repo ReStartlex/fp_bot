@@ -215,6 +215,15 @@ systemctl enable --now funpay-ns-api
 sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.check_web_api
 ```
 
+Админка сайта уже встроена в этот же сервис: открой `/` на Web API, вставь
+`WEB_API_TOKEN` и увидишь Dashboard, Orders, Problems, Mappings и Profit.
+До настройки reverse proxy безопасный доступ удобнее делать через SSH tunnel:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 root@VPS_IP
+# затем локально открыть http://127.0.0.1:8080
+```
+
 ## Безопасность
 
 - Все секреты — в `.env`. Файл не попадает в git и не должен передаваться по

@@ -34,6 +34,24 @@ def test_healthz_is_public(monkeypatch):
     assert response.json() == {"status": "ok"}
 
 
+def test_admin_frontend_is_served(monkeypatch):
+    async def noop():
+        return None
+
+    monkeypatch.setattr(api_app, "init_db", noop)
+    monkeypatch.setattr(api_app, "close_db", noop)
+    app = api_app.create_app()
+
+    with TestClient(app) as client:
+        index = client.get("/")
+        script = client.get("/static/app.js")
+
+    assert index.status_code == 200
+    assert "FunPay NS Admin" in index.text
+    assert script.status_code == 200
+    assert "/api/dashboard" in script.text
+
+
 def test_dashboard_requires_bearer_token(monkeypatch):
     async def noop():
         return None

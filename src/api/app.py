@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from src.api.auth import require_api_auth
 from src.config import Settings, get_settings
@@ -19,6 +22,9 @@ from src.services.admin import (
     list_problem_items,
 )
 from src.sync.stock_sync import sync_once
+
+
+WEB_DIR = Path(__file__).resolve().parents[1] / "web"
 
 
 @asynccontextmanager
@@ -38,6 +44,12 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    if WEB_DIR.exists():
+        app.mount("/static", StaticFiles(directory=WEB_DIR / "static"), name="static")
+
+        @app.get("/", include_in_schema=False)
+        async def index() -> FileResponse:
+            return FileResponse(WEB_DIR / "index.html")
 
     @app.get("/healthz", tags=["system"])
     async def healthz() -> dict[str, str]:

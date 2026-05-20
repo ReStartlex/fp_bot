@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FunPay NS Admin</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">FP</div>
+        <div>
+          <div class="brand-title">FunPay NS</div>
+          <div class="brand-subtitle">Admin Panel</div>
+        </div>
+      </div>
+      <nav class="nav">
+        <button class="nav-item active" data-view="dashboard">Dashboard</button>
+        <button class="nav-item" data-view="orders">Orders</button>
+        <button class="nav-item" data-view="problems">Problems</button>
+        <button class="nav-item" data-view="mappings">Mappings</button>
+        <button class="nav-item" data-view="profit">Profit</button>
+      </nav>
+      <div class="sidebar-footer">
+        <span id="apiStatus" class="status-dot warn"></span>
+        <span id="apiStatusText">Проверка API...</span>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <div>
+          <h1 id="pageTitle">Dashboard</h1>
+          <p id="pageSubtitle">Операционный обзор магазина</p>
+        </div>
+        <div class="topbar-actions">
+          <input id="apiToken" type="password" placeholder="WEB_API_TOKEN">
+          <button id="saveToken" class="button secondary">Сохранить токен</button>
+          <button id="refresh" class="button">Обновить</button>
+        </div>
+      </header>
+
+      <section id="alert" class="alert hidden"></section>
+      <section id="view" class="view"></section>
+    </main>
+  </div>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

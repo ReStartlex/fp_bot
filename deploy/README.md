@@ -81,6 +81,17 @@ systemctl status funpay-ns-api --no-pager
 sudo -u bot /opt/funpay-ns-bot/.venv/bin/python -m src.tools.check_web_api
 ```
 
+Админка сайта встроена в API и доступна на `/`. Она не хранит токен на сервере:
+браузер сохраняет `WEB_API_TOKEN` в localStorage и отправляет его как
+`Authorization: Bearer ...`.
+
+До reverse proxy можно открыть панель через SSH tunnel:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 root@VPS_IP
+# на локальном компьютере: http://127.0.0.1:8080
+```
+
 Логи:
 
 ```bash
