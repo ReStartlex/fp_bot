@@ -90,6 +90,11 @@ class Settings(BaseSettings):
     telegram_proxy_username: SecretStr | None = None
     telegram_proxy_password: SecretStr | None = None
 
+    web_api_enabled: bool = False
+    web_api_host: str = "127.0.0.1"
+    web_api_port: int = Field(default=8080, ge=1, le=65535)
+    web_api_token: SecretStr | None = None
+
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_dir: str = "logs"
 

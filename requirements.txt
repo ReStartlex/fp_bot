@@ -8,6 +8,8 @@ aiosqlite>=0.20.0
 APScheduler>=3.10.0
 loguru>=0.7.2
 pyotp>=2.9.0                   # TOTP для 2FA ns.gifts (если включено)
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
 
 # --- FunPay ---
 # FunPayAPI используем только для long-poll событий чата (golden_key хватает).
