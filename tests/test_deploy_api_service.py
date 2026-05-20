@@ -21,6 +21,8 @@ def test_update_script_manages_api_service_when_enabled():
     assert "systemctl stop funpay-ns-api" in script
     assert "deploy/funpay-ns-api.service" in script
     assert "systemctl start funpay-ns-api" in script
+    assert "API health-check: OK." in script
+    assert "src.tools.check_web_api" in script
 
 
 def test_deploy_docs_include_api_smoke_check():

@@ -120,12 +120,24 @@ if systemctl is-enabled --quiet funpay-ns-api 2>/dev/null \
    || [[ "${API_WAS_RUNNING}" -eq 1 ]]; then
     systemctl start funpay-ns-api
     echo "Сервис funpay-ns-api запущен."
-    sleep 2
+    API_READY=0
+    for _ in $(seq 1 12); do
+        if "${APP_DIR}/.venv/bin/python" -m src.tools.check_web_api >/dev/null 2>&1; then
+            API_READY=1
+            break
+        fi
+        sleep 1
+    done
     if ! systemctl is-active --quiet funpay-ns-api; then
         echo
         echo "── ВНИМАНИЕ: API сервис не поднялся, последние 60 строк лога ──"
         journalctl -u funpay-ns-api -n 60 --no-pager
         echo "────────────────────────────────────────────────────────────"
+    elif [[ "${API_READY}" -eq 1 ]]; then
+        echo "API health-check: OK."
+    else
+        echo "ВНИМАНИЕ: API сервис активен, но /healthz не ответил за 12 секунд."
+        journalctl -u funpay-ns-api -n 30 --no-pager || true
     fi
 fi
 

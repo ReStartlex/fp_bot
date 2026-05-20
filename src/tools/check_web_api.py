@@ -9,6 +9,28 @@ import httpx
 from src.config import get_settings
 
 
+async def _get_with_retry(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    attempts: int = 12,
+    delay_seconds: float = 1.0,
+    headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = await client.get(path, headers=headers)
+            response.raise_for_status()
+            return response
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts:
+                await asyncio.sleep(delay_seconds)
+    assert last_exc is not None
+    raise last_exc
+
+
 async def _main() -> int:
     settings = get_settings()
     base_url = f"http://{settings.web_api_host}:{settings.web_api_port}"
@@ -16,8 +38,7 @@ async def _main() -> int:
 
     async with httpx.AsyncClient(base_url=base_url, timeout=timeout) as client:
         try:
-            health = await client.get("/healthz")
-            health.raise_for_status()
+            health = await _get_with_retry(client, "/healthz")
         except Exception as exc:
             print(f"❌ /healthz недоступен на {base_url}: {exc}")
             return 1
@@ -33,11 +54,11 @@ async def _main() -> int:
             return 0
 
         try:
-            dashboard = await client.get(
+            dashboard = await _get_with_retry(
+                client,
                 "/api/dashboard",
                 headers={"Authorization": f"Bearer {token}"},
             )
-            dashboard.raise_for_status()
         except Exception as exc:
             print(f"❌ /api/dashboard недоступен или auth не прошёл: {exc}")
             return 1
