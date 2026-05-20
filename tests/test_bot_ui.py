@@ -53,6 +53,9 @@ class FakeOrder:
     funpay_order_id: str
     status: str
     ns_custom_id: str | None
+    funpay_lot_id: int = 1
+    error: str | None = None
+    updated_at: datetime | None = None
 
 
 @dataclass
@@ -306,6 +309,29 @@ def test_groups_page_has_markup_controls():
     assert "act:group_open:abcd:0" in callbacks
     assert "group:markup_set:1:12.5" in callbacks
     assert "group:markup_default:1" in callbacks
+
+
+def test_problems_page_has_retry_and_recovery_buttons():
+    bot = object.__new__(TelegramBot)
+    order = FakeOrder(
+        created_at=datetime(2026, 1, 1, 12, 0, 0),
+        funpay_order_id="fp-1",
+        status="pins_ready",
+        ns_custom_id="ns-1",
+        funpay_lot_id=69300023,
+        error="delivery failed",
+    )
+    sess = type("Sess", (), {"items": [order]})()
+
+    text, kb = bot._build_problems_page(  # type: ignore[attr-defined]
+        sess, "abcd", sess.items, 0, 1
+    )
+
+    assert "Панель проблем" in text
+    callbacks = [button.callback_data for row in kb.inline_keyboard for button in row]
+    assert "act:order_retry:abcd:0" in callbacks
+    assert "act:problem_force_sync:abcd:0" in callbacks
+    assert "act:problem_enable_mapping:abcd:0" in callbacks
 
 
 def test_clear_target_removes_menu_target_state():

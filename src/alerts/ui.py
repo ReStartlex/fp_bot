@@ -31,6 +31,8 @@ MENU_KIND_NS_CATS = "ns_cats"
 MENU_KIND_NS_SEARCH = "ns_search_hint"
 MENU_KIND_SYNC = "sync"
 MENU_KIND_ORDERS = "orders"
+MENU_KIND_PROBLEMS = "problems"
+MENU_KIND_STATS = "stats"
 MENU_KIND_RECONNECT = "fp_reconnect"
 MENU_KIND_HELP = "help"
 
@@ -70,6 +72,10 @@ def main_menu(target_lot_label: str | None = None) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📦 Заказы", callback_data=f"menu:{MENU_KIND_ORDERS}"),
+            InlineKeyboardButton(text="🧯 Проблемы", callback_data=f"menu:{MENU_KIND_PROBLEMS}"),
+        ],
+        [
+            InlineKeyboardButton(text="📈 Прибыль", callback_data=f"menu:{MENU_KIND_STATS}"),
             InlineKeyboardButton(
                 text="🔌 FunPay reconnect", callback_data=f"menu:{MENU_KIND_RECONNECT}"
             ),

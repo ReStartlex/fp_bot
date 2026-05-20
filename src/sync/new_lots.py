@@ -18,9 +18,12 @@ from loguru import logger
 from sqlalchemy import select
 
 from src.alerts.telegram import TelegramNotifier
+from src.config import Settings, get_settings
 from src.db.models import KnownLot, Mapping
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
+from src.mapping.suggest import NsSuggestion, suggest_ns_services
+from src.ns import NSClient
 
 
 def _lot_id(lot: Any) -> int | None:
@@ -47,6 +50,9 @@ def _lot_title(lot: Any) -> str | None:
 async def discover_new_lots(
     funpay_client: FunPayClient | None,
     telegram: TelegramNotifier | None,
+    *,
+    ns_client: NSClient | None = None,
+    settings: Settings | None = None,
 ) -> dict[str, int]:
     """
     Один прогон discovery.
@@ -55,6 +61,8 @@ async def discover_new_lots(
     if funpay_client is None:
         logger.debug("discover_new_lots: FunPay не подключён, пропускаю")
         return {"seen": 0, "new": 0, "notified": 0}
+    if settings is None and ns_client is not None:
+        settings = get_settings()
 
     try:
         lots = await funpay_client.get_my_lots()
@@ -108,9 +116,31 @@ async def discover_new_lots(
 
     notified = 0
     if new_lots and telegram is not None:
+        stock = None
+        if (
+            ns_client is not None
+            and settings is not None
+            and settings.new_lots_suggest_enabled
+            and settings.new_lots_suggest_max > 0
+        ):
+            try:
+                stock = await ns_client.get_stock()
+            except Exception as exc:
+                logger.warning(f"discover_new_lots: NS suggestions disabled: {exc}")
         for lid, title in new_lots:
             try:
-                await telegram.new_lot_discovered(lid, title)
+                suggestions: list[NsSuggestion] = []
+                if stock is not None:
+                    suggestions = suggest_ns_services(
+                        lot_title=title,
+                        stock=stock,
+                        limit=settings.new_lots_suggest_max if settings is not None else 3,
+                        min_score=(
+                            settings.new_lots_suggest_min_score
+                            if settings is not None else 20
+                        ),
+                    )
+                await telegram.new_lot_discovered(lid, title, suggestions=suggestions)
                 notified += 1
                 async with session_factory()() as session:
                     row = await session.get(KnownLot, lid)

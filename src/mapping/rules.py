@@ -123,3 +123,19 @@ def should_update_price(
         return True
     diff_percent = abs(new_price - old_price) / old_price * 100.0
     return diff_percent >= threshold_percent
+
+
+def estimate_profit_rub(
+    funpay_price_rub: float | None,
+    ns_price_usd: float | None,
+    fx_rate: float,
+) -> tuple[float, float, float, float] | None:
+    """Оценка прибыли по заказу в RUB: revenue, cost, profit, margin%."""
+    if funpay_price_rub is None or ns_price_usd is None:
+        return None
+    if funpay_price_rub <= 0 or ns_price_usd < 0 or fx_rate <= 0:
+        return None
+    cost_rub = ns_price_usd * fx_rate
+    profit_rub = funpay_price_rub - cost_rub
+    margin_percent = profit_rub / funpay_price_rub * 100.0
+    return funpay_price_rub, cost_rub, profit_rub, margin_percent

@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     # Лоты обнаруживаются и пушатся только один раз каждому ID.
     new_lots_check_interval_seconds: int = Field(default=180, ge=30)
     new_lots_notify_enabled: bool = True
+    new_lots_suggest_enabled: bool = True
+    new_lots_suggest_max: int = Field(default=3, ge=0, le=5)
+    new_lots_suggest_min_score: int = Field(default=20, ge=0)
     timezone: str = "Europe/Moscow"
     ns_use_playground: bool = False
 

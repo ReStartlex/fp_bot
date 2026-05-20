@@ -96,6 +96,7 @@ class App:
             sync_trigger=self._trigger_sync,
             funpay_client=self.fp,
             funpay_reconnect=self._funpay_reconnect,
+            order_retry=self._retry_order,
         )
         await self.bot.start()
 
@@ -293,7 +294,9 @@ class App:
         """Периодический поиск новых FunPay-лотов с алертом в Telegram."""
         try:
             from src.sync.new_lots import discover_new_lots
-            await discover_new_lots(self.fp, self.tg)
+            await discover_new_lots(
+                self.fp, self.tg, ns_client=self.ns, settings=self.settings
+            )
         except Exception as exc:
             logger.exception(f"discover_new_lots упал: {exc}")
 
@@ -328,6 +331,41 @@ class App:
                     f"<code>{event.funpay_order_id}</code>: <code>{short}</code>\n"
                     "Полный traceback — в логах сервера."
                 )
+
+    async def _retry_order(self, funpay_order_id: str) -> dict:
+        from src.db.repo import find_order_by_funpay_id
+        from src.db.session import session_factory
+
+        async with session_factory()() as session:
+            order = await find_order_by_funpay_id(session, funpay_order_id)
+            if order is None:
+                return {"status": "not_found", "reason": "order not found"}
+            if order.status != "pins_ready":
+                return {
+                    "status": "skipped",
+                    "reason": (
+                        "retry поддержан только для pins_ready, "
+                        f"сейчас {order.status}"
+                    ),
+                }
+            event = FunPayOrderEvent(
+                funpay_order_id=order.funpay_order_id,
+                funpay_lot_id=order.funpay_lot_id,
+                buyer_username=order.buyer_username,
+                buyer_user_id=order.buyer_user_id,
+                chat_id=order.chat_id,
+                quantity=order.quantity,
+                funpay_price_rub=order.funpay_price_rub,
+                description=None,
+            )
+
+        return await process_funpay_order(
+            event,
+            settings=self.settings,
+            ns_client=self.ns,
+            funpay_client=self.fp,
+            telegram=self.tg,
+        )
 
     # ---------- Health ----------
 

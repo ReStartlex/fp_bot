@@ -5,7 +5,7 @@ import pytest
 
 from src.config import Currency
 from src.db.models import Mapping
-from src.mapping.rules import compute_pricing, should_update_price
+from src.mapping.rules import compute_pricing, estimate_profit_rub, should_update_price
 from src.ns.models import Service
 
 
@@ -197,3 +197,16 @@ def test_pricing_fractional_markup_propagates_through_calculation():
     # 2 * 90 * 1.055 = 189.9
     assert res.price_target == pytest.approx(189.9)
     assert res.round_price() == 190
+
+
+def test_estimate_profit_rub_returns_revenue_cost_profit_margin():
+    revenue, cost, profit, margin = estimate_profit_rub(383.0, 4.0, 90.0)
+    assert revenue == pytest.approx(383.0)
+    assert cost == pytest.approx(360.0)
+    assert profit == pytest.approx(23.0)
+    assert margin == pytest.approx(23.0 / 383.0 * 100.0)
+
+
+def test_estimate_profit_rub_skips_incomplete_orders():
+    assert estimate_profit_rub(None, 4.0, 90.0) is None
+    assert estimate_profit_rub(383.0, None, 90.0) is None

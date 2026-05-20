@@ -139,7 +139,7 @@ class TelegramNotifier:
         await self.send(text)
 
     async def new_lot_discovered(
-        self, funpay_lot_id: int, title: str | None
+        self, funpay_lot_id: int, title: str | None, *, suggestions=None
     ) -> None:
         """Уведомление о новом FunPay-лоте, у которого ещё нет маппинга."""
         from html import escape
@@ -147,15 +147,38 @@ class TelegramNotifier:
         title_line = (
             f"\n<i>{escape(title)[:160]}</i>" if title else ""
         )
+        suggestion_lines: list[str] = []
+        for item in list(suggestions or [])[:3]:
+            suggestion_lines.append(
+                f"NS#{item.service_id} · {escape(item.service_name)[:80]} · "
+                f"{item.price:.2f}{escape(item.currency)} · stock {item.in_stock}"
+            )
+        suggestions_text = ""
+        if suggestion_lines:
+            suggestions_text = (
+                "\n\n<b>Возможные NS-услуги:</b>\n"
+                + "\n".join(f"• {line}" for line in suggestion_lines)
+            )
         text = (
             f"🆕 <b>Новый лот на FunPay</b>\n"
             f"ID: <code>{funpay_lot_id}</code>"
             f"{title_line}\n\n"
             f"Маппинга ещё нет — товар <b>не будет</b> выкупаться "
             f"автоматически, пока ты его не привяжешь к NS-сервису."
+            f"{suggestions_text}"
         )
+        suggestion_rows = [
+            [
+                {
+                    "text": f"✅ NS#{item.service_id} · {item.service_name[:24]}",
+                    "callback_data": f"newlot:map:{funpay_lot_id}:{item.service_id}",
+                }
+            ]
+            for item in list(suggestions or [])[:3]
+        ]
         markup = {
             "inline_keyboard": [
+                *suggestion_rows,
                 [
                     {
                         "text": "🎯 Выбрать целью",

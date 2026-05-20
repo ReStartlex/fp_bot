@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import html
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from types import SimpleNamespace
 from typing import Awaitable, Callable
@@ -34,16 +34,17 @@ from sqlalchemy import desc, select
 from src.alerts import ui
 from src.alerts.sessions import PAGE_SIZE, PaginationStore, paginate
 from src.config import Settings, get_settings
-from src.db.models import LotGroup, Mapping, Order, SyncRun
+from src.db.models import KnownLot, LotGroup, Mapping, Order, SyncRun
 from src.db.repo import (
     assign_mapping_group,
     classify_lot_group,
+    list_mappings,
     list_lot_groups,
     upsert_mapping,
 )
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
-from src.mapping.rules import compute_pricing
+from src.mapping.rules import compute_pricing, estimate_profit_rub
 from src.ns import NSClient
 from src.ns.models import StockResponse
 from src.sync.fx import get_rate_breakdown
@@ -51,6 +52,7 @@ from src.sync.fx import get_rate_breakdown
 
 SyncTrigger = Callable[[], Awaitable[dict]]
 FunPayReconnect = Callable[[], Awaitable[dict]]
+OrderRetry = Callable[[str], Awaitable[dict]]
 
 # Таймауты: если NS/FunPay завис — бот не должен молчать вечно.
 NS_TIMEOUT_SECONDS = 15.0
@@ -97,6 +99,18 @@ def _format_order_line(o: Order) -> str:
         f"<code>{created_text} MSK</code> "
         f"#{o.funpay_order_id} → {o.status} "
         f"(NS:{o.ns_custom_id or '—'})"
+    )
+
+
+def _format_problem_line(o: Order) -> str:
+    created_at = _to_moscow(o.updated_at or o.created_at)
+    created_text = "—" if created_at is None else created_at.strftime("%m-%d %H:%M")
+    error = (o.error or "").replace("\n", " ")
+    error_text = f"\n   <code>{html.escape(error[:120])}</code>" if error else ""
+    return (
+        f"<code>{created_text} MSK</code> "
+        f"#{html.escape(o.funpay_order_id)} · <b>{html.escape(o.status)}</b> "
+        f"· lot <code>{o.funpay_lot_id}</code>{error_text}"
     )
 
 
@@ -278,11 +292,13 @@ class TelegramBot:
         sync_trigger: SyncTrigger | None = None,
         funpay_client: FunPayClient | None = None,
         funpay_reconnect: FunPayReconnect | None = None,
+        order_retry: OrderRetry | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._sync_trigger = sync_trigger
         self._funpay_client = funpay_client
         self._funpay_reconnect = funpay_reconnect
+        self._order_retry = order_retry
         self._bot: Bot | None = None
         self._dp: Dispatcher | None = None
         self._task: asyncio.Task | None = None
@@ -478,6 +494,18 @@ class TelegramBot:
             if not self._is_owner(msg):
                 return
             await self._do_orders(msg)
+
+        @dp.message(Command("problems"))
+        async def cmd_problems(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_problems(msg)
+
+        @dp.message(Command("stats"))
+        async def cmd_stats(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_stats(msg)
 
         @dp.message(Command("sync"))
         async def cmd_sync(msg: Message) -> None:
@@ -905,6 +933,10 @@ class TelegramBot:
             await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
         elif action == ui.MENU_KIND_ORDERS:
             await self._show_orders_via_cq(cq)
+        elif action == ui.MENU_KIND_PROBLEMS:
+            await self._show_problems_via_cq(cq)
+        elif action == ui.MENU_KIND_STATS:
+            await self._show_stats_via_cq(cq)
         elif action == ui.MENU_KIND_SYNC:
             await self._run_sync_via_cq(cq)
         elif action == ui.MENU_KIND_RECONNECT:
@@ -978,6 +1010,12 @@ class TelegramBot:
             await self._act_map_group(cq, item)
         elif kind == "group_assign":
             await self._act_group_assign(cq, item)
+        elif kind == "order_retry":
+            await self._act_order_retry(cq, item)
+        elif kind == "problem_force_sync":
+            await self._act_problem_force_sync(cq, item)
+        elif kind == "problem_enable_mapping":
+            await self._act_problem_enable_mapping(cq, item)
         else:
             await cq.answer(f"Неизвестное действие: {kind}")
 
@@ -1026,6 +1064,8 @@ class TelegramBot:
             )
         elif kind == "orders":
             text, kb = self._build_orders_page(sess, sid, page_items, page, total_pages)
+        elif kind == "problems":
+            text, kb = self._build_problems_page(sess, sid, page_items, page, total_pages)
         else:
             await cq.answer(f"Неизвестный список: {kind}")
             return
@@ -1261,6 +1301,10 @@ class TelegramBot:
                     callback_data=f"act:group_open:{sid}:{global_idx}",
                 ),
                 InlineKeyboardButton(
+                    text="👁 Preview",
+                    callback_data=f"group:preview:{group.id}",
+                ),
+                InlineKeyboardButton(
                     text="−1%",
                     callback_data=f"group:markup_delta:{group.id}:-1",
                 ),
@@ -1383,6 +1427,51 @@ class TelegramBot:
         )
         return text, kb
 
+    def _build_problems_page(self, sess, sid, page_items, page, total_pages):
+        body = "\n\n".join(_format_problem_line(o) for o in page_items) or "<i>пусто</i>"
+        text = (
+            f"🧯 <b>Панель проблем</b>\n"
+            f"Всего: <b>{len(sess.items)}</b> · "
+            f"страница <b>{page + 1}/{total_pages or 1}</b>\n"
+            "─" * 8
+            + "\n"
+            + body
+        )
+        from aiogram.types import InlineKeyboardButton
+
+        item_buttons: list[list[InlineKeyboardButton]] = []
+        for local_idx, order in enumerate(page_items):
+            global_idx = page * PAGE_SIZE + local_idx
+            row: list[InlineKeyboardButton] = []
+            if order.status == "pins_ready":
+                row.append(
+                    InlineKeyboardButton(
+                        text=f"🔁 Retry #{order.funpay_order_id}",
+                        callback_data=f"act:order_retry:{sid}:{global_idx}",
+                    )
+                )
+            row.append(
+                InlineKeyboardButton(
+                    text="🔄 Force sync lot",
+                    callback_data=f"act:problem_force_sync:{sid}:{global_idx}",
+                )
+            )
+            row.append(
+                InlineKeyboardButton(
+                    text="▶ Mapping",
+                    callback_data=f"act:problem_enable_mapping:{sid}:{global_idx}",
+                )
+            )
+            item_buttons.append(row)
+        kb = ui.list_keyboard(
+            kind="problems",
+            sid=sid,
+            page=page,
+            total_pages=total_pages,
+            item_buttons=item_buttons,
+        )
+        return text, kb
+
     # ─────────────── реализации команд (показ из cmd или из cq) ───────────────
 
     @_guard
@@ -1483,6 +1572,23 @@ class TelegramBot:
         await self._render_paginated_from_cmd(msg, kind="orders", sid=sid, page=0)
 
     @_guard
+    async def _do_problems(self, msg: Message) -> None:
+        sid, total = await self._collect_problems()
+        if total == 0:
+            await self._send_view(
+                msg.chat.id,
+                "🧯 Проблем нет: failed/pins_ready заказов и выключенных mappings не найдено.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        await self._render_paginated_from_cmd(msg, kind="problems", sid=sid, page=0)
+
+    @_guard
+    async def _do_stats(self, msg: Message) -> None:
+        text = await self._render_profit_stats()
+        await self._send_view(msg.chat.id, text, reply_markup=ui.single_close_kb())
+
+    @_guard
     async def _show_orders_via_cq(self, cq: CallbackQuery) -> None:
         sid, total = await self._collect_orders()
         if total == 0:
@@ -1492,12 +1598,203 @@ class TelegramBot:
             return
         await self._render_paginated(cq, kind="orders", sid=sid, page=0)
 
+    @_guard
+    async def _show_problems_via_cq(self, cq: CallbackQuery) -> None:
+        sid, total = await self._collect_problems()
+        if total == 0:
+            await self._edit_or_answer(
+                cq,
+                "🧯 Проблем нет: failed/pins_ready заказов и выключенных mappings не найдено.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        await self._render_paginated(cq, kind="problems", sid=sid, page=0)
+
+    @_guard
+    async def _show_stats_via_cq(self, cq: CallbackQuery) -> None:
+        text = await self._render_profit_stats()
+        await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
+
     async def _collect_orders(self) -> tuple[str, int]:
         async with session_factory()() as session:
             stmt = select(Order).order_by(desc(Order.created_at)).limit(50)
             orders = list((await session.execute(stmt)).scalars().all())
         sid = self._sessions.put(orders, title="orders")
         return sid, len(orders)
+
+    async def _collect_problems(self) -> tuple[str, int]:
+        async with session_factory()() as session:
+            stmt = (
+                select(Order)
+                .where(Order.status.in_(("failed", "pins_ready")))
+                .order_by(desc(Order.updated_at))
+                .limit(50)
+            )
+            items = list((await session.execute(stmt)).scalars().all())
+            disabled = list(
+                (
+                    await session.execute(
+                        select(Mapping)
+                        .where(Mapping.enabled.is_(False))
+                        .order_by(Mapping.funpay_lot_id)
+                        .limit(50)
+                    )
+                ).scalars().all()
+            )
+            for mapping in disabled:
+                items.append(
+                    SimpleNamespace(
+                        funpay_order_id=f"mapping:{mapping.funpay_lot_id}",
+                        funpay_lot_id=mapping.funpay_lot_id,
+                        ns_service_id=mapping.ns_service_id,
+                        ns_custom_id=None,
+                        status="mapping_disabled",
+                        error=f"Mapping выключен: {mapping.label or 'без label'}",
+                        created_at=mapping.created_at,
+                        updated_at=mapping.updated_at,
+                    )
+                )
+        sid = self._sessions.put(items, title="problems")
+        return sid, len(items)
+
+    async def _render_profit_stats(self) -> str:
+        rate = await get_rate_breakdown(self._settings)
+        since = datetime.utcnow() - timedelta(days=7)
+        async with session_factory()() as session:
+            orders = list(
+                (
+                    await session.execute(
+                        select(Order)
+                        .where(Order.status == "delivered")
+                        .where(Order.created_at >= since)
+                        .order_by(desc(Order.created_at))
+                    )
+                ).scalars().all()
+            )
+            mappings = {
+                m.funpay_lot_id: m
+                for m in (await session.execute(select(Mapping))).scalars().all()
+            }
+            groups = {
+                g.id: g.name
+                for g in (await session.execute(select(LotGroup))).scalars().all()
+            }
+
+        revenue = cost = profit = 0.0
+        counted = 0
+        by_group: dict[str, list[float]] = {}
+        for order in orders:
+            estimated = estimate_profit_rub(
+                order.funpay_price_rub, order.ns_price_usd, rate.effective
+            )
+            if estimated is None:
+                continue
+            order_revenue, order_cost, order_profit, _ = estimated
+            revenue += order_revenue
+            cost += order_cost
+            profit += order_profit
+            counted += 1
+            mapping = mappings.get(order.funpay_lot_id)
+            group_name = "Без группы"
+            if mapping is not None and mapping.group_id is not None:
+                group_name = groups.get(mapping.group_id, group_name)
+            bucket = by_group.setdefault(group_name, [0.0, 0.0, 0.0])
+            bucket[0] += 1
+            bucket[1] += order_revenue
+            bucket[2] += order_profit
+
+        margin = profit / revenue * 100.0 if revenue > 0 else 0.0
+        lines = [
+            "📈 <b>Прибыль за 7 дней</b>",
+            "",
+            f"Заказов учтено: <b>{counted}</b>",
+            f"Продажи: <b>{revenue:.0f} ₽</b>",
+            f"Себестоимость NS: <b>{cost:.0f} ₽</b>",
+            f"Прибыль: <b>{profit:.0f} ₽</b>",
+            f"Маржа: <b>{margin:.1f}%</b>",
+            f"Курс оценки: <b>{rate.effective:.4f}</b>",
+        ]
+        if by_group:
+            lines.append("")
+            lines.append("<b>По группам:</b>")
+            for name, values in sorted(
+                by_group.items(), key=lambda item: item[1][2], reverse=True
+            )[:8]:
+                count, group_revenue, group_profit = values
+                group_margin = group_profit / group_revenue * 100.0 if group_revenue else 0.0
+                lines.append(
+                    f"• {html.escape(name)}: <b>{group_profit:.0f} ₽</b> "
+                    f"({int(count)} шт, {group_margin:.1f}%)"
+                )
+        lines.append("")
+        lines.append("<i>Важно: прибыль считается по текущему курсу USD/RUB, исторический курс заказа пока не сохраняется.</i>")
+        return "\n".join(lines)
+
+    async def _render_group_preview(self, group_id: int) -> str:
+        if self._funpay_client is None:
+            return "FunPay не подключён. Preview требует чтения текущих цен лотов."
+
+        from src.config_runtime import get_global_markup_percent, get_stock_cap
+        from src.sync.fx import get_usd_rub_rate
+        from src.sync.stock_sync import _decide_for_one, _flatten_services
+
+        async with session_factory()() as session:
+            group = await session.get(LotGroup, group_id)
+            if group is None:
+                return "Группа не найдена."
+            mappings = await list_mappings(session, only_enabled=True, group_id=group_id)
+        if not mappings:
+            return f"👁 <b>Preview группы {html.escape(group.name)}</b>\n\nАктивных маппингов нет."
+
+        stock = await self._get_stock()
+        services = _flatten_services(stock)
+        fx_rate = await get_usd_rub_rate(self._settings)
+        eff_markup = await get_global_markup_percent(self._settings)
+        eff_stock_cap = await get_stock_cap(self._settings)
+
+        decisions = []
+        for mapping in mappings:
+            decision = await _decide_for_one(
+                services.get(mapping.ns_service_id),
+                mapping,
+                self._settings,
+                fx_rate,
+                self._funpay_client,
+                effective_markup=eff_markup,
+                effective_stock_cap=eff_stock_cap,
+                group=group,
+            )
+            if decision is not None:
+                decisions.append(decision)
+
+        price_changes = [d for d in decisions if d.will_update_price]
+        stock_changes = [d for d in decisions if d.will_update_stock]
+        skipped = [d for d in decisions if d.skip_reason]
+        lines = [
+            f"👁 <b>Preview группы {html.escape(group.name)}</b>",
+            "",
+            f"Активных лотов: <b>{len(mappings)}</b>",
+            f"Цена изменится: <b>{len(price_changes)}</b>",
+            f"Сток изменится: <b>{len(stock_changes)}</b>",
+            f"Skip: <b>{len(skipped)}</b>",
+        ]
+        if price_changes:
+            lines.append("")
+            lines.append("<b>Топ изменений цены:</b>")
+            for decision in price_changes[:8]:
+                label = html.escape(ui.short_title(decision.label, 36))
+                current = "?" if decision.current_price is None else f"{decision.current_price:g}"
+                target = f"{decision.target.round_price():g}"
+                lines.append(f"• {label}: <b>{current}</b> → <b>{target}</b>")
+        if skipped:
+            lines.append("")
+            lines.append("<b>Проблемы:</b>")
+            for decision in skipped[:5]:
+                label = html.escape(ui.short_title(decision.label, 30))
+                lines.append(f"• {label}: <code>{html.escape(decision.skip_reason or '')[:90]}</code>")
+        lines.append("")
+        lines.append("Нажми 🔄 Синхронизация, чтобы применить эти изменения на FunPay.")
+        return "\n".join(lines)
 
     @_guard
     async def _do_sync(self, msg: Message) -> None:
@@ -2037,7 +2334,7 @@ class TelegramBot:
         newlot:inspect:<lot_id> — показать карточку Inspect лота
         """
         parts = (cq.data or "").split(":")
-        if len(parts) != 3:
+        if len(parts) not in (3, 4):
             await cq.answer("Некорректный callback", show_alert=True)
             return
         action = parts[1]
@@ -2083,6 +2380,41 @@ class TelegramBot:
                 return
             text = _format_inspect(lot_id, summary)
             await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
+            return
+
+        if action == "map":
+            if len(parts) != 4:
+                await cq.answer("Некорректный callback map", show_alert=True)
+                return
+            try:
+                service_id = int(parts[3])
+            except ValueError:
+                await cq.answer("Некорректный ns_service_id", show_alert=True)
+                return
+            try:
+                stock = await self._get_stock()
+            except Exception as exc:
+                await cq.answer(f"NS stock упал: {str(exc)[:120]}", show_alert=True)
+                return
+            svc = None
+            for cat in stock.categories:
+                for item in cat.services:
+                    if item.service_id == service_id:
+                        svc = item
+                        break
+                if svc is not None:
+                    break
+            if svc is None:
+                await cq.answer("NS-услуга больше не найдена", show_alert=True)
+                return
+            try:
+                async with session_factory()() as session:
+                    row = await session.get(KnownLot, lot_id)
+                    label = row.title[:60] if row is not None and row.title else f"#{lot_id}"
+                self._target_labels[cq.from_user.id] = label
+                await self._save_mapping_via_cq(cq, funpay_lot_id=lot_id, ns_service=svc)
+            finally:
+                self._target_labels.pop(cq.from_user.id, None)
             return
 
         await cq.answer(f"Неизвестное newlot-действие: {action}", show_alert=True)
@@ -2165,6 +2497,12 @@ class TelegramBot:
                 await session.commit()
             await cq.answer("Группа сброшена", show_alert=False)
             await self._show_mappings_via_cq(cq)
+            return
+
+        if action == "preview":
+            await cq.answer("Считаю preview группы...", show_alert=False)
+            text = await self._render_group_preview(target_id)
+            await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
             return
 
         async with session_factory()() as session:
@@ -3051,6 +3389,57 @@ class TelegramBot:
         await cq.answer(f"📁 Группа: {group.name}", show_alert=False)
         await self._show_mappings_via_cq(cq)
 
+    @_guard
+    async def _act_order_retry(self, cq: CallbackQuery, order) -> None:
+        if self._order_retry is None:
+            await cq.answer("Retry не подключён", show_alert=True)
+            return
+        if getattr(order, "status", None) != "pins_ready":
+            await cq.answer("Retry доступен только для pins_ready", show_alert=True)
+            return
+        await cq.answer("Пробую доставить повторно...", show_alert=False)
+        result = await self._order_retry(order.funpay_order_id)
+        text = (
+            f"🔁 <b>Retry заказа</b>\n"
+            f"FunPay: <code>{html.escape(order.funpay_order_id)}</code>\n"
+            f"Результат: <code>{html.escape(str(result))[:800]}</code>"
+        )
+        await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
+
+    @_guard
+    async def _act_problem_force_sync(self, cq: CallbackQuery, item) -> None:
+        lot_id = getattr(item, "funpay_lot_id", None)
+        try:
+            lot_id = int(lot_id)
+        except (TypeError, ValueError):
+            await cq.answer("Не могу прочитать lot_id", show_alert=True)
+            return
+        await cq.answer("Считаю lot preview...", show_alert=False)
+        text, kb = await self._render_calc(lot_id)
+        await self._edit_or_answer(cq, text, reply_markup=kb)
+
+    @_guard
+    async def _act_problem_enable_mapping(self, cq: CallbackQuery, item) -> None:
+        lot_id = getattr(item, "funpay_lot_id", None)
+        try:
+            lot_id = int(lot_id)
+        except (TypeError, ValueError):
+            await cq.answer("Не могу прочитать lot_id", show_alert=True)
+            return
+        async with session_factory()() as session:
+            mapping = (
+                await session.execute(
+                    select(Mapping).where(Mapping.funpay_lot_id == lot_id)
+                )
+            ).scalar_one_or_none()
+            if mapping is None:
+                await cq.answer("Маппинг не найден", show_alert=True)
+                return
+            mapping.enabled = True
+            await session.commit()
+        await cq.answer(f"Mapping lot {lot_id} включён", show_alert=False)
+        await self._show_problems_via_cq(cq)
+
     async def _refresh_mappings_view(self, cq: CallbackQuery) -> None:
         sid, total = await self._collect_mappings()
         if total == 0:
@@ -3165,6 +3554,7 @@ class TelegramBot:
             "group_mappings": self._build_group_mappings_page,
             "group_assign": self._build_group_assign_page,
             "orders": self._build_orders_page,
+            "problems": self._build_problems_page,
         }.get(kind)
         if builder is None:
             await msg.answer(f"Неизвестный список: {kind}")

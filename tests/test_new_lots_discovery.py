@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -18,6 +19,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.db.models import Base, KnownLot
 from src.db.repo import upsert_mapping
+from src.ns.models import Category, Service, StockResponse
 from src.sync.new_lots import discover_new_lots
 
 
@@ -40,10 +42,29 @@ class FakeFunPay:
 
 class FakeTG:
     def __init__(self):
-        self.calls: list[tuple[int, str | None]] = []
+        self.calls: list[tuple[int, str | None, list]] = []
 
-    async def new_lot_discovered(self, lot_id, title):
-        self.calls.append((lot_id, title))
+    async def new_lot_discovered(self, lot_id, title, *, suggestions=None):
+        self.calls.append((lot_id, title, list(suggestions or [])))
+
+
+class FakeNS:
+    async def get_stock(self):
+        return StockResponse(categories=[
+            Category(
+                category_id=1,
+                category_name="Steam",
+                services=[
+                    Service(
+                        service_id=300,
+                        service_name="Steam Gift Card | US | 5 USD",
+                        price=4.8,
+                        currency="USD",
+                        in_stock=10,
+                    )
+                ],
+            )
+        ])
 
 
 @pytest.fixture()
@@ -106,7 +127,7 @@ async def test_mapped_lot_does_not_notify(db_factory):
     tg = FakeTG()
     stats = await discover_new_lots(fp, tg)
     assert stats == {"seen": 2, "new": 1, "notified": 1}
-    assert tg.calls == [(200, "Steam")]
+    assert [(lot_id, title) for lot_id, title, _ in tg.calls] == [(200, "Steam")]
 
 
 @pytest.mark.asyncio
@@ -135,4 +156,21 @@ async def test_invalid_lot_ids_skipped(db_factory):
     tg = FakeTG()
     stats = await discover_new_lots(fp, tg)
     assert stats == {"seen": 1, "new": 1, "notified": 1}
-    assert tg.calls == [(42, "ok")]
+    assert [(lot_id, title) for lot_id, title, _ in tg.calls] == [(42, "ok")]
+
+
+@pytest.mark.asyncio
+async def test_new_lot_notification_receives_ns_suggestions(db_factory):
+    fp = FakeFunPay([FakeLot(id=200, description="Steam Gift Card 5 USD")])
+    tg = FakeTG()
+
+    settings = SimpleNamespace(
+        new_lots_suggest_enabled=True,
+        new_lots_suggest_max=3,
+        new_lots_suggest_min_score=20,
+    )
+    stats = await discover_new_lots(fp, tg, ns_client=FakeNS(), settings=settings)
+
+    assert stats == {"seen": 1, "new": 1, "notified": 1}
+    assert tg.calls[0][2]
+    assert tg.calls[0][2][0].service_id == 300
