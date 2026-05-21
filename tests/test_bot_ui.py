@@ -315,6 +315,28 @@ def test_mapping_risk_warns_on_currency_mismatch():
     assert any("валюта отличается" in item for item in warnings)
 
 
+def test_mapping_risk_ignores_funpay_id_as_nominal():
+    warnings = mapping_risk_warnings(
+        "#69491067",
+        "PlayStation Store Wallet TR 250 TRY",
+    )
+    assert not any("номинал отличается" in item for item in warnings)
+
+
+def test_newlot_title_extracted_from_notification_text():
+    text = (
+        "🆕 Новый лот на FunPay\n"
+        "ID: 69491067\n"
+        "✈️АВТОВЫДАЧА 🔑 Подарочная карта PSN 🔵 250 TRY (ТУРЦИЯ)\n\n"
+        "Маппинга ещё нет — товар не будет выкупаться автоматически."
+    )
+
+    title = TelegramBot._extract_newlot_title_from_message_text(text, 69491067)
+
+    assert title is not None
+    assert "250 TRY" in title
+
+
 def test_groups_page_has_markup_controls():
     bot = object.__new__(TelegramBot)
     sess = type("Sess", (), {"items": [

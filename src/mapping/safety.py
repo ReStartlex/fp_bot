@@ -5,6 +5,7 @@ import re
 
 
 _CURRENCIES = {"usd", "eur", "try", "rub", "kzt", "uah"}
+_ID_LIKE_MIN_LEN = 6
 
 
 def _norm(value: str | None) -> str:
@@ -24,7 +25,10 @@ def mapping_risk_warnings(funpay_title: str | None, ns_title: str | None) -> lis
         return []
 
     warnings: list[str] = []
-    fp_numbers = {t for t in fp_tokens if t.isdigit()}
+    fp_numbers = {
+        t for t in fp_tokens
+        if t.isdigit() and len(t) < _ID_LIKE_MIN_LEN
+    }
     ns_numbers = {t for t in ns_tokens if t.isdigit()}
     if fp_numbers and ns_numbers and fp_numbers.isdisjoint(ns_numbers):
         warnings.append(

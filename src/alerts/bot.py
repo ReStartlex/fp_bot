@@ -732,6 +732,41 @@ class TelegramBot:
         self._target_lots.pop(chat_id, None)
         self._target_labels.pop(chat_id, None)
 
+    @staticmethod
+    def _extract_newlot_title_from_message_text(text: str | None, lot_id: int) -> str | None:
+        """Достать название лота из Telegram-уведомления о новом лоте."""
+        if not text:
+            return None
+        lines = [line.strip() for line in text.splitlines()]
+        lot_id_text = str(lot_id)
+        for idx, line in enumerate(lines):
+            if lot_id_text not in line:
+                continue
+            for candidate in lines[idx + 1:]:
+                if not candidate:
+                    continue
+                if candidate.startswith("Маппинга ") or candidate.startswith("Возможные "):
+                    return None
+                return candidate[:120]
+        return None
+
+    async def _known_lot_label(self, lot_id: int, cq: CallbackQuery | None = None) -> str:
+        """Человекочитаемая подпись лота для target/risk-check."""
+        try:
+            async with session_factory()() as session:
+                row = await session.get(KnownLot, lot_id)
+                if row is not None and row.title:
+                    return row.title[:120]
+        except Exception:
+            pass
+        message_text = None
+        if cq is not None and cq.message is not None:
+            message_text = getattr(cq.message, "text", None)
+            if not message_text:
+                message_text = getattr(cq.message, "html_text", None)
+        from_message = self._extract_newlot_title_from_message_text(message_text, lot_id)
+        return from_message or f"#{lot_id}"
+
     def _menu_text(self, chat_id: int) -> str:
         target = self._target_label_for(chat_id)
         if target:
@@ -2504,20 +2539,11 @@ class TelegramBot:
             return
 
         if action == "target":
-            # Пытаемся достать человекочитаемое имя из БД (KnownLot)
-            label = f"#{lot_id}"
-            try:
-                from src.db.models import KnownLot
-                async with session_factory()() as session:
-                    row = await session.get(KnownLot, lot_id)
-                    if row is not None and row.title:
-                        label = row.title[:60]
-            except Exception:
-                pass
+            label = await self._known_lot_label(lot_id, cq)
             self._target_lots[cq.from_user.id] = lot_id
-            self._target_labels[cq.from_user.id] = label
+            self._target_labels[cq.from_user.id] = label[:60]
             await cq.answer(
-                f"🎯 Цель: {label}\nТеперь открой 🗂 Каталог NS или /ns_search "
+                f"🎯 Цель: {label[:80]}\nТеперь открой 🗂 Каталог NS или /ns_search "
                 "и нажми ✅ на нужной услуге.",
                 show_alert=True,
             )
@@ -2550,10 +2576,15 @@ class TelegramBot:
             except ValueError:
                 await cq.answer("Некорректный ns_service_id", show_alert=True)
                 return
+            await cq.answer("Проверяю NS-услугу и маппинг...", show_alert=False)
             try:
                 stock = await self._get_stock()
             except Exception as exc:
-                await cq.answer(f"NS stock упал: {str(exc)[:120]}", show_alert=True)
+                if cq.message is not None:
+                    await cq.message.answer(
+                        f"❌ NS stock упал: <code>{html.escape(str(exc))[:300]}</code>",
+                        reply_markup=ui.single_close_kb(),
+                    )
                 return
             svc = None
             for cat in stock.categories:
@@ -2564,14 +2595,21 @@ class TelegramBot:
                 if svc is not None:
                     break
             if svc is None:
-                await cq.answer("NS-услуга больше не найдена", show_alert=True)
+                if cq.message is not None:
+                    await cq.message.answer(
+                        "❌ NS-услуга больше не найдена. Обнови каталог или используй /ns_search.",
+                        reply_markup=ui.single_close_kb(),
+                    )
                 return
             try:
-                async with session_factory()() as session:
-                    row = await session.get(KnownLot, lot_id)
-                    label = row.title[:60] if row is not None and row.title else f"#{lot_id}"
+                label = await self._known_lot_label(lot_id, cq)
                 self._target_labels[cq.from_user.id] = label
-                await self._save_mapping_via_cq(cq, funpay_lot_id=lot_id, ns_service=svc)
+                await self._save_mapping_via_cq(
+                    cq,
+                    funpay_lot_id=lot_id,
+                    ns_service=svc,
+                    answer_callback=False,
+                )
             finally:
                 self._target_labels.pop(cq.from_user.id, None)
             return
@@ -3723,7 +3761,13 @@ class TelegramBot:
         await self._render_paginated(cq, kind="mappings", sid=sid, page=0)
 
     async def _save_mapping_via_cq(
-        self, cq: CallbackQuery, *, funpay_lot_id: int, ns_service, force: bool = False
+        self,
+        cq: CallbackQuery,
+        *,
+        funpay_lot_id: int,
+        ns_service,
+        force: bool = False,
+        answer_callback: bool = True,
     ) -> None:
         fp_label = self._target_labels.get(cq.from_user.id) or f"#{funpay_lot_id}"
         warnings = mapping_risk_warnings(fp_label, getattr(ns_service, "service_name", None))
@@ -3749,7 +3793,8 @@ class TelegramBot:
                     InlineKeyboardButton(text="✖ Отмена", callback_data="target:clear"),
                 ],
             ])
-            await cq.answer("Нужно подтверждение", show_alert=True)
+            if answer_callback:
+                await cq.answer("Нужно подтверждение", show_alert=True)
             if cq.message is not None:
                 await cq.message.answer(text, reply_markup=kb)
             return
@@ -3777,10 +3822,11 @@ class TelegramBot:
             if group is not None
             else "📁 Группа: <i>не определена</i>\n"
         )
-        await cq.answer(
-            f"✅ Замаппил «{fp_label}» → {svc_label}",
-            show_alert=True,
-        )
+        if answer_callback:
+            await cq.answer(
+                f"✅ Замаппил «{fp_label}» → {svc_label}",
+                show_alert=True,
+            )
         if cq.message is not None:
             await cq.message.answer(
                 f"✅ <b>Маппинг сохранён</b>\n"
