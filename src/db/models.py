@@ -91,6 +91,9 @@ class ChatState(Base):
     greeted_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     last_help_request_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     help_requests_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_paid_order_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_manual_message_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    manual_messages_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class RuntimeSetting(Base):

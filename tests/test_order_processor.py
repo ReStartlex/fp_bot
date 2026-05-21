@@ -683,6 +683,42 @@ async def test_help_request_allows_auto_delivery_during_grace(
 
 
 @pytest.mark.asyncio
+async def test_manual_intervention_before_late_order_blocks_ns_purchase(
+    db_session_factory, settings,
+):
+    await _make_mapping(db_session_factory)
+    async with db_session_factory() as session:
+        state = ChatState(chat_id=555, buyer_username="alice")
+        state.last_paid_order_at = datetime.utcnow() - timedelta(minutes=10)
+        state.last_manual_message_at = datetime.utcnow() - timedelta(minutes=2)
+        session.add(state)
+        await session.commit()
+
+    ns = FakeNS(wait_pins=["SHOULD-NOT-BUY"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    result = await process_funpay_order(
+        _event(order_id="fp-manual-late"),
+        settings=settings,
+        ns_client=ns,
+        funpay_client=fp,
+        telegram=tg,
+    )
+
+    assert result["status"] == "manual_hold"
+    assert ns.created_calls == 0
+    assert ns.paid_calls == 0
+    assert fp.sent == []
+    assert tg.warnings
+    db_order = await _order(db_session_factory, "fp-manual-late")
+    assert db_order is not None
+    assert db_order.status == "manual_hold"
+    assert db_order.ns_custom_id is None
+    assert db_order.pins_json is None
+
+
+@pytest.mark.asyncio
 async def test_order_failure_disables_lot_before_more_buyers(
     db_session_factory, settings,
 ):

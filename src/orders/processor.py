@@ -297,6 +297,7 @@ async def _should_hold_delivery(
     order: Order,
     *,
     grace_seconds: int | None = None,
+    manual_guard_seconds: int | None = None,
 ) -> bool:
     """
     True если перед доставкой нужно остановиться и отдать заказ оператору.
@@ -313,11 +314,26 @@ async def _should_hold_delivery(
     from src.db.models import ChatState
 
     state = await session.get(ChatState, order.chat_id)
-    if state is None or state.last_help_request_at is None:
+    if state is None:
         return False
     created_at = order.created_at
     # SQLite server_default в тестах иногда отдаёт naive datetime — сравниваем
     # naive UTC, как и остальной код в проекте.
+    manual_at = getattr(state, "last_manual_message_at", None)
+    if manual_at is not None:
+        if manual_at >= created_at:
+            return True
+        if manual_guard_seconds is None:
+            manual_guard_seconds = int(
+                get_settings().order_manual_intervention_guard_seconds
+            )
+        if manual_guard_seconds <= 0:
+            return True
+        if created_at - manual_at <= timedelta(seconds=manual_guard_seconds):
+            return True
+
+    if state.last_help_request_at is None:
+        return False
     if state.last_help_request_at < created_at:
         return False
     if grace_seconds is None:
@@ -479,6 +495,38 @@ async def _process_locked(
         order_status = db_order.status
         existing_ns_custom_id = db_order.ns_custom_id
         existing_ns_price_usd = db_order.ns_price_usd
+
+    # Если продавец уже вмешался вручную после оплаты, не покупаем код в NS:
+    # это дешевле и безопаснее, чем купить pins и остановиться только перед доставкой.
+    if not force_delivery and order_status == "received" and existing_ns_custom_id is None:
+        async with session_factory()() as session:
+            db_order = await find_order_by_funpay_id(session, event.funpay_order_id)
+            assert db_order is not None
+            if await _should_hold_delivery(
+                session,
+                db_order,
+                grace_seconds=int(settings.chat_help_auto_delivery_grace_seconds),
+                manual_guard_seconds=int(settings.order_manual_intervention_guard_seconds),
+            ):
+                await update_order(
+                    session,
+                    db_order,
+                    status="manual_hold",
+                    error=(
+                        "manual_hold: help/manual intervention before NS purchase; "
+                        "автопокупка остановлена во избежание дубля"
+                    ),
+                )
+                await session.commit()
+                if telegram is not None:
+                    await telegram.warning(
+                        f"🛑 Заказ <code>{event.funpay_order_id}</code> "
+                        "остановлен до покупки в NS: в чате было ручное вмешательство."
+                    )
+                return {
+                    "status": "manual_hold",
+                    "reason": "manual intervention before ns purchase",
+                }
 
     # ─── 5. Приветствие в чате FunPay (один раз, при первом заходе) ───
     if (
@@ -649,6 +697,9 @@ async def _process_locked(
                     session,
                     db_order,
                     grace_seconds=int(settings.chat_help_auto_delivery_grace_seconds),
+                    manual_guard_seconds=int(
+                        settings.order_manual_intervention_guard_seconds
+                    ),
                 )
             ):
                 await update_order(
@@ -657,22 +708,22 @@ async def _process_locked(
                     pins=pins,
                     status="manual_hold",
                     error=(
-                        "manual_hold: покупатель вызвал !помощь, окно автовыдачи истекло; "
-                        "pins сохранены, автоматическая выдача остановлена"
+                        "manual_hold: help/manual intervention before delivery; "
+                        "pins сохранены, автоматическая выдача остановлена во избежание дубля"
                     ),
                 )
                 await session.commit()
                 if telegram is not None:
                     await telegram.warning(
                         f"🛑 Заказ <code>{event.funpay_order_id}</code> "
-                        "поставлен на ручную проверку после !помощь и окна автовыдачи. "
+                        "поставлен на ручную проверку после help/manual intervention. "
                         "Pins сохранены, покупателю автоматически не отправлены."
                     )
                 return {
                     "status": "manual_hold",
                     "ns_custom_id": ns_custom_id,
                     "pins_count": len(pins),
-                    "reason": "help requested before delivery",
+                    "reason": "help/manual intervention before delivery",
                 }
             await update_order(session, db_order, status="pins_ready", pins=pins)
             await session.commit()
@@ -724,6 +775,9 @@ async def _deliver_pins(
                 session,
                 latest,
                 grace_seconds=help_grace_seconds,
+                manual_guard_seconds=int(
+                    get_settings().order_manual_intervention_guard_seconds
+                ),
             )
         ):
             await update_order(
@@ -732,7 +786,7 @@ async def _deliver_pins(
                 status="manual_hold",
                 error=(
                     latest.error
-                    or "manual_hold: покупатель вызвал !помощь, окно автовыдачи истекло; автодоставка остановлена"
+                    or "manual_hold: help/manual intervention; автодоставка остановлена"
                 ),
             )
             await session.commit()

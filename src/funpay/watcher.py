@@ -533,15 +533,14 @@ class FunPayWatcher:
             for m in new_messages:
                 author_id = m.get("author_id")
                 author_username = m.get("author_username") or username
-                if self._is_my_message(author_id, author_username):
-                    continue
+                is_my_message = self._is_my_message(author_id, author_username)
                 msg = FunPayMessageEvent(
                     chat_id=chat_id,
                     chat_username=username,
                     author_id=author_id,
                     author_username=author_username,
                     text=m.get("text", ""),
-                    is_my_message=False,
+                    is_my_message=is_my_message,
                 )
                 if not msg.text:
                     continue
@@ -706,8 +705,6 @@ class FunPayWatcher:
                     f"FunPay {type_str}: не смог нормализовать (нет text?): "
                     f"event={event!r}"
                 )
-                return
-            if msg.is_my_message:
                 return
             if not self._dedup_register("msg", msg):
                 # Уже видели через poller — игнорируем.

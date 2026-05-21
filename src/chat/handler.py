@@ -25,6 +25,8 @@ from src.db.repo import (
     list_active_orders_for_chat,
     mark_greeted,
     mark_help_requested,
+    mark_manual_intervention,
+    mark_paid_order_seen,
 )
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
@@ -164,8 +166,13 @@ class ChatHandler:
             f"is_my={event.is_my_message}"
         )
 
+        text = _clean_chat_text(event.text or "")
+        if not text:
+            log.debug("ChatHandler: пустой текст после strip — пропуск")
+            return
+
         if event.is_my_message:
-            log.debug("ChatHandler: пропускаю — is_my_message=True")
+            await self._handle_own_message(event, text, log)
             return
 
         # Подстраховка: сравниваем author_username с моим ником.
@@ -183,11 +190,6 @@ class ChatHandler:
                 f"ChatHandler: пропускаю — автор @{event.author_username} "
                 f"совпадает с моим ником (self-message)"
             )
-            return
-
-        text = _clean_chat_text(event.text or "")
-        if not text:
-            log.debug("ChatHandler: пустой текст после strip — пропуск")
             return
 
         if _looks_like_own_template_message(text):
@@ -225,6 +227,17 @@ class ChatHandler:
         self, event: FunPayMessageEvent, kind: FunPaySystemKind, log
     ) -> None:
         if kind == "paid_order":
+            try:
+                async with session_factory()() as session:
+                    state = await get_or_create_chat_state(
+                        session,
+                        chat_id=event.chat_id,
+                        buyer_username=event.author_username,
+                    )
+                    await mark_paid_order_seen(session, state)
+                    await session.commit()
+            except Exception as exc:
+                log.warning(f"Не записал paid-order marker в ChatState: {exc}")
             log.info(
                 "ChatHandler: пропускаю системное сообщение FunPay об оплате; "
                 "заказ обработает order pipeline"
@@ -250,6 +263,53 @@ class ChatHandler:
                 f"Не отправил ответ на системное сообщение FunPay "
                 f"kind={kind} в чат {event.chat_id}: {exc}"
             )
+
+    async def _handle_own_message(
+        self, event: FunPayMessageEvent, text: str, log
+    ) -> None:
+        """
+        Исходящее сообщение продавца в чат с активной/недавней оплатой — это
+        ручное вмешательство. После него автодоставка не должна догонять чат
+        вторым кодом.
+        """
+        if _looks_like_own_template_message(text) or _looks_like_funpay_system_message(text):
+            log.debug("ChatHandler: своё шаблонное/системное сообщение — пропуск")
+            return
+
+        held_orders = []
+        try:
+            async with session_factory()() as session:
+                state = await get_or_create_chat_state(
+                    session,
+                    chat_id=event.chat_id,
+                    buyer_username=event.author_username,
+                )
+                await mark_manual_intervention(session, state)
+                held_orders = await hold_active_orders_for_chat(
+                    session,
+                    chat_id=event.chat_id,
+                    reason=(
+                        "manual_hold: продавец вручную написал в чат; "
+                        "автовыдача остановлена, чтобы не выдать дубль"
+                    ),
+                    grace_seconds=0,
+                )
+                await session.commit()
+        except Exception as exc:
+            log.warning(f"Не записал manual-intervention marker в ChatState: {exc}")
+            return
+
+        if held_orders and self._tg is not None:
+            ids = ", ".join(f"#{order.funpay_order_id}" for order in held_orders[:5])
+            await self._tg.warning(
+                "Ручное сообщение продавца остановило автовыдачу "
+                f"для заказов: <code>{ids}</code>. "
+                "Если товар уже выдан вручную, отметь это в /problems."
+            )
+        log.warning(
+            f"ChatHandler: ручное исходящее сообщение в чат {event.chat_id}; "
+            f"held_orders={len(held_orders)}"
+        )
 
     async def _handle_help_request(
         self, event: FunPayMessageEvent, state_chat_id: int

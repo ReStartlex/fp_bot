@@ -122,6 +122,10 @@ class Settings(BaseSettings):
     # время завершить нормальную выдачу. Если товар не выдан после этого окна,
     # заказ уходит в manual_hold и оператор решает вручную.
     chat_help_auto_delivery_grace_seconds: int = Field(default=420, ge=0)
+    # Если продавец вручную написал в чат после оплаты, автодоставка по этому
+    # чату блокируется. Окно нужно для поздно увиденных заказов: если order
+    # event пришёл после ручного сообщения, бот всё равно не должен выдавать дубль.
+    order_manual_intervention_guard_seconds: int = Field(default=7200, ge=0)
     work_hours_start: int = Field(default=12, ge=0, le=23)
     work_hours_end: int = Field(default=23, ge=1, le=24)
     seller_display_name: str = "продавец"

@@ -371,6 +371,19 @@ async def mark_help_requested(session: AsyncSession, state: ChatState) -> None:
     await session.flush()
 
 
+async def mark_paid_order_seen(session: AsyncSession, state: ChatState) -> None:
+    """Запомнить, что в чате было системное сообщение об оплате заказа."""
+    state.last_paid_order_at = datetime.utcnow()
+    await session.flush()
+
+
+async def mark_manual_intervention(session: AsyncSession, state: ChatState) -> None:
+    """Запомнить ручное исходящее сообщение продавца в чат."""
+    state.last_manual_message_at = datetime.utcnow()
+    state.manual_messages_count = (state.manual_messages_count or 0) + 1
+    await session.flush()
+
+
 # ---------- FunPay chat cursors ----------
 
 async def get_chat_cursor(

@@ -81,6 +81,17 @@ def _migrate_sqlite_schema(sync_conn) -> None:
             if name not in columns:
                 sync_conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} FLOAT"))
                 logger.info(f"init_db: добавлена колонка orders.{name}")
+    if "chat_states" in tables:
+        columns = {col["name"] for col in inspector.get_columns("chat_states")}
+        for name in ("last_paid_order_at", "last_manual_message_at"):
+            if name not in columns:
+                sync_conn.execute(text(f"ALTER TABLE chat_states ADD COLUMN {name} DATETIME"))
+                logger.info(f"init_db: добавлена колонка chat_states.{name}")
+        if "manual_messages_count" not in columns:
+            sync_conn.execute(
+                text("ALTER TABLE chat_states ADD COLUMN manual_messages_count INTEGER DEFAULT 0")
+            )
+            logger.info("init_db: добавлена колонка chat_states.manual_messages_count")
 
 
 async def close_db() -> None:
