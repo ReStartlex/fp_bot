@@ -799,8 +799,14 @@ async def _deliver_pins(
     profit_rub: float | None = None
     profit_margin_percent: float | None = None
     try:
-        fx_rate_at_sale = await get_usd_rub_rate(get_settings())
-        estimated = estimate_profit_rub(event.funpay_price_rub, ns_price_usd, fx_rate_at_sale)
+        settings = get_settings()
+        fx_rate_at_sale = await get_usd_rub_rate(settings)
+        estimated = estimate_profit_rub(
+            event.funpay_price_rub,
+            ns_price_usd,
+            fx_rate_at_sale,
+            withdrawal_fee_percent=settings.funpay_withdrawal_fee_percent,
+        )
         if estimated is not None:
             _, _, profit_rub, profit_margin_percent = estimated
     except Exception as exc:

@@ -129,13 +129,26 @@ def estimate_profit_rub(
     funpay_price_rub: float | None,
     ns_price_usd: float | None,
     fx_rate: float,
+    *,
+    withdrawal_fee_percent: float = 3.0,
 ) -> tuple[float, float, float, float] | None:
-    """Оценка прибыли по заказу в RUB: revenue, cost, profit, margin%."""
+    """
+    Оценка прибыли по заказу в RUB: revenue, ns_cost, net_profit, margin%.
+
+    `revenue` — сумма продажи на FunPay до вывода.
+    `net_profit` уже учитывает потерю на выводе с FunPay.
+    """
     if funpay_price_rub is None or ns_price_usd is None:
         return None
-    if funpay_price_rub <= 0 or ns_price_usd < 0 or fx_rate <= 0:
+    if (
+        funpay_price_rub <= 0
+        or ns_price_usd < 0
+        or fx_rate <= 0
+        or withdrawal_fee_percent < 0
+    ):
         return None
     cost_rub = ns_price_usd * fx_rate
-    profit_rub = funpay_price_rub - cost_rub
+    withdrawal_fee_rub = funpay_price_rub * withdrawal_fee_percent / 100.0
+    profit_rub = funpay_price_rub - withdrawal_fee_rub - cost_rub
     margin_percent = profit_rub / funpay_price_rub * 100.0
     return funpay_price_rub, cost_rub, profit_rub, margin_percent

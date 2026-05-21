@@ -15,7 +15,7 @@ from src.db.models import Base
 import src.config_runtime as rt
 
 
-def _settings(*, markup: float = 6.0, premium: float = 2.0, stock_cap: int = 100) -> Settings:
+def _settings(*, markup: float = 5.0, premium: float = 3.0, stock_cap: int = 100) -> Settings:
     return Settings(  # type: ignore[call-arg]
         ns_user_id=1, ns_login="x", ns_password="x",
         ns_api_secret="QQ==", funpay_golden_key="x", funpay_user_id=1,

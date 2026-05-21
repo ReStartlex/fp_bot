@@ -195,20 +195,24 @@ async def get_profit_summary(days: int = 7, settings: Settings | None = None) ->
             ).scalars().all()
         )
 
-    revenue = cost = profit = 0.0
+    revenue = cost = profit = withdrawal_fee = 0.0
     counted = exact_count = 0
     for order in orders:
         fx = order.fx_rate_at_sale or rate.effective
-        estimated = estimate_profit_rub(order.funpay_price_rub, order.ns_price_usd, fx)
+        estimated = estimate_profit_rub(
+            order.funpay_price_rub,
+            order.ns_price_usd,
+            fx,
+            withdrawal_fee_percent=settings.funpay_withdrawal_fee_percent,
+        )
         if estimated is None:
             continue
         order_revenue, order_cost, order_profit, margin = estimated
-        if order.profit_rub is not None:
-            order_profit = order.profit_rub
-            order_cost = order_revenue - order_profit
+        if order.fx_rate_at_sale is not None:
             exact_count += 1
         revenue += order_revenue
         cost += order_cost
+        withdrawal_fee += order_revenue * settings.funpay_withdrawal_fee_percent / 100.0
         profit += order_profit
         counted += 1
     margin = profit / revenue * 100.0 if revenue > 0 else 0.0
@@ -218,6 +222,8 @@ async def get_profit_summary(days: int = 7, settings: Settings | None = None) ->
         "exact_orders": exact_count,
         "revenue_rub": revenue,
         "cost_rub": cost,
+        "withdrawal_fee_rub": withdrawal_fee,
+        "withdrawal_fee_percent": settings.funpay_withdrawal_fee_percent,
         "profit_rub": profit,
         "margin_percent": margin,
         "fallback_fx_rate": rate.effective,

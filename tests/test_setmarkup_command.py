@@ -256,6 +256,39 @@ def test_plain_text_setmarkup_alias_is_accepted():
     _async(go())
 
 
+def test_reset_markups_can_set_global_default_and_clear_overrides():
+    async def go():
+        await init_db()
+        try:
+            await _seed_mapping(69300023)
+            await _run("/setmarkup 69300023 9")
+            bot = TelegramBot(settings=_settings())
+            msg = SimpleNamespace(
+                text="/reset_markups 5",
+                answer=AsyncMock(),
+                chat=SimpleNamespace(id=123),
+                from_user=SimpleNamespace(id=123),
+            )
+
+            await bot._do_reset_markups(msg)  # type: ignore[arg-type]
+
+            async with session_factory()() as session:
+                obj = (
+                    await session.execute(
+                        select(Mapping).where(Mapping.funpay_lot_id == 69300023)
+                    )
+                ).scalar_one()
+            from src.config_runtime import get_global_markup_percent
+
+            assert obj.markup_percent is None
+            assert await get_global_markup_percent(_settings()) == pytest.approx(5.0)
+            reply = msg.answer.call_args.args[0]
+            assert "5.00%" in reply
+        finally:
+            await close_db()
+    _async(go())
+
+
 def test_plain_text_unknown_is_not_handled():
     bot = TelegramBot(settings=_settings())
     msg = SimpleNamespace(

@@ -267,7 +267,7 @@ class TelegramBot:
         "/map &lt;funpay_lot_id&gt; &lt;ns_service_id&gt; [markup%] [label]\n"
         "/unmap &lt;funpay_lot_id&gt;\n"
         "/setmarkup &lt;funpay_lot_id&gt; &lt;percent|default&gt;\n"
-        "/reset_markups — обнулить индивидуальные наценки\n"
+        "/reset_markups [percent] — сбросить индивидуальные наценки\n"
         "/clear_target — забыть выбранный целевой лот\n"
         "/calc &lt;funpay_lot_id&gt; — посчитать цены по маппингу\n"
         "/inspect_lot &lt;funpay_lot_id&gt; — заглянуть в LotFields\n"
@@ -1747,22 +1747,28 @@ class TelegramBot:
                 for g in (await session.execute(select(LotGroup))).scalars().all()
             }
 
-        revenue = cost = profit = 0.0
+        revenue = cost = profit = withdrawal_fee = 0.0
         counted = 0
         by_group: dict[str, list[float]] = {}
         exact_count = 0
         for order in orders:
             fx = getattr(order, "fx_rate_at_sale", None) or rate.effective
-            estimated = estimate_profit_rub(order.funpay_price_rub, order.ns_price_usd, fx)
+            estimated = estimate_profit_rub(
+                order.funpay_price_rub,
+                order.ns_price_usd,
+                fx,
+                withdrawal_fee_percent=self._settings.funpay_withdrawal_fee_percent,
+            )
             if estimated is None:
                 continue
             order_revenue, order_cost, order_profit, _ = estimated
-            if getattr(order, "profit_rub", None) is not None:
-                order_profit = float(order.profit_rub)
-                order_cost = order_revenue - order_profit
+            if getattr(order, "fx_rate_at_sale", None) is not None:
                 exact_count += 1
             revenue += order_revenue
             cost += order_cost
+            withdrawal_fee += (
+                order_revenue * self._settings.funpay_withdrawal_fee_percent / 100.0
+            )
             profit += order_profit
             counted += 1
             mapping = mappings.get(order.funpay_lot_id)
@@ -1781,7 +1787,9 @@ class TelegramBot:
             f"Заказов учтено: <b>{counted}</b>",
             f"Продажи: <b>{revenue:.0f} ₽</b>",
             f"Себестоимость NS: <b>{cost:.0f} ₽</b>",
-            f"Прибыль: <b>{profit:.0f} ₽</b>",
+            f"Вывод FunPay {self._settings.funpay_withdrawal_fee_percent:.1f}%: "
+            f"<b>-{withdrawal_fee:.0f} ₽</b>",
+            f"Чистая прибыль: <b>{profit:.0f} ₽</b>",
             f"Маржа: <b>{margin:.1f}%</b>",
             f"Точный курс в заказах: <b>{exact_count}/{counted}</b>",
             f"Курс для старых заказов: <b>{rate.effective:.4f}</b>",
@@ -2837,10 +2845,36 @@ class TelegramBot:
     @_guard
     async def _do_reset_markups(self, msg: Message) -> None:
         """
-        /reset_markups — обнулить markup_percent у всех маппингов, чтобы они
-        начали использовать глобальный default из .env. Полезно если ты
-        поменял MARKUP_PERCENT и хочешь, чтобы это сразу применилось ко всем.
+        /reset_markups [percent] — обнулить markup_percent у всех маппингов,
+        чтобы они начали использовать глобальный default. Если передать percent,
+        сначала меняем runtime default, затем сбрасываем маппинги на него.
         """
+        parts = (msg.text or "").strip().split()
+        requested_markup: float | None = None
+        if len(parts) >= 2:
+            raw = parts[1].lower().replace(",", ".").rstrip("%")
+            try:
+                requested_markup = float(raw)
+            except (TypeError, ValueError):
+                await msg.answer(
+                    "Использование: <code>/reset_markups [percent]</code>\n\n"
+                    "Примеры:\n"
+                    "<code>/reset_markups</code> — сбросить маппинги на текущий global\n"
+                    "<code>/reset_markups 5</code> — сделать global 5% и сбросить маппинги",
+                    reply_markup=ui.single_close_kb(),
+                )
+                return
+            if requested_markup < 0 or requested_markup > 200:
+                await msg.answer(
+                    "Наценка должна быть в диапазоне <b>0..200%</b>.",
+                    reply_markup=ui.single_close_kb(),
+                )
+                return
+
+        if requested_markup is not None:
+            from src.config_runtime import set_global_markup_percent
+            await set_global_markup_percent(requested_markup)
+
         async with session_factory()() as session:
             stmt = select(Mapping)
             rows = list((await session.execute(stmt)).scalars().all())
@@ -2854,15 +2888,21 @@ class TelegramBot:
 
         from src.config_runtime import get_global_markup_percent
         eff = await get_global_markup_percent(self._settings)
+        prefix = (
+            f"✅ Глобальная наценка установлена: <b>{eff:.2f}%</b>.\n"
+            if requested_markup is not None else ""
+        )
         await msg.answer(
-            (
-                f"♻ Сброшено наценок: <b>{affected}</b> "
-                f"(из {len(rows)} маппингов).\n"
-                f"Теперь все используют глобальную <b>{eff:.2f}%</b>.\n\n"
-                "Запусти 🔄 Синхронизация или /sync, чтобы новые цены применились."
-            ) if affected > 0 else (
-                f"Все {len(rows)} маппингов уже используют глобальную "
-                f"наценку <b>{eff:.2f}%</b> — менять нечего."
+            prefix + (
+                (
+                    f"♻ Сброшено наценок: <b>{affected}</b> "
+                    f"(из {len(rows)} маппингов).\n"
+                    f"Теперь все используют глобальную <b>{eff:.2f}%</b>.\n\n"
+                    "Запусти 🔄 Синхронизация или /sync, чтобы новые цены применились."
+                ) if affected > 0 else (
+                    f"Все {len(rows)} маппингов уже используют глобальную "
+                    f"наценку <b>{eff:.2f}%</b> — менять нечего."
+                )
             ),
             reply_markup=ui.single_close_kb(),
         )
@@ -2885,7 +2925,7 @@ class TelegramBot:
                 "  <b>stockcap</b> — лимит остатков на FunPay (1..100000)\n\n"
                 "Примеры:\n"
                 "<code>/setdefault markup 5</code>\n"
-                "<code>/setdefault premium 2.5</code>\n"
+                "<code>/setdefault premium 3</code>\n"
                 "<code>/setdefault stockcap 50</code>\n"
                 "<code>/setdefault markup default</code> — вернуть к .env",
                 reply_markup=ui.single_close_kb(),
@@ -2991,13 +3031,14 @@ class TelegramBot:
             f"     в .env: {self._settings.markup_percent}%\n"
             f"💱 Премия к USD: <b>{eff_premium:.2f}%</b> {src(self._settings.usd_rub_premium_percent, overrides['usd_rub_premium_percent'])}\n"
             f"     в .env: {self._settings.usd_rub_premium_percent}%\n"
+            f"🏦 Вывод FunPay: <b>{self._settings.funpay_withdrawal_fee_percent:.2f}%</b> <i>из .env</i>\n"
             f"📦 Лимит остатков: <b>{eff_stock}</b> {src(self._settings.funpay_stock_cap, overrides['funpay_stock_cap'])}\n"
             f"     в .env: {self._settings.funpay_stock_cap}\n\n"
             f"⏱ Sync каждые: <b>{self._settings.sync_interval_seconds}с</b>\n"
             f"🔁 Discovery новых лотов: <b>{self._settings.new_lots_check_interval_seconds}с</b>\n\n"
             "Меняй на лету:\n"
             "<code>/setdefault markup 5</code>\n"
-            "<code>/setdefault premium 2.5</code>\n"
+            "<code>/setdefault premium 3</code>\n"
             "<code>/setdefault stockcap 50</code>\n"
             "<code>/setdefault &lt;param&gt; default</code> — сбросить override"
         )

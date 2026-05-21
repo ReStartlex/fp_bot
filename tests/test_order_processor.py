@@ -253,7 +253,7 @@ async def test_happy_path_pay_returns_pins_immediately(
     assert db_order.ns_custom_id == "ns-custom-1"
     assert db_order.fx_rate_at_sale == 100.0
     assert db_order.profit_rub == pytest.approx(
-        db_order.funpay_price_rub - db_order.ns_price_usd * 100.0
+        db_order.funpay_price_rub * 0.97 - db_order.ns_price_usd * 100.0
     )
     assert db_order.profit_margin_percent == pytest.approx(
         db_order.profit_rub / db_order.funpay_price_rub * 100.0

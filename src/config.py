@@ -61,15 +61,15 @@ class Settings(BaseSettings):
     funpay_user_id: int
     funpay_chat_language: Literal["ru", "en"] = "ru"
 
-    markup_percent: float = Field(default=6.0, ge=0)
+    markup_percent: float = Field(default=5.0, ge=0)
     funpay_currency: Currency = Currency.RUB
     usd_rub_rate_mode: RateMode = RateMode.AUTO
     usd_rub_rate: float = Field(default=90.0, gt=0)
     # Премия к биржевому курсу: разница между ЦБ-курсом и реальной ценой
-    # покупки USD на бирже (Bybit и т.п.). 2.0 = +2% поверх курса ЦБ.
+    # покупки USD на бирже (Bybit и т.п.). 3.0 = +3% поверх курса ЦБ.
     # Применяется только в режиме AUTO; в MANUAL premium не используется,
     # потому что юзер сам задал нужный курс.
-    usd_rub_premium_percent: float = Field(default=2.0, ge=0, le=50)
+    usd_rub_premium_percent: float = Field(default=3.0, ge=0, le=50)
     price_update_threshold_percent: float = Field(default=2.0, ge=0)
     funpay_stock_cap: int = Field(default=100, ge=1)
     sync_min_margin_percent: float = Field(default=1.0)
@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     # Не влияет на то, какую цену мы записываем (мы пишем цену продавца, FunPay
     # сам добавит комиссию). Реальная комиссия зависит от категории.
     funpay_commission_percent: float = Field(default=12.5, ge=0, le=50)
+    # Реальная потеря при выводе средств с FunPay. Учитывается в прибыли,
+    # но не влияет на цену лота: цену контролируют markup и FX premium.
+    funpay_withdrawal_fee_percent: float = Field(default=3.0, ge=0, le=50)
 
     telegram_bot_token: SecretStr | None = None
     telegram_chat_id: int | None = None

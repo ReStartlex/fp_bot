@@ -203,8 +203,18 @@ def test_estimate_profit_rub_returns_revenue_cost_profit_margin():
     revenue, cost, profit, margin = estimate_profit_rub(383.0, 4.0, 90.0)
     assert revenue == pytest.approx(383.0)
     assert cost == pytest.approx(360.0)
-    assert profit == pytest.approx(23.0)
-    assert margin == pytest.approx(23.0 / 383.0 * 100.0)
+    assert profit == pytest.approx(383.0 - 383.0 * 0.03 - 360.0)
+    assert margin == pytest.approx(profit / 383.0 * 100.0)
+
+
+def test_estimate_profit_rub_supports_custom_withdrawal_fee():
+    revenue, cost, profit, margin = estimate_profit_rub(
+        200.0, 1.0, 100.0, withdrawal_fee_percent=5.0
+    )
+    assert revenue == pytest.approx(200.0)
+    assert cost == pytest.approx(100.0)
+    assert profit == pytest.approx(90.0)
+    assert margin == pytest.approx(45.0)
 
 
 def test_estimate_profit_rub_skips_incomplete_orders():

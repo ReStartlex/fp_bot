@@ -75,7 +75,11 @@ def _risk_skip_reason(
     cost = target.ns_price_usd * target.fx_rate
     if target.price_target <= 0:
         return "guardrail: целевая цена <= 0"
-    margin = (target.price_target - cost) / target.price_target * 100.0
+    withdrawal_fee_percent = float(
+        getattr(settings, "funpay_withdrawal_fee_percent", 0.0)
+    )
+    withdrawal_fee = target.price_target * withdrawal_fee_percent / 100.0
+    margin = (target.price_target - withdrawal_fee - cost) / target.price_target * 100.0
     if margin < settings.sync_min_margin_percent:
         return (
             "guardrail: маржа ниже минимума "

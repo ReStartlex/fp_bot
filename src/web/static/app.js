@@ -171,8 +171,9 @@ async function renderProfit() {
   el("view").innerHTML = renderCards([
     { title: "Orders", value: data.orders_counted ?? 0, note: `exact fx ${data.exact_orders ?? 0}` },
     { title: "Revenue", value: money(data.revenue_rub), note: "за 7 дней" },
-    { title: "Cost", value: money(data.cost_rub), note: `fx fallback ${Number(data.fallback_fx_rate || 0).toFixed(2)}` },
-    { title: "Profit", value: money(data.profit_rub), note: `margin ${pct(data.margin_percent)}` },
+    { title: "NS Cost", value: money(data.cost_rub), note: `fx fallback ${Number(data.fallback_fx_rate || 0).toFixed(2)}` },
+    { title: "FunPay Withdrawal", value: money(data.withdrawal_fee_rub), note: `${pct(data.withdrawal_fee_percent)} от продаж` },
+    { title: "Net Profit", value: money(data.profit_rub), note: `margin ${pct(data.margin_percent)}` },
   ]);
 }
 
