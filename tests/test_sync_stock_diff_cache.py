@@ -349,6 +349,59 @@ async def test_update_mapping_last_synced_persists_to_db(db_factory):
         assert m.last_synced_at is not None
 
 
+def test_cache_update_for_no_action_happens_before_continue():
+    """
+    Регрессионный тест против бага, обнаруженного в проде после
+    деплоя 7cf15e6: блок «обновить cache после verified no-action»
+    был ПОСЛЕ `continue`, поэтому никогда не выполнялся для лотов
+    без actions (а это 46 из 47 в стабильном состоянии). В логах:
+        Sync done: checked=46, unchanged=1, ...
+    т.е. cache не наполнялся, fast-path был бесполезен.
+
+    Проверяем построчно: в блоке обработки `decisions` после
+    `if not actions:` должна быть строка `pending_cache_updates.append`
+    ДО следующего `continue`.
+
+    Реализация: смотрим line-by-line. Когда видим `if not actions:`,
+    идём вниз пока не встретим `continue` (выход из блока) или
+    `pending_cache_updates.append` (cache update). Первое из двух
+    должно быть append, иначе — мёртвый код после continue.
+    """
+    from pathlib import Path
+    src = Path(__file__).parent.parent / "src" / "sync" / "stock_sync.py"
+    lines = src.read_text(encoding="utf-8").splitlines()
+
+    # Ищем строку `if not actions:` именно в run-цикле декидов (отступ ~12 пробелов).
+    # Точно: ищем `if not actions:` БЕЗ inversion (т.е. без 'and'), на уровне `for decision in decisions`.
+    found_block = False
+    cache_seen_before_continue = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped != "if not actions:":
+            continue
+        # Это потенциальный наш блок. Найдём следующий `continue` или append.
+        for j in range(i + 1, min(i + 30, len(lines))):
+            inner = lines[j].strip()
+            if inner.startswith("pending_cache_updates.append"):
+                found_block = True
+                cache_seen_before_continue = True
+                break
+            if inner == "continue":
+                found_block = True
+                break
+        if found_block:
+            break
+
+    assert found_block, "не найден блок `if not actions:` в src/sync/stock_sync.py"
+    assert cache_seen_before_continue, (
+        "БАГ: в no-action блоке `pending_cache_updates.append` "
+        "находится ПОСЛЕ `continue` (или вообще отсутствует). "
+        "Это значит cache никогда не наполнится для лотов "
+        "без actions (46 из 47 в стабильном состоянии), "
+        "и diff-fast-path будет бесполезен."
+    )
+
+
 @pytest.mark.asyncio
 async def test_update_mapping_last_synced_overwrites_previous_values(db_factory):
     """Повторный вызов перезаписывает значения."""

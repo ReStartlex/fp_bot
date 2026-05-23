@@ -593,7 +593,26 @@ async def sync_once(
                 continue
 
             if not actions:
+                # Verified no-action: FunPay-GET подтвердил, что
+                # current_price/stock на FunPay уже == target. Это идеальный
+                # момент заполнить diff-cache: на следующем цикле fast-path
+                # увидит совпадение и пропустит FunPay-GET совсем.
+                #
+                # КРИТИЧНО: этот блок ДОЛЖЕН быть ДО `continue`, иначе
+                # cache не наполнится никогда (только что нашёл этот баг
+                # в проде — `unchanged=1` всегда, потому что cache
+                # обновлялся только при save_lot success, а save_lot'ов
+                # в стабильном состоянии 0). Без этого fast-path
+                # бесполезен — все лоты вечно cache miss.
                 logger.debug(f"  [{label}] {action_str}")
+                mapping_id = _find_mapping_id_for_decision(mappings, decision)
+                if mapping_id is not None and decision.current_price is not None:
+                    pending_cache_updates.append((
+                        mapping_id,
+                        decision.target.round_price(),
+                        decision.target.stock,
+                        decision.target.stock > 0,
+                    ))
                 continue
 
             if dry_run:
@@ -622,22 +641,6 @@ async def sync_once(
                     lots_skipped += 1
                 # Не спамим FunPay: пауза согласно rate-limit
                 await asyncio.sleep(1.0 / settings.funpay_update_rate_limit_per_second)
-
-            # Также: если decision НЕ потребовал actions (price/stock
-            # уже совпадают на FunPay), значит мы только что верифицировали
-            # cache через GET — можем обновить last_synced как для cache hit.
-            # Это закрывает «cold start» проблему: после рестарта/миграции
-            # last_synced=NULL, первый цикл идёт через FunPay GET, и мы
-            # тут заполняем cache.
-            if not actions and not decision.skip_reason:
-                mapping_id = _find_mapping_id_for_decision(mappings, decision)
-                if mapping_id is not None and decision.current_price is not None:
-                    pending_cache_updates.append((
-                        mapping_id,
-                        decision.target.round_price(),
-                        decision.target.stock,
-                        decision.target.stock > 0,
-                    ))
 
         # === Сохранение diff-cache: только успешные обновления + cache-hits ===
         # Накопили в pending_cache_updates (после save_lot success или
