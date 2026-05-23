@@ -443,14 +443,43 @@ async def sync_once(
         )
         await session.commit()
 
+    # Снимаем HTTP-метрики FunPay за прошедший цикл (атомарно сбрасываются
+    # в admin-клиенте). Это даёт прямую видимость работы rate-limiter'a и
+    # retry-логики в проде, без необходимости grep'ать journalctl.
+    # `exhausted` > 0 — это уже инцидент (лот пропущен, нужен внимание).
+    http_metrics: dict[str, int] = {"ok": 0, "retry_429": 0, "retry_5xx": 0, "exhausted": 0}
+    if funpay_client is not None:
+        try:
+            http_metrics = funpay_client.get_and_reset_http_metrics()
+        except Exception as exc:  # noqa: BLE001
+            # метрики — это observability, они не должны ломать sync_stock
+            logger.debug(f"Sync done: не удалось снять http-метрики: {exc}")
+
+    http_str = (
+        f"http=[ok={http_metrics['ok']} "
+        f"r429={http_metrics['retry_429']} "
+        f"r5xx={http_metrics['retry_5xx']} "
+        f"fails={http_metrics['exhausted']}]"
+    )
+
     if lots_checked > 0 or error:
-        logger.info(
+        # На exhausted'ы хотим обращать внимание — повышаем уровень до WARNING.
+        line = (
             f"Sync done: checked={lots_checked}, "
-            f"updated={lots_updated}, skipped={lots_skipped}"
+            f"updated={lots_updated}, skipped={lots_skipped}, {http_str}"
         )
+        if http_metrics["exhausted"] > 0:
+            logger.warning(line + "  (есть исчерпания retry — лоты пропущены!)")
+        else:
+            logger.info(line)
     else:
         logger.debug(
             f"Sync done (empty): checked={lots_checked}, "
-            f"updated={lots_updated}, skipped={lots_skipped}"
+            f"updated={lots_updated}, skipped={lots_skipped}, {http_str}"
         )
-    return {"checked": lots_checked, "updated": lots_updated, "skipped": lots_skipped}
+    return {
+        "checked": lots_checked,
+        "updated": lots_updated,
+        "skipped": lots_skipped,
+        "http": http_metrics,
+    }

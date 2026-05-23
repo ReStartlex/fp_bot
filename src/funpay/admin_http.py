@@ -229,6 +229,41 @@ class FunPayAdminClient:
             max_concurrent=rate_max_concurrent,
             min_interval_seconds=rate_min_interval_seconds,
         )
+        # HTTP-метрики (observability):
+        #   ok          — успешных запросов (2xx/redirect, не считая retry-промежуточных)
+        #   retry_429   — сколько раз пришлось ждать после 429 и retry'ить
+        #   retry_5xx   — сколько раз пришлось ждать после 502/503/504 (или сетевой) и retry'ить
+        #   exhausted   — сколько раз ВСЕ retry исчерпались (это и есть пропущенный лот)
+        # Снимаются методом get_and_reset_http_metrics() — атомарно
+        # (под self._metrics_lock), чтобы между чтением и сбросом не
+        # потерять инкременты из параллельных потоков.
+        self._metrics_lock = threading.Lock()
+        self._metrics: dict[str, int] = {
+            "ok": 0,
+            "retry_429": 0,
+            "retry_5xx": 0,
+            "exhausted": 0,
+        }
+
+    def _metrics_inc(self, key: str, by: int = 1) -> None:
+        """Thread-safe инкремент счётчика метрик."""
+        with self._metrics_lock:
+            self._metrics[key] = self._metrics.get(key, 0) + by
+
+    def get_and_reset_http_metrics(self) -> dict[str, int]:
+        """
+        Атомарно снимает текущие метрики и обнуляет их.
+
+        Возвращает snapshot ВСЕХ ключей (ok, retry_429, retry_5xx, exhausted).
+        Используется sync_stock в конце каждого цикла, чтобы залогировать
+        агрегат http-нагрузки за цикл — это даёт прямую видимость работы
+        rate-limiter'a в проде (раньше приходилось grep'ать journalctl).
+        """
+        with self._metrics_lock:
+            snap = dict(self._metrics)
+            for k in self._metrics:
+                self._metrics[k] = 0
+            return snap
 
     # ----- low-level -----
 
@@ -320,7 +355,9 @@ class FunPayAdminClient:
                     )
                     _time.sleep(delay)
                     attempts_5xx += 1
+                    self._metrics_inc("retry_5xx")
                     continue
+                self._metrics_inc("exhausted")
                 raise
 
             last_response = r
@@ -339,11 +376,13 @@ class FunPayAdminClient:
                     )
                     _time.sleep(delay)
                     attempts_429 += 1
+                    self._metrics_inc("retry_429")
                     continue
                 logger.error(
                     f"FunPay GET 429 после {max_429 + 1} попыток — "
                     f"{url[:80]}"
                 )
+                self._metrics_inc("exhausted")
                 r.raise_for_status()
                 return r
 
@@ -361,15 +400,20 @@ class FunPayAdminClient:
                     )
                     _time.sleep(delay)
                     attempts_5xx += 1
+                    self._metrics_inc("retry_5xx")
                     continue
                 logger.error(
                     f"FunPay GET {r.status_code} после {max_5xx + 1} попыток "
                     f"— {url[:80]}"
                 )
+                self._metrics_inc("exhausted")
                 r.raise_for_status()
                 return r
 
             # 200 / 3xx / не-retryable 4xx-5xx (404, 500, ...) — отдаём как есть.
+            # Только успешные (2xx) считаем как ok.
+            if 200 <= r.status_code < 400:
+                self._metrics_inc("ok")
             r.raise_for_status()
             return r
 
@@ -388,6 +432,9 @@ class FunPayAdminClient:
         Под глобальным rate-limiter'ом (тот же что и у GET): FunPay
         считает совокупный RPS, POST к offerSave участвует в нём
         наравне с GET к offerEdit/chat.
+
+        Метрики: ok инкрементим только для 2xx/3xx (429/5xx считаются
+        в `_sync_post_form_with_429_retry`, чтобы не двоить retry-метрики).
         """
         with self._rate_limiter.acquire():
             r = self._session.post(
@@ -401,6 +448,8 @@ class FunPayAdminClient:
                 timeout=20,
                 allow_redirects=False,
             )
+        if 200 <= r.status_code < 400:
+            self._metrics_inc("ok")
         return r
 
     def _sync_post_form_with_429_retry(
@@ -434,7 +483,9 @@ class FunPayAdminClient:
                             attempt, None, self._base_429_backoff, self._max_429_backoff
                         )
                     )
+                    self._metrics_inc("retry_5xx")
                     continue
+                self._metrics_inc("exhausted")
                 raise
             last_response = r
             if r.status_code == 429 and attempt < max_retries:
@@ -448,8 +499,12 @@ class FunPayAdminClient:
                     f"{url[:80]}"
                 )
                 _time.sleep(delay)
+                self._metrics_inc("retry_429")
                 continue
             # либо не 429, либо retries исчерпаны
+            if r.status_code == 429:
+                # вышли по исчерпанию retries (attempt == max_retries)
+                self._metrics_inc("exhausted")
             return r
 
         if last_exc is not None:

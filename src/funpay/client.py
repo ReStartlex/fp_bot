@@ -553,6 +553,22 @@ class FunPayClient:
         self._admin_client_cache = client
         return client
 
+    def get_and_reset_http_metrics(self) -> dict[str, int]:
+        """
+        Снимает агрегат HTTP-метрик FunPay и обнуляет счётчики.
+
+        Используется sync_stock и др. фоновыми циклами, чтобы залогировать
+        результат за один цикл — без этого rate-limit/retry-нагрузку
+        приходилось grep'ать в journalctl.
+
+        Возвращает dict с ключами: ok, retry_429, retry_5xx, exhausted.
+        Если admin-клиент ещё не инициализирован — все ключи нули.
+        """
+        cached = getattr(self, "_admin_client_cache", None)
+        if cached is None:
+            return {"ok": 0, "retry_429": 0, "retry_5xx": 0, "exhausted": 0}
+        return cached.get_and_reset_http_metrics()
+
     async def get_lot_fields(self, lot_id: int, node_id: int | None = None) -> Any:
         """
         Поля лота для редактирования (LotFields).
