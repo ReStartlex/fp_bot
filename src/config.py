@@ -102,6 +102,24 @@ class Settings(BaseSettings):
     log_dir: str = "logs"
 
     funpay_update_rate_limit_per_second: float = Field(default=1.0, gt=0)
+
+    # Поведение при HTTP 429 от FunPay (rate-limit). Применяется ко всем
+    # обращениям FunPayAdminClient: GET /lots/offerEdit, GET /chat/,
+    # POST /lots/offerSave, POST /runner/.
+    #
+    # Логика:
+    #   sleep_before_retry = Retry-After (если прислан и парсится как число)
+    #                        иначе  min(base * 2^attempt, max)
+    #
+    # Зачем: в горячий момент (массовый sync_stock или ответ FunPay при
+    # пике трафика) FunPay начинает выкидывать 429. Без ретраев это
+    # выливалось в `FunPay save_lot(...) NOT OK: http=429` и заставляло
+    # стоковый sync пропускать лот целиком (полный slot терялся).
+    # Терпеливый exponential backoff с уважением Retry-After разруливает
+    # это без потерь.
+    funpay_429_max_retries: int = Field(default=4, ge=0, le=10)
+    funpay_429_base_backoff_seconds: float = Field(default=1.0, gt=0, le=30.0)
+    funpay_429_max_backoff_seconds: float = Field(default=30.0, gt=0, le=120.0)
     ns_retry_attempts: int = Field(default=3, ge=1)
     ns_retry_delay_seconds: float = Field(default=5.0, gt=0)
     ns_order_poll_interval_seconds: float = Field(default=5.0, gt=0)

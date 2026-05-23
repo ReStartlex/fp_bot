@@ -543,6 +543,9 @@ class FunPayClient:
             golden_key=gk,
             phpsessid=ps,
             user_agent=self.DEFAULT_USER_AGENT,
+            max_429_retries=self._settings.funpay_429_max_retries,
+            base_429_backoff_seconds=self._settings.funpay_429_base_backoff_seconds,
+            max_429_backoff_seconds=self._settings.funpay_429_max_backoff_seconds,
         )
         self._admin_client_cache = client
         return client

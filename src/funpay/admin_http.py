@@ -124,6 +124,10 @@ class FunPayAdminClient:
         golden_key: str,
         phpsessid: str | None = None,
         user_agent: str = DEFAULT_USER_AGENT,
+        *,
+        max_429_retries: int = 4,
+        base_429_backoff_seconds: float = 1.0,
+        max_429_backoff_seconds: float = 30.0,
     ) -> None:
         if not golden_key:
             raise ValueError("FunPayAdminClient: golden_key обязателен")
@@ -139,38 +143,105 @@ class FunPayAdminClient:
         self._golden_key = golden_key
         self._user_agent = user_agent
         self._csrf_token: str | None = None
+        # параметры backoff'а на 429
+        self._max_429_retries = max(0, int(max_429_retries))
+        self._base_429_backoff = max(0.0, float(base_429_backoff_seconds))
+        self._max_429_backoff = max(self._base_429_backoff, float(max_429_backoff_seconds))
 
     # ----- low-level -----
 
-    def _sync_get(self, url: str, retries: int = 2) -> requests.Response:
+    @staticmethod
+    def _compute_429_backoff(
+        attempt: int,
+        retry_after_header: str | None,
+        base_seconds: float,
+        max_seconds: float,
+    ) -> float:
+        """
+        Сколько секунд спать ПЕРЕД попыткой номер (attempt+1).
+
+        Логика:
+          1. Если FunPay прислал Retry-After и это парсится как
+             число секунд (>= 0) — берём его, но не больше `max_seconds`.
+          2. Иначе exponential backoff: base * 2^attempt, capped до max.
+
+        HTTP-date в Retry-After не поддерживаем (FunPay использует только
+        числовой формат) — fallback на exponential.
+        """
+        if retry_after_header:
+            ra = str(retry_after_header).strip()
+            try:
+                seconds = float(ra)
+                if seconds >= 0:
+                    return min(seconds, max_seconds)
+            except (TypeError, ValueError):
+                pass
+        delay = base_seconds * (2 ** max(0, int(attempt)))
+        return min(delay, max_seconds)
+
+    def _sync_get(self, url: str, retries: int | None = None) -> requests.Response:
         """
         GET к FunPay с обработкой rate-limit (429).
-        FunPay в горячий момент даёт 429 — нужна короткая backoff-пауза.
+
+        FunPay в горячий момент массово отдаёт 429 — нам нужно подождать
+        и попробовать снова. Иначе sync_stock пропустит лот целиком.
+
+        Сколько ретраев и какой backoff — настраивается через
+        Settings.funpay_429_*, а сюда прокидывается через __init__.
         """
         import time as _time
+        max_retries = self._max_429_retries if retries is None else int(retries)
         last_exc: Exception | None = None
-        for attempt in range(retries + 1):
+        last_429: requests.Response | None = None
+
+        for attempt in range(max_retries + 1):
             try:
                 r = self._session.get(url, timeout=20, allow_redirects=True)
             except Exception as exc:
                 last_exc = exc
-                if attempt < retries:
-                    _time.sleep(0.5 * (2 ** attempt))
+                if attempt < max_retries:
+                    # на сетевые ошибки тоже растягиваемся exponential'но,
+                    # но без Retry-After (его неоткуда взять).
+                    _time.sleep(
+                        self._compute_429_backoff(
+                            attempt, None, self._base_429_backoff, self._max_429_backoff
+                        )
+                    )
                     continue
                 raise
             if r.status_code == 429:
-                # Backoff: 1s, 2s
-                if attempt < retries:
-                    _time.sleep(1.0 * (2 ** attempt))
+                last_429 = r
+                if attempt < max_retries:
+                    ra = r.headers.get("Retry-After")
+                    delay = self._compute_429_backoff(
+                        attempt, ra, self._base_429_backoff, self._max_429_backoff
+                    )
+                    logger.warning(
+                        f"FunPay GET 429 (attempt {attempt + 1}/{max_retries + 1}, "
+                        f"Retry-After={ra}), backoff {delay:.2f}s — "
+                        f"{url[:80]}"
+                    )
+                    _time.sleep(delay)
                     continue
+                # ретраев больше нет — отдадим 429 наверх через raise_for_status
+                logger.error(
+                    f"FunPay GET 429 после {max_retries + 1} попыток — "
+                    f"{url[:80]}"
+                )
+                r.raise_for_status()
+                return r
             r.raise_for_status()
             return r
+
         if last_exc is not None:
             raise last_exc
+        if last_429 is not None:
+            last_429.raise_for_status()
+            return last_429
         raise RuntimeError(f"_sync_get({url}): retries exhausted")
 
     def _sync_post(self, url: str, data: dict[str, str]) -> requests.Response:
-        # POST формы — FunPay ожидает application/x-www-form-urlencoded
+        """Один POST формы — без ретраев. Используется как примитив."""
         r = self._session.post(
             url,
             data=data,
@@ -183,6 +254,60 @@ class FunPayAdminClient:
             allow_redirects=False,
         )
         return r
+
+    def _sync_post_form_with_429_retry(
+        self,
+        url: str,
+        data: dict[str, str],
+        *,
+        retries: int | None = None,
+    ) -> requests.Response:
+        """
+        POST формы /lots/offerSave с retries+backoff на 429.
+
+        Возвращает последнюю Response (даже если она 429) — вызывающий
+        сам решает, считать ли это успехом. На сетевые ошибки —
+        retry с тем же backoff, на исчерпании retries поднимает
+        исходное исключение.
+        """
+        import time as _time
+        max_retries = self._max_429_retries if retries is None else int(retries)
+        last_exc: Exception | None = None
+        last_response: requests.Response | None = None
+
+        for attempt in range(max_retries + 1):
+            try:
+                r = self._sync_post(url, data)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    _time.sleep(
+                        self._compute_429_backoff(
+                            attempt, None, self._base_429_backoff, self._max_429_backoff
+                        )
+                    )
+                    continue
+                raise
+            last_response = r
+            if r.status_code == 429 and attempt < max_retries:
+                ra = r.headers.get("Retry-After")
+                delay = self._compute_429_backoff(
+                    attempt, ra, self._base_429_backoff, self._max_429_backoff
+                )
+                logger.warning(
+                    f"FunPay POST 429 (attempt {attempt + 1}/{max_retries + 1}, "
+                    f"Retry-After={ra}), backoff {delay:.2f}s — "
+                    f"{url[:80]}"
+                )
+                _time.sleep(delay)
+                continue
+            # либо не 429, либо retries исчерпаны
+            return r
+
+        if last_exc is not None:
+            raise last_exc
+        assert last_response is not None  # не должно случиться
+        return last_response
 
     # ----- public API -----
 
@@ -712,19 +837,32 @@ class FunPayAdminClient:
         FunPay /lots/offerSave принимает form-data, отвечает либо
         JSON {"msg": "ok"|"...error..."}, либо HTML-страницу
         (если что-то пошло сильно не так).
+
+        На 429 (rate-limit от FunPay) делаем retries+backoff
+        (см. `_sync_post_form_with_429_retry`) — раньше один 429
+        заставлял sync_stock полностью пропустить лот.
         """
         url = f"{self.BASE}/lots/offerSave"
         data = dict(lot.raw_fields)
         # offer_id должен быть в данных
         data.setdefault("offer_id", str(lot.lot_id))
 
-        r = await asyncio.to_thread(self._sync_post, url, data)
+        r = await asyncio.to_thread(self._sync_post_form_with_429_retry, url, data)
 
         result: dict[str, Any] = {
             "http_status": r.status_code,
             "content_type": r.headers.get("Content-Type", ""),
             "body_preview": r.text[:300],
         }
+        # 429 после всех ретраев — явная диагностика, без HTML-каши в логе
+        if r.status_code == 429:
+            result["ok"] = False
+            result["funpay_error"] = (
+                f"FunPay rate-limit 429 после "
+                f"{self._max_429_retries + 1} попыток "
+                f"(Retry-After={r.headers.get('Retry-After')!r})"
+            )
+            return result
         # Пробуем распарсить JSON-ответ
         try:
             j = r.json()

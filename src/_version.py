@@ -4,6 +4,6 @@ deploy/stamp_version.py перед каждым push'ем.
 
 ВАЖНО: НЕ редактируй вручную — твои изменения будут перезаписаны.
 """
-SHA = "c7e8525c7c7d1e86e976c0ac755e17a76dfdf323"
-DATE = "2026-05-23T21:26:39+03:00"
-SUBJECT = "feat(orders): hard timeout, manual_hold instead of failed, race-guard"
+SHA = "8928bcff2313cde70842242473b04686eecbfe60"
+DATE = "2026-05-23T22:42:40+03:00"
+SUBJECT = "feat(funpay): 429 exponential backoff with Retry-After + tests for hold-click"
