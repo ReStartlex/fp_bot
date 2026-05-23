@@ -126,10 +126,75 @@ journalctl -u funpay-ns-api -f
 bash /opt/funpay-ns-bot/deploy/update.sh
 ```
 
-Скрипт скачивает свежий tarball через `gh-proxy.com` (обход блокировки
-GitHub с Timeweb), обновляет зависимости, перезапускает systemd-сервис.
-Если `funpay-ns-api` уже был включён или запущен, `update.sh` также аккуратно
-остановит и поднимет API после обновления.
+Что делает `update.sh` (в порядке шагов):
+
+1. **Бэкап** `.env` + `data/bridge.db` (с WAL/SHM) в
+   `/opt/funpay-ns-bot/backups/<timestamp>/`. Хранит последние
+   `BACKUP_KEEP` снапшотов (по умолчанию 10). Делается ДО остановки
+   сервиса, чтобы БД была в консистентном состоянии.
+2. Останавливает `funpay-ns-bot` (и `funpay-ns-api`, если он был активен).
+3. Тянет свежий код через `gh-proxy.com` (или прямой git, см. ниже).
+4. Прокатывает `pip install -r requirements.txt`.
+5. Чинит права (`bot:bot`, `chmod 600` на `.env` и бэкапы).
+6. Поднимает сервисы обратно, делает health-check, печатает версию.
+7. Если сервис **не поднялся** — печатает короткую инструкцию по откату
+   из последнего бэкапа.
+
+Полезные переменные окружения для `update.sh` (все опциональные):
+
+| Переменная | Что делает |
+|---|---|
+| `PIN_SHA` | Зафиксировать обновление на конкретный коммит. Защищает от случайного отката на «плохой» main. |
+| `GIT_HTTP_PROXY` | HTTP-прокси для git напрямую на github.com (fallback, если `gh-proxy.com` на тех. работах). |
+| `BACKUP_KEEP` | Сколько последних бэкапов держать (по умолчанию 10). |
+
+Примеры:
+
+```bash
+# Стандартное обновление (как раньше).
+bash /opt/funpay-ns-bot/deploy/update.sh
+
+# Откатиться/обновиться на конкретный SHA (после инцидента в main).
+PIN_SHA=708ed212aa150f6cc45471ff7bb735da1ef0d010 \
+  bash /opt/funpay-ns-bot/deploy/update.sh
+
+# Когда gh-proxy.com на тех. работах — идём через свой HTTP-прокси.
+GIT_HTTP_PROXY='http://user:pass@proxy.example.com:8080' \
+  bash /opt/funpay-ns-bot/deploy/update.sh
+```
+
+### Постоянный pin: файл `.deploy_pin`
+
+Если хочется зафиксировать версию надолго (например, до полного аудита
+новых коммитов после инцидента), вместо `PIN_SHA` в env удобнее
+положить SHA в файл:
+
+```bash
+echo "708ed212aa150f6cc45471ff7bb735da1ef0d010" \
+    | sudo -u bot tee /opt/funpay-ns-bot/.deploy_pin
+```
+
+После этого любой `update.sh` будет упираться в этот коммит, пока ты
+не удалишь файл:
+
+```bash
+rm /opt/funpay-ns-bot/.deploy_pin
+```
+
+`PIN_SHA` через env имеет приоритет над файлом, чтобы можно было разово
+прокатить новую версию без редактирования файла.
+
+### Если сервис не поднялся: откат из бэкапа
+
+`update.sh` сам напечатает шаги. Базовый сценарий:
+
+```bash
+systemctl stop funpay-ns-bot funpay-ns-api
+cp /opt/funpay-ns-bot/backups/<timestamp>/.env /opt/funpay-ns-bot/.env
+cp /opt/funpay-ns-bot/backups/<timestamp>/data/bridge.db \
+   /opt/funpay-ns-bot/data/bridge.db
+PIN_SHA=<sha_прошлой_рабочей_версии> bash /opt/funpay-ns-bot/deploy/update.sh
+```
 
 ## Обновление cookies FunPay
 

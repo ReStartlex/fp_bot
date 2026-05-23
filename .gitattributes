@@ -1,0 +1,28 @@
+# Гарантируем LF для всех shell-скриптов и Python-кода, чтобы запуск
+# на Linux VPS не ломался из-за \r из Windows CRLF (bash и Python
+# и так умеют LF, а CRLF приводит к `bad interpreter: \r` и подобному).
+*.sh        text eol=lf
+*.py        text eol=lf
+*.service   text eol=lf
+*.md        text eol=lf
+*.toml      text eol=lf
+*.ini       text eol=lf
+*.txt       text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+Dockerfile  text eol=lf
+
+# PowerShell-скрипт исполняется только на Windows.
+*.ps1       text eol=crlf
+
+# Бинарники не трогаем.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.zip       binary
+*.gz        binary
+*.tgz       binary
+*.db        binary
+*.sqlite    binary
+*.sqlite3   binary

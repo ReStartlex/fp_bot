@@ -4,6 +4,6 @@ deploy/stamp_version.py перед каждым push'ем.
 
 ВАЖНО: НЕ редактируй вручную — твои изменения будут перезаписаны.
 """
-SHA = "6f5922f9cdc08f1a0c8ebd1650a5e244a541054a"
-DATE = "2026-05-19T17:49:21+03:00"
-SUBJECT = "fix(watcher): dedupe repeated help by message id"
+SHA = "95997a9419fab489bc187c20872998dbc651db92"
+DATE = "2026-05-23T17:03:03+03:00"
+SUBJECT = "feat(deploy): safer updates with backups, commit pin and proxy fallback"
