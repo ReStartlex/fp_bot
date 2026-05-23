@@ -380,7 +380,7 @@ class App:
                 chat_id=order.chat_id,
                 quantity=order.quantity,
                 funpay_price_rub=order.funpay_price_rub,
-                description=None,
+                description=order.description,
             )
 
         return await process_funpay_order(

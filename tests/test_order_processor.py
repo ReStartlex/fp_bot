@@ -107,8 +107,11 @@ class FakeNS:
             pins=self._pay_pins,
         )
 
-    async def wait_order_completion(self, custom_id: str):
+    async def wait_order_completion(
+        self, custom_id: str, *, timeout_seconds: float | None = None
+    ):
         self.waited_calls += 1
+        self.last_wait_timeout = timeout_seconds
         return OrderInfo(
             custom_id=custom_id, status=self._wait_status,
             status_message="ok", pins=self._wait_pins,

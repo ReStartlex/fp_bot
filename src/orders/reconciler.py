@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from loguru import logger
 
@@ -11,7 +12,11 @@ from src.db.repo import list_reconcilable_orders
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
 from src.ns import NSClient
-from src.orders.processor import FunPayOrderEvent, process_funpay_order
+from src.orders.processor import (
+    FunPayOrderEvent,
+    _trigger_manual_hold,
+    process_funpay_order,
+)
 
 
 @dataclass(frozen=True)
@@ -50,8 +55,42 @@ async def reconcile_orders_once(
         )
 
     checked = recovered = skipped = failed = 0
+    # getattr с дефолтом 0: тесты могут передать duck-typed settings без
+    # этого поля. 0 = guard выключен.
+    hard_timeout = int(getattr(settings, "order_delivery_hard_timeout_seconds", 0))
+    timeout_cutoff = (
+        datetime.utcnow() - timedelta(seconds=hard_timeout)
+        if hard_timeout > 0
+        else None
+    )
     for order in orders:
         checked += 1
+        # Если заказ старше hard-timeout, бот не должен молча его
+        # реанимировать — деньги уплачены давно, покупатель уже либо
+        # отказался, либо ждёт оператора. Переводим в manual_hold с
+        # алертом, оператор решит через Telegram.
+        if timeout_cutoff is not None and order.created_at <= timeout_cutoff:
+            logger.warning(
+                f"Reconciler: заказ {order.funpay_order_id} старше "
+                f"hard-timeout ({hard_timeout}s), перевожу в manual_hold"
+            )
+            await _trigger_manual_hold(
+                funpay_order_id=order.funpay_order_id,
+                stage="reconciler_too_old",
+                reason=(
+                    f"reconciler нашёл застрявший заказ старше "
+                    f"hard-timeout ({hard_timeout}s); автодоставка не "
+                    f"возобновляется во избежание дубля"
+                ),
+                funpay_client=funpay_client,
+                telegram=telegram,
+                log=logger.bind(funpay_order_id=order.funpay_order_id),
+            )
+            skipped += 1
+            continue
+
+        # Передаём description из БД, чтобы processor мог пересопоставить
+        # маппинг по описанию (полезно для старых событий с funpay_lot_id=0).
         event = FunPayOrderEvent(
             funpay_order_id=order.funpay_order_id,
             funpay_lot_id=order.funpay_lot_id,
@@ -60,7 +99,7 @@ async def reconcile_orders_once(
             chat_id=order.chat_id,
             quantity=order.quantity,
             funpay_price_rub=order.funpay_price_rub,
-            description=None,
+            description=order.description,
         )
         try:
             result = await process_funpay_order(
@@ -84,6 +123,8 @@ async def reconcile_orders_once(
             skipped += 1
         elif status == "failed":
             failed += 1
+        elif status == "manual_hold":
+            skipped += 1
         else:
             skipped += 1
 

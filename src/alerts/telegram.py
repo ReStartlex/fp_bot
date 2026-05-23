@@ -138,6 +138,80 @@ class TelegramNotifier:
         )
         await self.send(text)
 
+    async def manual_hold_required(
+        self,
+        *,
+        funpay_order_id: str,
+        stage: str,
+        age_seconds: int,
+        buyer_username: str | None,
+        ns_custom_id: str | None,
+        has_pins: bool,
+        reason: str,
+    ) -> None:
+        """
+        Бросающийся в глаза алерт «бот не успел — выдай вручную».
+
+        stage: словесная стадия pipeline, на которой выдохлись.
+        age_seconds: сколько прошло от received до момента истечения.
+        ns_custom_id: если уже создан заказ в NS — оператор по нему найдёт
+            покупку в кабинете NS / в логах.
+        has_pins: True если коды у нас уже на руках (pins_ready). Тогда
+            оператор может просто нажать «🔁 Retry» и бот отправит сам.
+        """
+        from html import escape
+
+        callback_safe_id = funpay_order_id.strip()
+        if len(callback_safe_id) > 48:
+            callback_safe_id = callback_safe_id[:48]
+        age_minutes = max(1, round(age_seconds / 60))
+        pins_line = (
+            "✅ Коды NS уже на руках — Retry просто отправит их в чат."
+            if has_pins
+            else "⚠ Коды у NS ещё не получены — нужно выдать вручную или вернуть деньги."
+        )
+        ns_line = (
+            f"NS: <code>{escape(ns_custom_id)}</code>\n" if ns_custom_id else ""
+        )
+        buyer_line = (
+            f"Покупатель: {escape(buyer_username)}\n" if buyer_username else ""
+        )
+        text = (
+            f"🛑 <b>РУЧНАЯ ВЫДАЧА</b>\n"
+            f"FunPay: <code>{escape(funpay_order_id)}</code>\n"
+            f"{buyer_line}"
+            f"{ns_line}"
+            f"Стадия: <code>{escape(stage)}</code>\n"
+            f"Прошло: ~{age_minutes} мин\n\n"
+            f"{pins_line}\n\n"
+            f"Причина: <code>{escape(reason)[:240]}</code>"
+        )
+        markup = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "🔁 Retry (force)",
+                        "callback_data": f"hold:retry:{callback_safe_id}",
+                    },
+                    {
+                        "text": "✅ Выдано вручную",
+                        "callback_data": f"hold:done:{callback_safe_id}",
+                    },
+                ],
+                [
+                    {
+                        "text": "ℹ️ Детали заказа",
+                        "callback_data": f"hold:show:{callback_safe_id}",
+                    },
+                    {
+                        "text": "✖ Скрыть",
+                        "callback_data": "close",
+                    },
+                ],
+            ]
+        }
+        await self.send(text, reply_markup=markup)
+
     async def new_lot_discovered(
         self, funpay_lot_id: int, title: str | None, *, suggestions=None
     ) -> None:

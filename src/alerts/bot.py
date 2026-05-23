@@ -717,6 +717,17 @@ class TelegramBot:
                 return
             await self._on_group_click(cq)
 
+        # Кнопки на алертах про manual_hold: hold:retry/done/show:<funpay_order_id>.
+        # Эти алерты приходят из processor._trigger_manual_hold и из reconciler
+        # для застрявших заказов. callback_data не session-based — несёт прямой
+        # funpay_order_id, чтобы alert не "протух" по rotation сессий.
+        @dp.callback_query(F.data.startswith("hold:"))
+        async def cb_hold(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await self._on_hold_click(cq)
+
     # ─────────────── общие хелперы ───────────────
 
     def _target_label_for(self, chat_id: int) -> str | None:
@@ -3716,6 +3727,96 @@ class TelegramBot:
             await session.commit()
         await cq.answer("Отмечено как выданное вручную", show_alert=False)
         await self._show_problems_via_cq(cq)
+
+    async def _on_hold_click(self, cq: CallbackQuery) -> None:
+        """
+        Обработчик кнопок на алерте manual_hold_required.
+
+        Форматы:
+            hold:retry:<funpay_order_id>  → force-retry через self._order_retry
+            hold:done:<funpay_order_id>   → пометить delivered (ручная выдача)
+            hold:show:<funpay_order_id>   → показать детали (текст алерта)
+        """
+        raw = (cq.data or "")
+        parts = raw.split(":", 2)
+        if len(parts) != 3:
+            await cq.answer("Неверный формат", show_alert=True)
+            return
+        _, action, funpay_order_id = parts
+        funpay_order_id = funpay_order_id.strip()
+        if not funpay_order_id:
+            await cq.answer("Пустой order_id", show_alert=True)
+            return
+
+        async with session_factory()() as session:
+            order = await find_order_by_funpay_id(session, funpay_order_id)
+        if order is None:
+            await cq.answer("Заказ не найден в БД", show_alert=True)
+            return
+
+        if action == "retry":
+            if self._order_retry is None:
+                await cq.answer("Retry не подключён", show_alert=True)
+                return
+            if order.status not in ("pins_ready", "manual_hold"):
+                await cq.answer(
+                    f"Retry недоступен: статус {order.status}", show_alert=True
+                )
+                return
+            await cq.answer("Пробую доставить повторно…", show_alert=False)
+            result = await self._order_retry(funpay_order_id)
+            text = (
+                f"🔁 <b>Retry заказа</b>\n"
+                f"FunPay: <code>{html.escape(funpay_order_id)}</code>\n"
+                f"Результат: <code>{html.escape(str(result))[:800]}</code>"
+            )
+            await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
+            return
+
+        if action == "done":
+            # Идемпотентно: если уже delivered, ничего не ломаем.
+            if order.status == "delivered":
+                await cq.answer("Уже отмечен как delivered", show_alert=False)
+                return
+            if order.status != "manual_hold":
+                await cq.answer(
+                    f"Доступно только для manual_hold (сейчас {order.status})",
+                    show_alert=True,
+                )
+                return
+            async with session_factory()() as session:
+                db_order = await find_order_by_funpay_id(session, funpay_order_id)
+                if db_order is None:
+                    await cq.answer("Заказ исчез", show_alert=True)
+                    return
+                db_order.status = "delivered"
+                db_order.error = (
+                    "manual_delivered: оператор подтвердил ручную выдачу из alert'a"
+                )
+                await session.commit()
+            await cq.answer("Отмечено как выданное вручную", show_alert=False)
+            return
+
+        if action == "show":
+            text = (
+                f"ℹ️ <b>Детали заказа</b>\n"
+                f"FunPay: <code>{html.escape(funpay_order_id)}</code>\n"
+                f"NS: <code>{html.escape(order.ns_custom_id or '—')}</code>\n"
+                f"Статус: <code>{html.escape(order.status)}</code>\n"
+                f"Покупатель: {html.escape(order.buyer_username or '—')}\n"
+                f"Лот FunPay: <code>{order.funpay_lot_id}</code>\n"
+                f"Кол-во: {order.quantity}\n"
+                f"Цена FunPay: {order.funpay_price_rub or '—'}\n"
+                f"Цена NS: {order.ns_price_usd or '—'}\n"
+                f"Создан: <code>{order.created_at.isoformat(timespec='seconds')}</code>\n"
+                f"Обновлён: <code>{order.updated_at.isoformat(timespec='seconds')}</code>\n"
+                f"Описание: <code>{html.escape((order.description or '—')[:240])}</code>\n"
+                f"Ошибка: <code>{html.escape((order.error or '—')[:400])}</code>"
+            )
+            await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
+            return
+
+        await cq.answer(f"Неизвестное действие: {action}", show_alert=True)
 
     @_guard
     async def _act_problem_force_sync(self, cq: CallbackQuery, item) -> None:

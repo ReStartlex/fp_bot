@@ -226,6 +226,7 @@ async def create_order(
     chat_id: int | None,
     quantity: int,
     funpay_price_rub: float | None,
+    description: str | None = None,
 ) -> Order:
     obj = Order(
         funpay_order_id=funpay_order_id,
@@ -236,6 +237,7 @@ async def create_order(
         chat_id=chat_id,
         quantity=quantity,
         funpay_price_rub=funpay_price_rub,
+        description=description,
         status="received",
     )
     session.add(obj)

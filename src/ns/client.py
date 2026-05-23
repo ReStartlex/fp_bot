@@ -276,12 +276,26 @@ class NSClient:
         data = await self._request("GET", f"/api/v2/order_info/{custom_id}")
         return OrderInfo.model_validate(data)
 
-    async def wait_order_completion(self, custom_id: str) -> OrderInfo:
+    async def wait_order_completion(
+        self,
+        custom_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> OrderInfo:
         """
         Опрашивает order_info пока заказ не дойдёт до финального статуса.
         Бросает NSOrderTimeoutError если не успел.
+
+        timeout_seconds: переопределить ns_order_timeout_seconds из настроек.
+        Нужно, когда внешний pipeline хочет уложиться в свой более жёсткий
+        лимит (например, order_delivery_hard_timeout_seconds).
         """
-        deadline = time.time() + self._settings.ns_order_timeout_seconds
+        effective_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else self._settings.ns_order_timeout_seconds
+        )
+        deadline = time.time() + effective_timeout
         while time.time() < deadline:
             info = await self.order_info(custom_id)
             status = info.status_enum
@@ -290,7 +304,7 @@ class NSClient:
             await asyncio.sleep(self._settings.ns_order_poll_interval_seconds)
         raise NSOrderTimeoutError(
             f"Заказ {custom_id} не завершился за "
-            f"{self._settings.ns_order_timeout_seconds}с"
+            f"{effective_timeout:.0f}с"
         )
 
 

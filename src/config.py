@@ -111,6 +111,20 @@ class Settings(BaseSettings):
     order_reconcile_stale_after_seconds: int = Field(default=60, ge=0)
     order_reconcile_max_per_run: int = Field(default=10, ge=1, le=100)
 
+    # Жёсткий лимит на ПОЛНЫЙ цикл received→delivered. По истечении бот:
+    #   1) переводит заказ в manual_hold (а не failed), чтобы заказ
+    #      остался виден в /problems и доступен для ручного retry;
+    #   2) аварийно выключает FunPay-лот (чтобы новые покупки не ушли
+    #      в ту же ловушку);
+    #   3) шлёт в Telegram алерт с кнопками "Retry/Выдано вручную/Детали".
+    # Главная задача — не оставлять покупателя без выдачи бесконечно
+    # ("после получения денег покупатель должен получить товар или
+    # увидеть оператора в адекватные сроки"), и одновременно не дать
+    # боту "догнать" оператора, если тот уже выдал товар вручную.
+    # Диапазон 5..30 мин: меньше — слишком агрессивно для медленных
+    # NS-выдач, больше — покупатель долго ждёт без обратной связи.
+    order_delivery_hard_timeout_seconds: int = Field(default=600, ge=300, le=1800)
+
     chat_autogreeting_enabled: bool = True
     chat_greeting_cooldown_hours: int = Field(default=24, ge=1)
     chat_help_triggers: str = "!help,!помощь,!support,!оператор,!sos,!админ"

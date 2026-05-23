@@ -184,8 +184,12 @@ class Order(Base):
     profit_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     profit_margin_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="received")
-    # Возможные статусы: received, ns_created, ns_paid, delivered, failed, refunded
+    # Возможные статусы: received, ns_created, ns_paid, delivered, failed, refunded, manual_hold
     pins_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Описание лота как пришло из FunPay-события. Нужно reconciler'у,
+    # чтобы после рестарта он мог повторно сматчить маппинг по
+    # описанию (если funpay_lot_id=0 — старый формат событий без lot_id).
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
