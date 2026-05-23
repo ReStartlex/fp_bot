@@ -4,6 +4,6 @@ deploy/stamp_version.py перед каждым push'ем.
 
 ВАЖНО: НЕ редактируй вручную — твои изменения будут перезаписаны.
 """
-SHA = "53dd9621c13b6fa44b6e987eef59f80c57fbe5a2"
-DATE = "2026-05-24T00:48:04+03:00"
-SUBJECT = "fix(sync_stock): no longer hides save_lot failures (rate-limit etc.)"
+SHA = "2e9f0c78e6b33672c45cb10ace1a404e9935cd57"
+DATE = "2026-05-24T02:01:33+03:00"
+SUBJECT = "feat(sync_stock): diff-based cache (skip FunPay GET if NS-target == last_synced)"
