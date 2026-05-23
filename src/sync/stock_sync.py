@@ -245,12 +245,33 @@ def _extract_active(lot_fields: Any) -> bool:
     return True  # консервативно считаем активным
 
 
+class SaveLotFailed(RuntimeError):
+    """
+    FunPay save_lot вернул ответ, но это НЕ подтверждённый успех.
+
+    Бросается из `_apply_decision`, если `funpay_client.save_lot()`
+    отдал `{"ok": False, ...}` — например, исчерпание 429-retries
+    (rate-limit) или ошибка от самого FunPay в JSON-ответе.
+
+    КРИТИЧНО: до этой проверки `_apply_decision` молча возвращался
+    после save_lot, и `run_sync_once` инкрементил lots_updated даже
+    если обновление реально не прошло. Метрики r429/exhaust помогли
+    это диагностировать. Теперь fail виден как WARN + skipped++.
+    """
+
+
 async def _apply_decision(
     decision: LotSyncDecision,
     funpay_client: FunPayClient,
     settings: Settings,
 ) -> None:
-    """Применить решение к лоту на FunPay."""
+    """Применить решение к лоту на FunPay.
+
+    На fail save_lot бросает SaveLotFailed — это поймает try/except
+    в run_sync_once и инкрементнёт lots_skipped, плюс залогирует
+    WARN. Раньше fail save_lot молча проглатывался, и lots_updated
+    врал.
+    """
     lot_fields = await funpay_client.get_lot_fields(decision.funpay_lot_id)
 
     # Принципы безопасной мутации: пишем только в известные атрибуты
@@ -263,7 +284,20 @@ async def _apply_decision(
     elif decision.will_activate:
         _set_active(lot_fields, True)
 
-    await funpay_client.save_lot(lot_fields)
+    result = await funpay_client.save_lot(lot_fields)
+
+    # FunPayClient.save_lot может вернуть:
+    #   * dict с ключом "ok": bool — наш собственный admin_http.save_lot
+    #   * None (старые/мокированные клиенты) — считаем успехом
+    #   * другие типы — считаем успехом (на стороне нашего admin_http
+    #     это всегда dict, но защищаемся от изменения контракта).
+    if isinstance(result, dict) and result.get("ok") is False:
+        err = result.get("funpay_error") or result.get("json") or "unknown FunPay error"
+        http_status = result.get("http_status")
+        raise SaveLotFailed(
+            f"save_lot({decision.funpay_lot_id}) не подтвердил успех: "
+            f"http={http_status}, error={err}"
+        )
 
 
 def _set_price(lot_fields: Any, price: float) -> None:
