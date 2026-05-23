@@ -75,6 +75,24 @@ class Settings(BaseSettings):
     sync_min_margin_percent: float = Field(default=1.0)
     sync_max_price_change_percent: float = Field(default=50.0, ge=0)
     sync_reserve_pending_orders: bool = True
+
+    # === Diff-based sync_stock cache ===
+    # sync_stock каждый цикл проверяет 47 лотов и делает 47 GET к
+    # FunPay (`get_lot_fields`). Но 46 из 47 не меняются между циклами
+    # (в проде стабильно `updated=1`). Эти GET зря тратят rate-limit.
+    #
+    # Решение: запоминаем последний успешный sync (`mappings.last_synced_*`)
+    # и пропускаем FunPay-запросы, если NS-target совпадает с cache.
+    # Раз в TTL делаем «полный» цикл — на случай если кто-то правил цены
+    # на FunPay вручную через их UI (наш cache мог разъехаться).
+    #
+    # Эффект: ожидаемо снижение GET'ов в ~10-15 раз → 429 пропадает
+    # как класс. Управляется отдельным флагом, чтобы можно было
+    # быстро откатить через .env (без передеплоя), если что.
+    sync_stock_diff_cache_enabled: bool = True
+    # 300 сек = 5 минут. Каждые 5 минут принудительно делаем GET,
+    # чтобы cache не разъехался с FunPay.
+    sync_stock_diff_cache_ttl_seconds: int = Field(default=300, ge=30, le=3600)
     # Комиссия FunPay для оценки цены клиента: чисто справочно для /calc.
     # Не влияет на то, какую цену мы записываем (мы пишем цену продавца, FunPay
     # сам добавит комиссию). Реальная комиссия зависит от категории.

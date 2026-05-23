@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import (
@@ -150,6 +150,38 @@ async def set_lot_group_markup(
     group.markup_percent = markup_percent
     await session.flush()
     return group
+
+
+async def update_mapping_last_synced(
+    session: AsyncSession,
+    *,
+    mapping_id: int,
+    price: float,
+    stock: int,
+    active: bool,
+) -> None:
+    """
+    Запомнить последний успешно подтверждённый sync для diff-cache.
+
+    Вызывается ТОЛЬКО после успешного save_lot (или после verified GET,
+    подтвердившего что FunPay уже == target). НЕ вызывается при
+    SaveLotFailed — иначе на следующем цикле фаст-патч может молча
+    пропустить retry. Это критично для корректности.
+
+    Используется fast-path'ом в run_sync_once: если NS-target совпадает
+    с (last_synced_price, last_synced_stock, last_synced_active) и
+    last_synced_at моложе TTL — пропускаем FunPay-запрос целиком.
+    """
+    await session.execute(
+        sa_update(Mapping)
+        .where(Mapping.id == mapping_id)
+        .values(
+            last_synced_price=float(price),
+            last_synced_stock=int(stock),
+            last_synced_active=bool(active),
+            last_synced_at=datetime.utcnow(),
+        )
+    )
 
 
 # ---------- FX rates ----------

@@ -75,6 +75,19 @@ def _migrate_sqlite_schema(sync_conn) -> None:
         if "group_id" not in columns:
             sync_conn.execute(text("ALTER TABLE mappings ADD COLUMN group_id INTEGER"))
             logger.info("init_db: добавлена колонка mappings.group_id")
+        # Diff-based sync cache (см. Mapping модель в models.py)
+        if "last_synced_price" not in columns:
+            sync_conn.execute(text("ALTER TABLE mappings ADD COLUMN last_synced_price FLOAT"))
+            logger.info("init_db: добавлена колонка mappings.last_synced_price")
+        if "last_synced_stock" not in columns:
+            sync_conn.execute(text("ALTER TABLE mappings ADD COLUMN last_synced_stock INTEGER"))
+            logger.info("init_db: добавлена колонка mappings.last_synced_stock")
+        if "last_synced_active" not in columns:
+            sync_conn.execute(text("ALTER TABLE mappings ADD COLUMN last_synced_active BOOLEAN"))
+            logger.info("init_db: добавлена колонка mappings.last_synced_active")
+        if "last_synced_at" not in columns:
+            sync_conn.execute(text("ALTER TABLE mappings ADD COLUMN last_synced_at DATETIME"))
+            logger.info("init_db: добавлена колонка mappings.last_synced_at")
     if "orders" in tables:
         columns = {col["name"] for col in inspector.get_columns("orders")}
         for name in ("fx_rate_at_sale", "profit_rub", "profit_margin_percent"):

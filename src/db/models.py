@@ -51,6 +51,25 @@ class Mapping(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
+    # === Diff-based sync cache ===
+    # Зачем: sync_stock каждые 30 сек делает 47 GET к FunPay (`get_lot_fields`)
+    # чтобы проверить, не разошлись ли наши и FunPay-цены. На практике
+    # 46 из 47 лотов НЕ меняются между циклами (в проде видно: updated=1
+    # стабильно). Эти GET зря тратят rate-limit и провоцируют 429.
+    #
+    # Решение: после успешного save_lot запоминаем `(price, stock, active)`.
+    # В следующем цикле, если target из NS совпадает с last_synced и
+    # last_synced свежий (TTL), пропускаем FunPay-запрос целиком.
+    # Раз в TTL делаем «полный» цикл — на случай если кто-то менял
+    # цены на FunPay вручную через их UI, чтобы наш cache не разъехался.
+    #
+    # NULL = «ещё не синхронизировался» (первый прогон после миграции
+    # или после ручного сброса). Fast-path в этом случае не применяется.
+    last_synced_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    last_synced_stock: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_synced_active: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
 
