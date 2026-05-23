@@ -128,6 +128,7 @@ class FunPayAdminClient:
         max_429_retries: int = 4,
         base_429_backoff_seconds: float = 1.0,
         max_429_backoff_seconds: float = 30.0,
+        max_5xx_retries: int = 2,
     ) -> None:
         if not golden_key:
             raise ValueError("FunPayAdminClient: golden_key обязателен")
@@ -147,6 +148,8 @@ class FunPayAdminClient:
         self._max_429_retries = max(0, int(max_429_retries))
         self._base_429_backoff = max(0.0, float(base_429_backoff_seconds))
         self._max_429_backoff = max(self._base_429_backoff, float(max_429_backoff_seconds))
+        # параметры backoff'а на 5xx / сетевые ошибки (base/max общий с 429)
+        self._max_5xx_retries = max(0, int(max_5xx_retries))
 
     # ----- low-level -----
 
@@ -179,65 +182,123 @@ class FunPayAdminClient:
         delay = base_seconds * (2 ** max(0, int(attempt)))
         return min(delay, max_seconds)
 
+    # Статус-коды, которые ретраим на GET. Объясняется в _sync_get:
+    #   - 429: rate-limit; FunPay просит «подожди, я перегружен».
+    #   - 502/503/504: transient gateway issues — FunPay сам не отдаёт
+    #     наш бекенд (Cloudflare/балансер ловит ошибку). Обычно
+    #     рассасывается за 1-5 секунд.
+    # 500 НЕ ретраим: это application bug у FunPay, повтор бесполезен.
+    # 4xx (404/401/403) тоже не ретраим — это уже наши проблемы (нет
+    # лота, нет авторизации) и повтор только пожжёт rate-limit.
+    _RETRYABLE_GET_STATUSES_TRANSIENT: frozenset[int] = frozenset({502, 503, 504})
+
     def _sync_get(self, url: str, retries: int | None = None) -> requests.Response:
         """
-        GET к FunPay с обработкой rate-limit (429).
+        GET к FunPay с обработкой rate-limit (429) и transient 5xx.
 
-        FunPay в горячий момент массово отдаёт 429 — нам нужно подождать
-        и попробовать снова. Иначе sync_stock пропустит лот целиком.
+        Стратегия:
+        - 429: отдельный счётчик ретраев (self._max_429_retries),
+          уважает Retry-After. Раньше один 429 пропускал лот в sync_stock.
+        - 502/503/504 (и сетевые ошибки): отдельный счётчик
+          (self._max_5xx_retries, обычно ниже — FunPay 5xx или
+          совсем кратковременный, или достаточно «глубокий» чтобы
+          не было смысла долго ждать).
+        - 500/4xx: НЕ ретраим, отдаём исключение.
 
-        Сколько ретраев и какой backoff — настраивается через
-        Settings.funpay_429_*, а сюда прокидывается через __init__.
+        Параметр `retries` (если задан) переопределяет только 429-счётчик
+        — это сделано для обратной совместимости со старым API.
+
+        Backoff: exponential, общая логика `_compute_429_backoff`.
         """
         import time as _time
-        max_retries = self._max_429_retries if retries is None else int(retries)
+        max_429 = self._max_429_retries if retries is None else int(retries)
+        max_5xx = self._max_5xx_retries
+        attempts_429 = 0
+        attempts_5xx = 0
         last_exc: Exception | None = None
-        last_429: requests.Response | None = None
+        last_response: requests.Response | None = None
 
-        for attempt in range(max_retries + 1):
+        # Жёсткий потолок на общее число итераций — защита от
+        # потенциального race condition / бага в счётчиках.
+        hard_cap = max_429 + max_5xx + 2
+
+        for _ in range(hard_cap + 1):
             try:
                 r = self._session.get(url, timeout=20, allow_redirects=True)
             except Exception as exc:
                 last_exc = exc
-                if attempt < max_retries:
-                    # на сетевые ошибки тоже растягиваемся exponential'но,
-                    # но без Retry-After (его неоткуда взять).
-                    _time.sleep(
-                        self._compute_429_backoff(
-                            attempt, None, self._base_429_backoff, self._max_429_backoff
-                        )
-                    )
-                    continue
-                raise
-            if r.status_code == 429:
-                last_429 = r
-                if attempt < max_retries:
-                    ra = r.headers.get("Retry-After")
+                if attempts_5xx < max_5xx:
+                    # сетевые ошибки трактуем как 5xx «server unreachable»
                     delay = self._compute_429_backoff(
-                        attempt, ra, self._base_429_backoff, self._max_429_backoff
+                        attempts_5xx, None,
+                        self._base_429_backoff, self._max_429_backoff,
                     )
                     logger.warning(
-                        f"FunPay GET 429 (attempt {attempt + 1}/{max_retries + 1}, "
+                        f"FunPay GET network error: {type(exc).__name__}: {exc}; "
+                        f"attempt {attempts_5xx + 1}/{max_5xx + 1}, "
+                        f"backoff {delay:.2f}s — {url[:80]}"
+                    )
+                    _time.sleep(delay)
+                    attempts_5xx += 1
+                    continue
+                raise
+
+            last_response = r
+
+            if r.status_code == 429:
+                if attempts_429 < max_429:
+                    ra = r.headers.get("Retry-After")
+                    delay = self._compute_429_backoff(
+                        attempts_429, ra,
+                        self._base_429_backoff, self._max_429_backoff,
+                    )
+                    logger.warning(
+                        f"FunPay GET 429 (attempt {attempts_429 + 1}/{max_429 + 1}, "
                         f"Retry-After={ra}), backoff {delay:.2f}s — "
                         f"{url[:80]}"
                     )
                     _time.sleep(delay)
+                    attempts_429 += 1
                     continue
-                # ретраев больше нет — отдадим 429 наверх через raise_for_status
                 logger.error(
-                    f"FunPay GET 429 после {max_retries + 1} попыток — "
+                    f"FunPay GET 429 после {max_429 + 1} попыток — "
                     f"{url[:80]}"
                 )
                 r.raise_for_status()
                 return r
+
+            if r.status_code in self._RETRYABLE_GET_STATUSES_TRANSIENT:
+                if attempts_5xx < max_5xx:
+                    ra = r.headers.get("Retry-After")
+                    delay = self._compute_429_backoff(
+                        attempts_5xx, ra,
+                        self._base_429_backoff, self._max_429_backoff,
+                    )
+                    logger.warning(
+                        f"FunPay GET {r.status_code} (attempt "
+                        f"{attempts_5xx + 1}/{max_5xx + 1}, Retry-After={ra}), "
+                        f"backoff {delay:.2f}s — {url[:80]}"
+                    )
+                    _time.sleep(delay)
+                    attempts_5xx += 1
+                    continue
+                logger.error(
+                    f"FunPay GET {r.status_code} после {max_5xx + 1} попыток "
+                    f"— {url[:80]}"
+                )
+                r.raise_for_status()
+                return r
+
+            # 200 / 3xx / не-retryable 4xx-5xx (404, 500, ...) — отдаём как есть.
             r.raise_for_status()
             return r
 
+        # На случай совсем странного зацикливания (hard_cap исчерпан).
         if last_exc is not None:
             raise last_exc
-        if last_429 is not None:
-            last_429.raise_for_status()
-            return last_429
+        if last_response is not None:
+            last_response.raise_for_status()
+            return last_response
         raise RuntimeError(f"_sync_get({url}): retries exhausted")
 
     def _sync_post(self, url: str, data: dict[str, str]) -> requests.Response:

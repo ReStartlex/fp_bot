@@ -36,6 +36,7 @@ def _make_client(
     max_429_retries: int = 3,
     base: float = 0.01,  # 10ms — чтобы тесты бежали мгновенно
     max_cap: float = 0.5,
+    max_5xx_retries: int = 2,
 ) -> FunPayAdminClient:
     return FunPayAdminClient(
         golden_key="dummy",
@@ -43,6 +44,7 @@ def _make_client(
         max_429_retries=max_429_retries,
         base_429_backoff_seconds=base,
         max_429_backoff_seconds=max_cap,
+        max_5xx_retries=max_5xx_retries,
     )
 
 
@@ -411,3 +413,255 @@ def test_init_max_backoff_at_least_base():
         max_429_backoff_seconds=1.0,  # абсурдно мало
     )
     assert client._max_429_backoff >= client._base_429_backoff
+
+
+# ─────────────── _sync_get на 5xx (transient gateway) ───────────────
+
+
+def test_sync_get_retries_on_502(monkeypatch):
+    """502 → 502 → 200: ретраит до успеха, два sleep'а."""
+    client = _make_client(max_429_retries=0, max_5xx_retries=3, base=0.01)
+    sleeper = _SleepRecorder()
+    monkeypatch.setattr("time.sleep", sleeper)
+
+    responses = iter([
+        _FakeResponse(status_code=502, body="<html>502 Bad Gateway</html>"),
+        _FakeResponse(status_code=502, body="<html>502 Bad Gateway</html>"),
+        _FakeResponse(status_code=200, body="OK"),
+    ])
+    monkeypatch.setattr(client._session, "get", lambda *a, **kw: next(responses))
+
+    r = client._sync_get("https://funpay.com/lots/offerEdit?offer=1")
+
+    assert r.status_code == 200
+    assert len(sleeper.sleeps) == 2
+    # exp с base=0.01: первая пауза 0.01, вторая 0.02
+    assert sleeper.sleeps[0] == pytest.approx(0.01, rel=0.01)
+    assert sleeper.sleeps[1] == pytest.approx(0.02, rel=0.01)
+
+
+def test_sync_get_retries_on_503_and_504(monkeypatch):
+    """503 и 504 тоже ретраятся как transient."""
+    client = _make_client(max_429_retries=0, max_5xx_retries=2)
+    sleeper = _SleepRecorder()
+    monkeypatch.setattr("time.sleep", sleeper)
+
+    for status in (503, 504):
+        sleeper.sleeps.clear()
+        responses = iter([
+            _FakeResponse(status_code=status),
+            _FakeResponse(status_code=200, body="ok"),
+        ])
+        monkeypatch.setattr(client._session, "get", lambda *a, **kw: next(responses))
+
+        r = client._sync_get("https://funpay.com/x")
+        assert r.status_code == 200, f"должно ретраиться на {status}"
+        assert len(sleeper.sleeps) == 1
+
+
+def test_sync_get_5xx_uses_retry_after_header(monkeypatch):
+    """Если 5xx-ответ принёс Retry-After=2 — спим именно 2с (а не exp)."""
+    client = _make_client(max_429_retries=0, max_5xx_retries=2, base=0.001, max_cap=10.0)
+    sleeper = _SleepRecorder()
+    monkeypatch.setattr("time.sleep", sleeper)
+
+    responses = iter([
+        _FakeResponse(status_code=503, headers={"Retry-After": "2"}),
+        _FakeResponse(status_code=200, body="ok"),
+    ])
+    monkeypatch.setattr(client._session, "get", lambda *a, **kw: next(responses))
+
+    r = client._sync_get("https://funpay.com/x")
+    assert r.status_code == 200
+    assert sleeper.sleeps == [2.0]
+
+
+def test_sync_get_does_not_retry_500(monkeypatch):
+    """500 (application bug у FunPay) — НЕ ретраим, повтор бесполезен.
+    Это критически важно: иначе на каждый битый лот мы будем тратить
+    3 запроса вместо 1, разогревая FunPay-rate-limit."""
+    import requests
+
+    client = _make_client(max_429_retries=3, max_5xx_retries=3)
+    sleeper = _SleepRecorder()
+    monkeypatch.setattr("time.sleep", sleeper)
+
+    call_count = {"n": 0}
+
+    def fake_get(*a, **kw):
+        call_count["n"] += 1
+        return _FakeResponse(status_code=500, body="Internal Server Error")
+
+    monkeypatch.setattr(client._session, "get", fake_get)
+
+    with pytest.raises(requests.HTTPError):
+        client._sync_get("https://funpay.com/x")
+
+    assert call_count["n"] == 1, "500 должен НЕ ретраиться"
+    assert sleeper.sleeps == []
+
+
+def test_sync_get_does_not_retry_4xx(monkeypatch):
+    """404/401/403 — тоже не ретраим (это наши проблемы, не FunPay'a)."""
+    import requests
+
+    client = _make_client(max_429_retries=3, max_5xx_retries=3)
+    sleeper = _SleepRecorder()
+    monkeypatch.setattr("time.sleep", sleeper)
+
+    for status in (401, 403, 404):
+        call_count = {"n": 0}
+
+        def fake_get(*a, _s=status, **kw):
+            call_count["n"] += 1
+            return _FakeResponse(status_code=_s, body=f"http {_s}")
+
+        monkeypatch.setattr(client._session, "get", fake_get)
+        sleeper.sleeps.clear()
+
+        with pytest.raises(requests.HTTPError):
+            client._sync_get("https://funpay.com/x")
+
+        assert call_count["n"] == 1, f"{status} не должен ретраиться"
+        assert sleeper.sleeps == []
+
+
+def test_sync_get_5xx_exhausts_retries_raises_httperror(monkeypatch):
+    """Все попытки = 502 → raise_for_status поднимает HTTPError."""
+    import requests
+
+    client = _make_client(max_429_retries=0, max_5xx_retries=2, base=0.001, max_cap=0.01)
+    sleeper = _SleepRecorder()
+    monkeypatch.setattr("time.sleep", sleeper)
+
+    monkeypatch.setattr(
+        client._session,
+        "get",
+        lambda *a, **kw: _FakeResponse(status_code=502),
+    )
+
+    with pytest.raises(requests.HTTPError):
+        client._sync_get("https://funpay.com/x")
+
+    # 2 retries → 3 попытки → 2 sleep'а между ними
+    assert len(sleeper.sleeps) == 2
+
+
+def test_sync_get_5xx_zero_retries_means_one_attempt(monkeypatch):
+    """max_5xx_retries=0 → 1 попытка, 502 сразу падает без sleep'ов."""
+    import requests
+
+    client = _make_client(max_429_retries=0, max_5xx_retries=0)
+    sleeper = _SleepRecorder()
+    monkeypatch.setattr("time.sleep", sleeper)
+
+    call_count = {"n": 0}
+
+    def fake_get(*a, **kw):
+        call_count["n"] += 1
+        return _FakeResponse(status_code=502)
+
+    monkeypatch.setattr(client._session, "get", fake_get)
+
+    with pytest.raises(requests.HTTPError):
+        client._sync_get("https://funpay.com/x")
+
+    assert call_count["n"] == 1
+    assert sleeper.sleeps == []
+
+
+def test_sync_get_429_and_5xx_counters_are_independent(monkeypatch):
+    """Если сервер чередует 429 и 502, оба счётчика тратятся независимо.
+    Это сохраняет шанс на успех при «двойной» нестабильности."""
+    client = _make_client(max_429_retries=2, max_5xx_retries=2, base=0.001)
+    sleeper = _SleepRecorder()
+    monkeypatch.setattr("time.sleep", sleeper)
+
+    responses = iter([
+        _FakeResponse(status_code=429),                    # 429-counter: 1/2
+        _FakeResponse(status_code=502),                    # 5xx-counter: 1/2
+        _FakeResponse(status_code=429),                    # 429-counter: 2/2
+        _FakeResponse(status_code=502),                    # 5xx-counter: 2/2
+        _FakeResponse(status_code=200, body="finally"),    # успех
+    ])
+    monkeypatch.setattr(client._session, "get", lambda *a, **kw: next(responses))
+
+    r = client._sync_get("https://funpay.com/x")
+    assert r.status_code == 200
+    # 4 sleep'а между 5 запросами
+    assert len(sleeper.sleeps) == 4
+
+
+def test_sync_get_network_error_uses_5xx_counter(monkeypatch):
+    """ConnectionError должен тратить 5xx-счётчик, а не 429."""
+    import requests
+
+    client = _make_client(max_429_retries=0, max_5xx_retries=2, base=0.001)
+    sleeper = _SleepRecorder()
+    monkeypatch.setattr("time.sleep", sleeper)
+
+    calls = {"n": 0}
+
+    def fake_get(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise requests.ConnectionError("network down")
+        return _FakeResponse(status_code=200, body="OK")
+
+    monkeypatch.setattr(client._session, "get", fake_get)
+
+    r = client._sync_get("https://funpay.com/x")
+
+    assert r.status_code == 200
+    assert calls["n"] == 2
+    assert len(sleeper.sleeps) == 1
+    # И при этом max_429_retries=0 — это значит сетевая ошибка НЕ съела
+    # 429-счётчик. Проверка через противопоставление: сразу за этим
+    # тестом 429 ответ должен иметь ноль ретраев → один запрос → fail.
+
+
+def test_sync_get_logs_5xx_status_in_warning(monkeypatch, caplog):
+    """Лог-сообщение должно содержать конкретный код (502/503/504),
+    а не общий '5xx', чтобы в проде по логу было сразу видно, что упало."""
+    import logging
+
+    client = _make_client(max_429_retries=0, max_5xx_retries=1, base=0.001)
+    monkeypatch.setattr("time.sleep", _SleepRecorder())
+
+    responses = iter([
+        _FakeResponse(status_code=502),
+        _FakeResponse(status_code=200, body="OK"),
+    ])
+    monkeypatch.setattr(client._session, "get", lambda *a, **kw: next(responses))
+
+    # Подцепляем loguru → caplog (loguru пишет в собственный logger,
+    # но мы можем грубо отловить через add handler).
+    import io
+    from loguru import logger as loguru_logger
+
+    stream = io.StringIO()
+    handler_id = loguru_logger.add(stream, level="WARNING", format="{message}")
+    try:
+        client._sync_get("https://funpay.com/lots/offerEdit?offer=42")
+    finally:
+        loguru_logger.remove(handler_id)
+
+    log_output = stream.getvalue()
+    assert "502" in log_output, f"warning должен упомянуть код 502, got: {log_output!r}"
+
+
+# ─────────────── интеграция с __init__ ───────────────
+
+
+def test_init_max_5xx_retries_clamped_to_zero():
+    """Отрицательные значения 5xx-retries → 0."""
+    client = FunPayAdminClient(
+        golden_key="x", max_5xx_retries=-3,
+    )
+    assert client._max_5xx_retries == 0
+
+
+def test_init_defaults_for_5xx_retries():
+    """Дефолтное значение — 2 (см. конфиг)."""
+    client = FunPayAdminClient(golden_key="x")
+    assert client._max_5xx_retries == 2

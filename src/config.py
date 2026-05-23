@@ -120,6 +120,24 @@ class Settings(BaseSettings):
     funpay_429_max_retries: int = Field(default=4, ge=0, le=10)
     funpay_429_base_backoff_seconds: float = Field(default=1.0, gt=0, le=30.0)
     funpay_429_max_backoff_seconds: float = Field(default=30.0, gt=0, le=120.0)
+
+    # Поведение GET-запросов при 5xx Bad Gateway / Service Unavailable /
+    # Gateway Timeout от FunPay (видимая проблема: лог 23.05.2026 показал
+    # массовые `get_lot_fields ... 502 Server Error: Bad Gateway`,
+    # из-за чего sync_stock пропускал лоты целиком).
+    #
+    # Применяется только к GET (идемпотентные). POST 5xx (save_lot,
+    # send_message) НЕ ретраится автоматически: для send_message это
+    # риск двойной отправки сообщения. base/max backoff общие с
+    # funpay_429_*. Сетевые ошибки (ConnectionError и т.п.) тоже
+    # используют этот счётчик, потому что семантически они равны
+    # "сервер недоступен".
+    #
+    # 5xx у FunPay обычно transient и рассасывается за 1-5 секунд,
+    # поэтому 2 retries (всего 3 попытки) достаточно: 1s, 2s — суммарно
+    # ~3 секунды задержки. Если FunPay лежит дольше — лучше пропустить
+    # лот и попробовать в следующем sync-цикле через 30 секунд.
+    funpay_5xx_max_retries: int = Field(default=2, ge=0, le=10)
     ns_retry_attempts: int = Field(default=3, ge=1)
     ns_retry_delay_seconds: float = Field(default=5.0, gt=0)
     ns_order_poll_interval_seconds: float = Field(default=5.0, gt=0)
