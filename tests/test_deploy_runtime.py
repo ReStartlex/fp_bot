@@ -13,8 +13,10 @@ from deploy.runtime import (
     BACKUP_DIR_NAME,
     BACKUP_TARGETS,
     PIN_FILENAME,
+    REQUIRED_STAGING_FILES,
     make_backup,
     resolve_target_ref,
+    verify_staging,
 )
 
 
@@ -267,3 +269,149 @@ def test_cli_resolve_target_invalid_pin_exits_nonzero(
     captured = capsys.readouterr()
     assert exit_code == 2
     assert "resolve-target FAILED" in captured.err
+
+
+# ─────────────── verify_staging ───────────────
+
+
+def _seed_valid_staging(tmp_path: Path) -> Path:
+    """Создаёт правдоподобный staging-каталог (минимум для прохождения verify)."""
+    staging = tmp_path / "staging"
+    (staging / "src").mkdir(parents=True)
+    (staging / "src" / "_version.py").write_text(
+        '"""docstring."""\n'
+        'SHA = "abc1234def56789012345678901234567890abcd"\n'
+        'DATE = "2026-05-23T20:00:00+00:00"\n'
+        'SUBJECT = "feat: test"\n',
+        encoding="utf-8",
+    )
+    (staging / "src" / "main.py").write_text(
+        "def main() -> int:\n    return 0\n", encoding="utf-8"
+    )
+    (staging / "requirements.txt").write_text("pytest>=7\n", encoding="utf-8")
+    return staging
+
+
+def test_verify_staging_ok_on_valid_dir(tmp_path: Path):
+    staging = _seed_valid_staging(tmp_path)
+
+    result = verify_staging(staging)
+
+    assert result.ok is True
+    assert result.errors == ()
+    assert result.checked_files == len(REQUIRED_STAGING_FILES)
+    assert result.compiled_modules >= 2  # _version.py + main.py
+
+
+def test_verify_staging_fails_when_dir_missing(tmp_path: Path):
+    result = verify_staging(tmp_path / "nope")
+
+    assert result.ok is False
+    assert any("not found" in e for e in result.errors)
+
+
+def test_verify_staging_fails_on_missing_main_py(tmp_path: Path):
+    staging = _seed_valid_staging(tmp_path)
+    (staging / "src" / "main.py").unlink()
+
+    result = verify_staging(staging)
+
+    assert result.ok is False
+    assert any("missing required file: src/main.py" in e for e in result.errors)
+
+
+def test_verify_staging_fails_on_empty_version_py(tmp_path: Path):
+    staging = _seed_valid_staging(tmp_path)
+    (staging / "src" / "_version.py").write_text("", encoding="utf-8")
+
+    result = verify_staging(staging)
+
+    assert result.ok is False
+    assert any("empty file: src/_version.py" in e for e in result.errors)
+
+
+def test_verify_staging_fails_when_version_py_is_html(tmp_path: Path):
+    """Защита от ситуации, когда fetch вернул HTML страницу ошибки
+    GitHub'а вместо нашего _version.py — без SHA/SUBJECT-маркеров."""
+    staging = _seed_valid_staging(tmp_path)
+    (staging / "src" / "_version.py").write_text(
+        "<html><body>500 Server Error</body></html>"
+        + "\n" * 5 + "x" * 100,  # сделаем большим, чтобы не сработал size-check
+        encoding="utf-8",
+    )
+
+    result = verify_staging(staging)
+
+    assert result.ok is False
+    assert any("doesn't look like our _version.py" in e for e in result.errors)
+
+
+def test_verify_staging_fails_on_syntax_error_in_src(tmp_path: Path):
+    """compileall должен поймать сломанный .py в src/."""
+    staging = _seed_valid_staging(tmp_path)
+    (staging / "src" / "broken.py").write_text(
+        "def oops(:\n    pass\n", encoding="utf-8"
+    )
+
+    result = verify_staging(staging)
+
+    assert result.ok is False
+    assert any("SyntaxError" in e for e in result.errors)
+
+
+def test_verify_staging_fails_when_no_src_dir(tmp_path: Path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    # Создадим только requirements.txt, без src/
+    (staging / "requirements.txt").write_text("x\n", encoding="utf-8")
+
+    result = verify_staging(staging)
+
+    assert result.ok is False
+    # Хотя бы один из ожидаемых маркеров ошибки.
+    msg = " | ".join(result.errors)
+    assert ("has no src/ directory" in msg) or ("missing required file" in msg)
+
+
+def test_verify_staging_doesnt_fail_on_runtime_imports(tmp_path: Path):
+    """compileall проверяет ТОЛЬКО синтаксис: ImportError (отсутствие
+    .venv с зависимостями) не должен валить verify. Это критично, потому
+    что в staging-папке нет .venv."""
+    staging = _seed_valid_staging(tmp_path)
+    (staging / "src" / "uses_missing_dep.py").write_text(
+        "from nonexistent_package import boom\n", encoding="utf-8"
+    )
+
+    result = verify_staging(staging)
+
+    assert result.ok is True, f"ожидался OK, errors={result.errors}"
+
+
+# ─────────────── CLI verify-staging ───────────────
+
+
+def test_cli_verify_staging_ok_returns_zero(tmp_path: Path, capsys):
+    staging = _seed_valid_staging(tmp_path)
+    from deploy.runtime import main
+
+    exit_code = main(["verify-staging", "--dir", str(staging)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "verify_staging=OK" in captured.out
+
+
+def test_cli_verify_staging_fail_returns_three(tmp_path: Path, capsys):
+    """CLI exit code 3 на невалидной staging — update.sh ловит именно его,
+    чтобы отличить от exit 1 (общая ошибка bash) и exit 2 (исключение
+    Python). На 3 — НЕ останавливать сервис, оставить старый код."""
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    from deploy.runtime import main
+
+    exit_code = main(["verify-staging", "--dir", str(staging)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 3
+    assert "verify_staging=FAIL" in captured.out
+    assert "verify-staging error" in captured.err

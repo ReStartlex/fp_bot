@@ -15,10 +15,25 @@
 #   GIT_HTTP_PROXY=<url>    HTTP-прокси для git напрямую на github.com
 #                           (fallback, если gh-proxy.com на тех. работах).
 #   BACKUP_KEEP=<N>         Сколько последних бэкапов держать (default 10).
+#   STAGING_DIR=<path>      Где собирать staging (default ${APP_DIR}.staging).
+#
+# Архитектура (важно):
+#   1. БЭКАП (.env + bridge.db) — пока сервис ещё ЖИВ и БД консистентна.
+#   2. FETCH в STAGING (а не in-place). Сервис продолжает работать.
+#   3. VERIFY staging (compileall + ключевые файлы есть). Если verify
+#      падает — exit БЕЗ остановки сервиса. Бот продолжает работать на
+#      старом коде. Это спасает от инцидента 23.05.2026: тогда update.sh
+#      сначала остановил сервис, потом git fetch завис на мёртвом прокси,
+#      и продакшн остался лежать.
+#   4. STOP сервиса (только теперь, когда новый код гарантированно валиден).
+#   5. RSYNC staging → production (с теми же exclude, что у tarball-деплоя).
+#   6. PIP install + chown + START сервиса.
+#   7. Health-check.
 
 set -euo pipefail
 
 APP_DIR=/opt/funpay-ns-bot
+STAGING_DIR=${STAGING_DIR:-${APP_DIR}.staging}
 BACKUP_KEEP=${BACKUP_KEEP:-10}
 
 if [[ ! -d "${APP_DIR}" ]]; then
@@ -31,6 +46,9 @@ fi
 # safe.directory один раз в системном config.
 git config --system --add safe.directory "${APP_DIR}" 2>/dev/null \
     || git config --global --add safe.directory "${APP_DIR}" 2>/dev/null \
+    || true
+git config --system --add safe.directory "${STAGING_DIR}" 2>/dev/null \
+    || git config --global --add safe.directory "${STAGING_DIR}" 2>/dev/null \
     || true
 
 # update.sh обязан запускаться от root. Сам скрипт делает chown bot:bot,
@@ -69,36 +87,98 @@ else
     BACKUP_DIR=""
 fi
 
-# 2. ОСТАНАВЛИВАЕМ сервис ДО любых файловых операций.
-# Иначе процесс держит open file descriptor на bridge.db; после
-# фоновой подмены файлов SQLite видит "файл удалён" и переключается
+# 2. FETCH в STAGING. Бот продолжает работать.
+#    PIN_SHA / GIT_HTTP_PROXY пробрасываются прозрачно через env.
+#    fetch_code.sh теперь смотрит APP_DIR — указываем staging.
+echo "==> Fetch кода в staging: ${STAGING_DIR}"
+mkdir -p "${STAGING_DIR}"
+if APP_DIR="${STAGING_DIR}" bash "${APP_DIR}/deploy/fetch_code.sh"; then
+    echo "    staging fetch OK"
+else
+    echo
+    echo "── ❌ FETCH В STAGING УПАЛ ──"
+    echo "Сервис funpay-ns-bot НЕ был остановлен и продолжает работать"
+    echo "на старом коде. Это безопасный сценарий: ничего трогать не нужно."
+    echo
+    echo "Проверь сеть/прокси и запусти update.sh повторно, либо выкати"
+    echo "tarball-стратегией вручную (см. PROJECT_CONTEXT.md)."
+    echo "─────────────────────────────"
+    exit 1
+fi
+
+# 3. VERIFY staging. Только если zero errors — продолжаем в production.
+#    На любой ошибке staging — exit БЕЗ остановки сервиса.
+echo "==> Verify staging"
+VERIFY_PYTHON=""
+if [[ -x "${APP_DIR}/.venv/bin/python" ]]; then
+    VERIFY_PYTHON="${APP_DIR}/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    VERIFY_PYTHON="python3"
+elif command -v python >/dev/null 2>&1; then
+    VERIFY_PYTHON="python"
+fi
+if [[ -n "${VERIFY_PYTHON}" && -f "${STAGING_DIR}/deploy/runtime.py" ]]; then
+    set +e
+    (cd "${STAGING_DIR}" && "${VERIFY_PYTHON}" -m deploy.runtime verify-staging --dir "${STAGING_DIR}")
+    VERIFY_RC=$?
+    set -e
+    if [[ "${VERIFY_RC}" -ne 0 ]]; then
+        echo
+        echo "── ❌ VERIFY STAGING УПАЛ (rc=${VERIFY_RC}) ──"
+        echo "Сервис funpay-ns-bot НЕ был остановлен и продолжает работать"
+        echo "на старом коде. Staging-папка осталась в ${STAGING_DIR}"
+        echo "для ручного разбора."
+        echo "──────────────────────────────────────────────"
+        exit 1
+    fi
+    echo "    verify OK"
+else
+    echo "    (verify пропущен: deploy.runtime недоступен)"
+fi
+
+# 4. STOP сервиса. Только теперь — staging валиден и готов к swap'у.
+# Останавливаем потому что процесс держит open file descriptor на bridge.db;
+# после фоновой подмены файлов SQLite видит "файл удалён" и переключается
 # в read-only режим (отсюда наш "attempt to write a readonly database").
 SERVICE_WAS_RUNNING=0
 API_WAS_RUNNING=0
 if systemctl is-active --quiet funpay-ns-api 2>/dev/null; then
-    echo "==> Останавливаю funpay-ns-api до обновления кода"
+    echo "==> Останавливаю funpay-ns-api до swap'a кода"
     systemctl stop funpay-ns-api
     API_WAS_RUNNING=1
 fi
 if systemctl is-active --quiet funpay-ns-bot 2>/dev/null; then
-    echo "==> Останавливаю funpay-ns-bot до обновления кода"
+    echo "==> Останавливаю funpay-ns-bot до swap'a кода"
     systemctl stop funpay-ns-bot
     SERVICE_WAS_RUNNING=1
 fi
 
-# 3. Скачиваем свежий код. fetch_code.sh теперь делает in-place git fetch
-# (без rm -rf), поэтому .venv, data/, .env остаются на месте.
-# PIN_SHA/GIT_HTTP_PROXY пробрасываются прозрачно (export сверху не нужен,
-# bash наследует уже выставленные env-переменные).
-if [[ -x "${APP_DIR}/deploy/fetch_code.sh" ]]; then
-    bash "${APP_DIR}/deploy/fetch_code.sh"
-else
-    echo "==> локального fetch_code.sh нет, тяну с GitHub через gh-proxy"
-    bash <(curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/ReStartlex/fp_bot/main/deploy/fetch_code.sh)
+# 5. RSYNC staging → production.
+# Те же exclude, что у tarball-деплоя: .env, data/, logs/, backups/,
+# .venv/, .git/, .deploy_pin (его обновим отдельно ниже).
+# --delete: убирает в проде файлы, которых уже нет в новом коммите.
+echo "==> rsync staging → production"
+rsync -a --delete \
+    --exclude='.env' --exclude='data/' --exclude='logs/' --exclude='backups/' \
+    --exclude='.venv/' --exclude='.git/' --exclude='.deploy_pin' \
+    --exclude='BUILD_INFO' --exclude='__pycache__/' --exclude='*.pyc' \
+    "${STAGING_DIR}/" "${APP_DIR}/"
+
+# Чистим bytecode на проде, чтобы Python не подсунул кеш на старый код
+find "${APP_DIR}/src" "${APP_DIR}/tests" -name '__pycache__' -type d \
+    -exec rm -rf {} + 2>/dev/null || true
+find "${APP_DIR}/src" "${APP_DIR}/tests" -name '*.pyc' \
+    -delete 2>/dev/null || true
+
+# Обновим .deploy_pin и BUILD_INFO на проде из staging
+if [[ -f "${STAGING_DIR}/.deploy_pin" ]]; then
+    cp "${STAGING_DIR}/.deploy_pin" "${APP_DIR}/.deploy_pin"
+fi
+if [[ -f "${STAGING_DIR}/BUILD_INFO" ]]; then
+    cp "${STAGING_DIR}/BUILD_INFO" "${APP_DIR}/BUILD_INFO"
 fi
 
-# 4. Обновляем pip-зависимости. Сервис уже остановлен (выше) — pip
-# может спокойно писать в .venv без гонки.
+# 6. Обновляем pip-зависимости. Сервис уже остановлен, .venv свободна.
 # НЕ глотаем stderr: при настоящих ошибках их видно в логе.
 PIP_OK=1
 if ! "${APP_DIR}/.venv/bin/pip" install -r "${APP_DIR}/requirements.txt"; then
@@ -110,7 +190,7 @@ if ! "${APP_DIR}/.venv/bin/pip" install -r "${APP_DIR}/requirements.txt"; then
     echo "Иначе посмотри вывод выше и поправь requirements.txt."
 fi
 
-# 5. Чиним права ДО рестарта. Сервис бежит от 'bot', и .env должен
+# 7. Чиним права ДО рестарта. Сервис бежит от 'bot', и .env должен
 # быть владельца bot (mv от root забирает права).
 # Также гарантируем logs/ и data/ как папки (systemd-mount-namespacing
 # падает если их нет) и владельца bot:bot.
@@ -158,7 +238,7 @@ _print_rollback_hint() {
     echo "──────────────────────"
 }
 
-# 6. Запускаем (или перезапускаем) сервис.
+# 8. Запускаем (или перезапускаем) сервис.
 if systemctl is-enabled --quiet funpay-ns-bot 2>/dev/null \
    || [[ "${SERVICE_WAS_RUNNING}" -eq 1 ]]; then
     systemctl start funpay-ns-bot
@@ -199,7 +279,7 @@ if systemctl is-enabled --quiet funpay-ns-api 2>/dev/null \
     fi
 fi
 
-# 7. Печатаем версию, чтобы сразу было видно — фикс задеплоился?
+# 9. Печатаем версию, чтобы сразу было видно — фикс задеплоился?
 if [[ -f "${APP_DIR}/BUILD_INFO" ]]; then
     echo
     echo "── Версия задеплоенного кода ──"

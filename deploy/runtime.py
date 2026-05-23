@@ -13,14 +13,16 @@ CLI:
     python -m deploy.runtime backup --app-dir /opt/funpay-ns-bot --keep 10
     python -m deploy.runtime resolve-target --app-dir /opt/funpay-ns-bot \\
         [--default-branch main]
+    python -m deploy.runtime verify-staging --dir /opt/funpay-ns-bot.staging
 
-Оба подкоманды печатают понятную человеку строку в stdout и завершаются
+Все подкоманды печатают понятную человеку строку в stdout и завершаются
 ненулевым кодом только при настоящих ошибках. Не критичные warning-и
 (нет .env, нет БД — это нормально на первом деплое) идут в stderr.
 """
 from __future__ import annotations
 
 import argparse
+import compileall
 import re
 import shutil
 import sys
@@ -195,6 +197,120 @@ def resolve_target_ref(
     return f"origin/{default_branch}"
 
 
+# ────────────────── verify_staging ──────────────────
+
+
+# Минимальный набор файлов, без которого деплой бессмысленно swap'ать
+# в production. Если хоть одного нет — fetch явно сломался (например,
+# tarball оборвался посередине, или git fetch упал на странице ошибки).
+REQUIRED_STAGING_FILES: tuple[str, ...] = (
+    "src/_version.py",
+    "src/main.py",
+    "requirements.txt",
+)
+
+# Минимальный размер _version.py. Если меньше — это явно не наш файл
+# (он содержит как минимум docstring + 3 строки SHA/DATE/SUBJECT).
+_MIN_VERSION_PY_SIZE = 80
+
+
+@dataclass(frozen=True)
+class StagingVerifyResult:
+    ok: bool
+    errors: tuple[str, ...]
+    checked_files: int
+    compiled_modules: int
+
+    def summary_line(self) -> str:
+        status = "OK" if self.ok else "FAIL"
+        return (
+            f"verify_staging={status} "
+            f"checked={self.checked_files} "
+            f"compiled={self.compiled_modules} "
+            f"errors={len(self.errors)}"
+        )
+
+
+def verify_staging(staging_dir: Path) -> StagingVerifyResult:
+    """
+    Проверить, что staging-папка пригодна для swap'a в production.
+
+    Что проверяем:
+      1. Каталог существует.
+      2. Все файлы из `REQUIRED_STAGING_FILES` есть и непустые.
+      3. `src/_version.py` содержит как минимум SHA= и SUBJECT=
+         (защита от случая, когда fetch вернул HTML страницу ошибки
+         GitHub'а, которая просто записалась в файл с тем же именем).
+      4. `compileall src/` проходит без SyntaxError — гарантирует,
+         что код хотя бы парсится. Это самый быстрый smoke-test,
+         не требует .venv и не тратит время на импорт зависимостей.
+
+    Возвращает `StagingVerifyResult.ok=True` ТОЛЬКО если все проверки
+    зелёные. На False — update.sh обязан `exit 1` БЕЗ остановки
+    production-сервиса (бот продолжает работать на старом коде).
+    """
+    staging_dir = staging_dir.resolve()
+    errors: list[str] = []
+    checked = 0
+
+    if not staging_dir.is_dir():
+        return StagingVerifyResult(
+            ok=False,
+            errors=(f"staging dir not found: {staging_dir}",),
+            checked_files=0,
+            compiled_modules=0,
+        )
+
+    for rel in REQUIRED_STAGING_FILES:
+        path = staging_dir / rel
+        checked += 1
+        if not path.is_file():
+            errors.append(f"missing required file: {rel}")
+            continue
+        size = path.stat().st_size
+        if size == 0:
+            errors.append(f"empty file: {rel}")
+            continue
+        if rel == "src/_version.py":
+            if size < _MIN_VERSION_PY_SIZE:
+                errors.append(
+                    f"{rel} suspiciously small ({size} bytes < "
+                    f"{_MIN_VERSION_PY_SIZE})"
+                )
+                continue
+            content = path.read_text(encoding="utf-8", errors="replace")
+            if "SHA" not in content or "SUBJECT" not in content:
+                errors.append(
+                    f"{rel} doesn't look like our _version.py "
+                    f"(no SHA/SUBJECT markers)"
+                )
+
+    # compileall src/: ловит SyntaxError. Падать только на синтаксе,
+    # а не на ImportError (последний возможен из-за отсутствия .venv
+    # в staging — это норма, имеют значение только синтаксические сбои).
+    compiled = 0
+    src_dir = staging_dir / "src"
+    if src_dir.is_dir():
+        compiled = sum(1 for _ in src_dir.rglob("*.py"))
+        ok = compileall.compile_dir(
+            str(src_dir),
+            quiet=2,
+            force=True,
+            workers=0,
+        )
+        if not ok:
+            errors.append("compileall(src/) found SyntaxError")
+    else:
+        errors.append("staging has no src/ directory")
+
+    return StagingVerifyResult(
+        ok=not errors,
+        errors=tuple(errors),
+        checked_files=checked,
+        compiled_modules=compiled,
+    )
+
+
 # ----------------------------- CLI -----------------------------
 
 
@@ -237,6 +353,22 @@ def _cmd_resolve_target(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_verify_staging(args: argparse.Namespace) -> int:
+    staging_dir = Path(args.dir)
+    try:
+        result = verify_staging(staging_dir)
+    except Exception as exc:
+        print(
+            f"verify-staging FAILED: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 2
+    for err in result.errors:
+        print(f"verify-staging error: {err}", file=sys.stderr)
+    print(result.summary_line())
+    return 0 if result.ok else 3
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="deploy.runtime",
@@ -269,6 +401,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Игнорировать переменную окружения PIN_SHA (для тестов).",
     )
     p_resolve.set_defaults(func=_cmd_resolve_target)
+
+    p_verify = sub.add_parser(
+        "verify-staging",
+        help=(
+            "Проверить staging-папку перед swap'ом в production. "
+            "Возвращает 0 если staging пригоден, 3 если не пригоден "
+            "(update.sh должен на 3 завершиться БЕЗ остановки сервиса), "
+            "2 на непредвиденной ошибке."
+        ),
+    )
+    p_verify.add_argument(
+        "--dir", required=True, help="Путь к staging-каталогу для проверки."
+    )
+    p_verify.set_defaults(func=_cmd_verify_staging)
 
     return parser
 

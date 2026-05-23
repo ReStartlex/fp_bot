@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Скачивание/обновление кода проекта в /opt/funpay-ns-bot.
+# Скачивание/обновление кода проекта в APP_DIR (по умолчанию
+# /opt/funpay-ns-bot, но update.sh теперь вызывает с APP_DIR=
+# /opt/funpay-ns-bot.staging — чтобы прокачать код в staging,
+# проверить его и только потом swap'нуть в production).
 #
 # Стратегия выбора источника (по приоритету):
 #   1. CODEBERG_URL (если задан) — git clone/pull с него.
@@ -18,7 +21,8 @@
 
 set -euo pipefail
 
-APP_DIR=/opt/funpay-ns-bot
+# APP_DIR конфигурируемо: update.sh использует staging-каталог.
+APP_DIR=${APP_DIR:-/opt/funpay-ns-bot}
 BRANCH=${BRANCH:-main}
 GH_OWNER=ReStartlex
 GH_REPO=fp_bot
