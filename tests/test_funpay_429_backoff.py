@@ -38,6 +38,9 @@ def _make_client(
     max_cap: float = 0.5,
     max_5xx_retries: int = 2,
 ) -> FunPayAdminClient:
+    # rate_min_interval=0 ВАЖНО: иначе rate-limiter добавляет лишние
+    # sleep'ы поверх backoff'а, и тесты-счётчики (sleeper.sleeps)
+    # ломаются. Здесь мы проверяем именно retry/backoff-логику.
     return FunPayAdminClient(
         golden_key="dummy",
         phpsessid=None,
@@ -45,6 +48,8 @@ def _make_client(
         base_429_backoff_seconds=base,
         max_429_backoff_seconds=max_cap,
         max_5xx_retries=max_5xx_retries,
+        rate_max_concurrent=8,
+        rate_min_interval_seconds=0.0,
     )
 
 

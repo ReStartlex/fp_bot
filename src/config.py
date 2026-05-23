@@ -138,6 +138,25 @@ class Settings(BaseSettings):
     # ~3 секунды задержки. Если FunPay лежит дольше — лучше пропустить
     # лот и попробовать в следующем sync-цикле через 30 секунд.
     funpay_5xx_max_retries: int = Field(default=2, ge=0, le=10)
+
+    # === Глобальный rate-limit на исходящие FunPay-запросы ===
+    # Предотвращает 429 ДО их возникновения, вместо того чтобы только
+    # реагировать после. Применяется к GET и POST одновременно
+    # (общий счётчик).
+    #
+    # Видимая в проде проблема (23.05.2026, через несколько секунд
+    # после старта): на одном offerEdit URL мы получали 429 → 429 →
+    # 200, на 4 разных URL подряд. Это значит FunPay активно нас
+    # ограничивает при текущем стиле массовых запросов из
+    # sync_stock + chat-watcher.
+    #
+    # max_concurrent: сколько HTTP-запросов могут идти одновременно.
+    #   4 — консервативно (asyncio thread pool обычно 6-10, оставляем
+    #   запас на другие thread-вызовы: SQLite, обработчики и т.п.).
+    # min_interval_seconds: минимальная пауза между ЛЮБЫМИ двумя
+    #   запросами. 0.1 = max 10 RPS даже при concurrent=1.
+    funpay_rate_max_concurrent: int = Field(default=4, ge=1, le=32)
+    funpay_rate_min_interval_seconds: float = Field(default=0.1, ge=0.0, le=10.0)
     ns_retry_attempts: int = Field(default=3, ge=1)
     ns_retry_delay_seconds: float = Field(default=5.0, gt=0)
     ns_order_poll_interval_seconds: float = Field(default=5.0, gt=0)

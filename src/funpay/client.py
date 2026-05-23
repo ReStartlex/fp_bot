@@ -547,6 +547,8 @@ class FunPayClient:
             base_429_backoff_seconds=self._settings.funpay_429_base_backoff_seconds,
             max_429_backoff_seconds=self._settings.funpay_429_max_backoff_seconds,
             max_5xx_retries=self._settings.funpay_5xx_max_retries,
+            rate_max_concurrent=self._settings.funpay_rate_max_concurrent,
+            rate_min_interval_seconds=self._settings.funpay_rate_min_interval_seconds,
         )
         self._admin_client_cache = client
         return client
