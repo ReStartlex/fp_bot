@@ -18,7 +18,12 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from src.alerts.bot import TelegramBot, _parse_hours_arg
+from src.alerts.bot import (
+    TelegramBot,
+    _parse_hours_arg,
+    _split_ids_to_copy_chunks,
+    _split_lines_to_chunks,
+)
 from src.db.models import Base, Order
 
 
@@ -145,6 +150,9 @@ async def test_do_pending_confirm_renders_copyable_list(db_with_orders):
     """
     Главный кейс: ответ содержит готовый блок для копирования в саппорт
     + имя покупателя + возраст в часах.
+
+    Ответ теперь шлётся МИНИМУМ двумя сообщениями (список + copy-block),
+    чтобы не выйти за Telegram 4096-char limit на больших списках.
     """
     bot = _make_bot_with_owner_check_disabled()
     msg = MagicMock()
@@ -153,21 +161,20 @@ async def test_do_pending_confirm_renders_copyable_list(db_with_orders):
 
     await bot._do_pending_confirm(msg)
 
-    bot._send_view.assert_called_once()
-    call_args = bot._send_view.call_args
-    chat_id = call_args.args[0]
-    text = call_args.args[1]
+    # Минимум 2 сообщения: список + copy-block
+    assert bot._send_view.call_count >= 2
 
-    assert chat_id == 12345
-    # Должен быть order_id
-    assert "#OLD12345" in text
-    # Имя покупателя для контекста саппорта
-    assert "Macan1467" in text
-    # Готовый блок для копирования (одна строка с #ID через запятую)
-    assert "#OLD12345" in text and "Скопировать" in text
-    # НЕ должно быть подтверждённого или свежего заказа
-    assert "DONE1234" not in text
-    assert "FRESH123" not in text
+    # Все сообщения в нужный chat_id
+    for call in bot._send_view.call_args_list:
+        assert call.args[0] == 12345
+
+    # Объединённый текст всех сообщений
+    all_text = "\n".join(call.args[1] for call in bot._send_view.call_args_list)
+    assert "#OLD12345" in all_text
+    assert "Macan1467" in all_text  # имя покупателя для саппорта
+    assert "Скопировать" in all_text  # есть метка copy-block
+    assert "DONE1234" not in all_text  # подтверждённый не показан
+    assert "FRESH123" not in all_text  # свежий не показан
 
 
 @pytest.mark.asyncio
@@ -196,7 +203,162 @@ async def test_do_pending_confirm_custom_hours(db_with_orders):
 
     await bot._do_pending_confirm(msg)
 
-    text = bot._send_view.call_args.args[1]
-    assert "#OLD12345" in text
-    assert "#FRESH123" in text
-    assert "#DONE1234" not in text  # подтверждённый никогда не показывается
+    # Должно быть как минимум 2 send_view вызова: список + copy-block.
+    assert bot._send_view.call_count >= 2
+    all_texts = " ".join(call.args[1] for call in bot._send_view.call_args_list)
+    assert "#OLD12345" in all_texts
+    assert "#FRESH123" in all_texts
+    assert "#DONE1234" not in all_texts  # подтверждённый никогда не показывается
+
+
+# ───────────────────── chunking helpers ─────────────────────
+
+
+def test_split_lines_to_chunks_small_fits_in_one():
+    chunks = _split_lines_to_chunks(
+        header_lines=["HEADER"],
+        body_lines=["line1", "line2", "line3"],
+        max_chars=1000,
+    )
+    assert len(chunks) == 1
+    assert "HEADER" in chunks[0]
+    assert "line1" in chunks[0]
+    assert "line3" in chunks[0]
+
+
+def test_split_lines_to_chunks_splits_when_over_limit():
+    """500 строк по 60 char (~30KB) с лимитом 3500 → ~10 чанков."""
+    body = [f"line {i:03d} " + ("x" * 50) for i in range(500)]
+    chunks = _split_lines_to_chunks(
+        header_lines=["HDR"],
+        body_lines=body,
+        max_chars=3500,
+    )
+    assert len(chunks) >= 2, "Должно разрезаться на несколько чанков"
+    # Каждый чанк ≤ ожидаемого + 1 заголовок (header ≤ 100 chars)
+    for c in chunks:
+        assert len(c) <= 3700, f"Чанк превысил лимит: {len(c)} chars"
+    # Все строки присутствуют в каком-то чанке
+    all_text = "\n".join(chunks)
+    for i in range(500):
+        assert f"line {i:03d}" in all_text, f"Потеряна строка {i}"
+
+
+def test_split_lines_to_chunks_every_chunk_starts_with_header():
+    """Юзер не должен теряться: каждое сообщение должно сразу
+    показывать о чём оно."""
+    body = ["x" * 100 for _ in range(100)]
+    chunks = _split_lines_to_chunks(
+        header_lines=["📋 SUPPORT LIST"],
+        body_lines=body,
+        max_chars=500,
+    )
+    assert len(chunks) > 1
+    for c in chunks:
+        assert c.startswith("📋 SUPPORT LIST"), (
+            f"Чанк не начинается с заголовка: {c[:50]!r}"
+        )
+
+
+def test_split_lines_to_chunks_empty_body():
+    chunks = _split_lines_to_chunks(
+        header_lines=["only header"],
+        body_lines=[],
+    )
+    assert chunks == ["only header"]
+
+
+def test_split_ids_to_copy_chunks_small():
+    chunks = _split_ids_to_copy_chunks(["AAA111", "BBB222", "CCC333"])
+    assert chunks == ["#AAA111, #BBB222, #CCC333"]
+
+
+def test_split_ids_to_copy_chunks_large():
+    """500 заказов с лимитом 3500 → несколько чанков, без потерь."""
+    ids = [f"ORD{i:05d}" for i in range(500)]
+    chunks = _split_ids_to_copy_chunks(ids, max_chars=3500)
+    assert len(chunks) >= 2
+    for c in chunks:
+        assert len(c) <= 3500
+    joined = ", ".join(chunks)
+    for i in range(500):
+        assert f"#ORD{i:05d}" in joined, f"Потерян ORD{i:05d}"
+
+
+def test_split_ids_to_copy_chunks_no_trailing_separator():
+    chunks = _split_ids_to_copy_chunks(["A1", "B2"])
+    for c in chunks:
+        assert not c.endswith(", "), f"Trailing separator: {c!r}"
+        assert not c.startswith(", "), f"Leading separator: {c!r}"
+
+
+def test_split_ids_to_copy_chunks_empty():
+    assert _split_ids_to_copy_chunks([]) == []
+
+
+# ───────────────────── chunking integration ─────────────────────
+
+
+@pytest.fixture()
+async def db_with_many_orders(monkeypatch):
+    """БД с 200 delivered-заказами старше 24ч — для проверки чанкинга."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    long_ago = datetime.utcnow() - timedelta(hours=30)
+    async with factory() as session:
+        for i in range(200):
+            order = Order(
+                funpay_order_id=f"ORD{i:05d}",
+                funpay_lot_id=1,
+                ns_service_id=42,
+                buyer_username=f"BuyerWithLongUsername_{i:03d}",
+                quantity=1,
+                funpay_price_rub=100.0,
+                status="delivered",
+            )
+            session.add(order)
+            await session.flush()
+            order.updated_at = long_ago - timedelta(seconds=i)
+        await session.commit()
+
+    monkeypatch.setattr("src.alerts.bot.session_factory", lambda: factory)
+    yield factory
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_do_pending_confirm_handles_200_orders_without_overflow(
+    db_with_many_orders,
+):
+    """
+    Регрессия на bug 24.05.2026:
+      «Telegram server says - Bad Request: message is too long»
+    200 заказов по ~60 chars = ~12KB → должны разъехаться на чанки.
+    """
+    bot = _make_bot_with_owner_check_disabled()
+    msg = MagicMock()
+    msg.chat = SimpleNamespace(id=12345)
+    msg.text = "/pending_confirm"
+
+    await bot._do_pending_confirm(msg)
+
+    # Проверка №1: НИ ОДНО отправленное сообщение не превысило 4096 chars.
+    for call in bot._send_view.call_args_list:
+        text = call.args[1]
+        assert len(text) <= 4096, (
+            f"Сообщение {len(text)} chars превышает Telegram limit 4096. "
+            f"Превью: {text[:200]!r}"
+        )
+
+    # Проверка №2: все 200 order_id присутствуют где-то в выводе.
+    all_text = " ".join(c.args[1] for c in bot._send_view.call_args_list)
+    for i in range(200):
+        assert f"ORD{i:05d}" in all_text, f"Потерян #ORD{i:05d} в выводе"
+
+    # Проверка №3: должно быть несколько сообщений (точно > 1).
+    assert bot._send_view.call_count >= 2, (
+        "Ожидалось разбиение на несколько сообщений из-за объёма"
+    )

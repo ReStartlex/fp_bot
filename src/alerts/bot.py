@@ -78,6 +78,72 @@ def _format_dt(dt: datetime | None) -> str:
     return "—" if msk is None else msk.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _split_lines_to_chunks(
+    *,
+    header_lines: list[str],
+    body_lines: list[str],
+    max_chars: int = 3500,
+) -> list[str]:
+    """
+    Склеить header + body в чанки ≤ max_chars (запас под Telegram 4096).
+
+    Гарантии:
+    - каждый чанк начинается с header (чтобы юзер не терялся);
+    - ни одна строка не режется посередине;
+    - если одна строка длиннее max_chars (теоретически невозможно для
+      наших данных — order_id 8 chars + username 24 chars + 30 chars текста),
+      она всё равно отправится одной строкой, даже превысив лимит
+      (Telegram отрежет на 4096, но это лучше, чем silently потерять
+      запись из списка).
+    """
+    if not body_lines:
+        return ["\n".join(header_lines)] if header_lines else []
+    header_text = "\n".join(header_lines)
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = len(header_text) + 1  # +1 на \n после header
+    for line in body_lines:
+        line_len = len(line) + 1
+        if current_lines and current_len + line_len > max_chars:
+            chunks.append(header_text + "\n" + "\n".join(current_lines))
+            current_lines = [line]
+            current_len = len(header_text) + 1 + line_len
+        else:
+            current_lines.append(line)
+            current_len += line_len
+    if current_lines:
+        chunks.append(header_text + "\n" + "\n".join(current_lines))
+    return chunks
+
+
+def _split_ids_to_copy_chunks(
+    ids: list[str],
+    *,
+    max_chars: int = 3500,
+) -> list[str]:
+    """
+    Склеить order_ids в строки «#ID, #ID, ...» с ограничением по длине.
+    Используется для блока «скопировать в саппорт».
+    """
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    SEP = ", "
+    for oid in ids:
+        token = f"#{oid}"
+        add_len = len(token) + (len(SEP) if current else 0)
+        if current and current_len + add_len > max_chars:
+            chunks.append(SEP.join(current))
+            current = [token]
+            current_len = len(token)
+        else:
+            current.append(token)
+            current_len += add_len
+    if current:
+        chunks.append(SEP.join(current))
+    return chunks
+
+
 def _parse_hours_arg(command_text: str | None, *, default: int) -> int:
     """
     Достать число часов из текста команды вида `/pending_confirm 12`.
@@ -406,6 +472,7 @@ class TelegramBot:
             BotCommand(command="ns_search", description="🔍 Поиск NS"),
             BotCommand(command="sync", description="🔄 Синхронизация"),
             BotCommand(command="orders", description="📦 Последние заказы"),
+            BotCommand(command="pending_confirm", description="⏳ Заказы без подтв. (список для саппорта FunPay)"),
             BotCommand(command="setmarkup", description="✏ Наценка одного маппинга"),
             BotCommand(command="reset_markups", description="♻ Сбросить наценку у всех маппингов"),
             BotCommand(command="setdefault", description="🎚 Глобальные настройки (markup/premium/stock)"),
@@ -1026,6 +1093,8 @@ class TelegramBot:
             await self._show_orders_via_cq(cq)
         elif action == ui.MENU_KIND_PROBLEMS:
             await self._show_problems_via_cq(cq)
+        elif action == ui.MENU_KIND_PENDING:
+            await self._show_pending_confirm_via_cq(cq)
         elif action == ui.MENU_KIND_STATS:
             await self._show_stats_via_cq(cq)
         elif action == ui.MENU_KIND_SYNC:
@@ -1729,53 +1798,84 @@ class TelegramBot:
     @_guard
     async def _do_pending_confirm(self, msg: Message) -> None:
         """
-        /pending_confirm [hours=24] — список заказов status=delivered,
-        прошло >Nh, покупатель не нажал «подтвердить» (и саппорт тоже).
-
-        Выводим:
-        - человекочитаемый список (для понимания);
-        - готовый блок «#ID, #ID, #ID» — копируется в саппорт FunPay
-          одной кнопкой, экономит ручную сборку списка раз в день.
+        /pending_confirm [hours=24] — заказы status=delivered, прошло >Nh,
+        покупатель не нажал «подтвердить» (и саппорт тоже). С чанкингом
+        под Telegram limit 4096 chars (на больших списках).
         """
         hours = _parse_hours_arg(msg.text, default=24)
+        await self._render_pending_confirm(chat_id=msg.chat.id, hours=hours)
+
+    @_guard
+    async def _show_pending_confirm_via_cq(self, cq: CallbackQuery) -> None:
+        await self._render_pending_confirm(chat_id=cq.from_user.id, hours=24)
+
+    async def _render_pending_confirm(self, *, chat_id: int, hours: int) -> None:
         orders = await self._collect_pending_confirm(hours=hours)
 
         if not orders:
             await self._send_view(
-                msg.chat.id,
+                chat_id,
                 f"✅ Нет заказов, ожидающих подтверждения дольше {hours}ч.",
                 reply_markup=ui.single_close_kb(),
             )
             return
 
-        lines = [
-            f"📋 Заказы старше {hours}ч, не подтверждённые покупателем",
-            f"   ({len(orders)} шт., готовый список для саппорта FunPay):",
-            "",
-        ]
-        now = datetime.utcnow()
-        for o in orders:
-            age_h = int((now - o.updated_at).total_seconds() // 3600)
-            buyer = o.buyer_username or "—"
-            lines.append(f"• #{o.funpay_order_id} — {buyer}, выдан {age_h}ч назад")
-
-        ids_block = ", ".join(f"#{o.funpay_order_id}" for o in orders)
-        lines += [
-            "",
-            "📥 Скопировать для саппорта одной строкой:",
-            f"`{ids_block}`",
-        ]
-
-        await self._send_view(
-            msg.chat.id,
-            "\n".join(lines),
-            reply_markup=ui.single_close_kb(),
+        # Сборка человекочитаемого списка с разбиением на чанки.
+        # Telegram hard limit = 4096 chars; берём запас и режем по ~3500.
+        header = (
+            f"📋 Заказы старше {hours}ч без подтверждения "
+            f"({len(orders)} шт.)\n"
+            f"Готовый список для саппорта FunPay ниже.\n"
         )
+        now = datetime.utcnow()
+        item_lines = [
+            f"• #{o.funpay_order_id} — {o.buyer_username or '—'}, "
+            f"выдан {int((now - o.updated_at).total_seconds() // 3600)}ч назад"
+            for o in orders
+        ]
+
+        # Чанк 1+: разбиваем item_lines по ~3500 chars,
+        # последний чанк (без footer) + ВСЕГДА отдельным сообщением copy-block.
+        chunks = _split_lines_to_chunks(
+            header_lines=[header],
+            body_lines=item_lines,
+            max_chars=3500,
+        )
+
+        # Шлём все чанки списка. Кнопку закрытия — только на последний.
+        for idx, text in enumerate(chunks):
+            is_last_text_chunk = idx == len(chunks) - 1
+            reply_markup = ui.single_close_kb() if is_last_text_chunk else None
+            await self._send_view(chat_id, text, reply_markup=reply_markup)
+
+        # Copy-block: одним или несколькими отдельными сообщениями,
+        # без markdown-обёртки (раньше делали `...` — но если в чанке
+        # внутри случится backtick, parse_mode сломается; чистый
+        # plaintext всегда копируется через long-tap в Telegram).
+        copy_chunks = _split_ids_to_copy_chunks(
+            [o.funpay_order_id for o in orders],
+            max_chars=3500,
+        )
+        for idx, ids_text in enumerate(copy_chunks):
+            label = (
+                "📥 Скопировать в саппорт (long-tap → copy):"
+                if idx == 0
+                else f"📥 …продолжение ({idx + 1}/{len(copy_chunks)}):"
+            )
+            await self._send_view(
+                chat_id,
+                f"{label}\n{ids_text}",
+                reply_markup=(
+                    ui.single_close_kb()
+                    if idx == len(copy_chunks) - 1
+                    else None
+                ),
+            )
 
     async def _collect_pending_confirm(self, *, hours: int) -> list[Order]:
         async with session_factory()() as session:
             return await list_pending_confirmation(
-                session, older_than_hours=hours, limit=200
+                session, older_than_hours=hours, limit=500
             )
 
     @_guard

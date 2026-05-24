@@ -86,7 +86,25 @@ class App:
         # 2. Telegram notifier (one-shot отправщик)
         self.tg = TelegramNotifier(self.settings)
         await self.tg.__aenter__()
-        await self.tg.info("Бот запущен ✅")
+        # Заметное сообщение о старте — раньше шёл "ℹ️ Бот запущен ✅",
+        # который терялся среди ℹ️-info. Теперь с версией+временем,
+        # парный к 🔴 "Бот остановлен" в stop().
+        try:
+            from src import _version as _v
+            sha_short = getattr(_v, "SHA", "?")[:7]
+            subject = (getattr(_v, "SUBJECT", "") or "").strip()
+        except Exception:
+            sha_short = "?"
+            subject = ""
+        start_msg = (
+            f"🟢 <b>Бот запущен</b>\n"
+            f"📦 версия: <code>{sha_short}</code>"
+        )
+        if subject:
+            # обрезаем длинные SUBJECT (например feat(...): description...)
+            short_subject = subject[:80] + ("…" if len(subject) > 80 else "")
+            start_msg += f"\n📝 {short_subject}"
+        await self.tg.send(start_msg)
 
         # 3. FunPay-клиент + watcher (с авто-повторами)
         await self._try_connect_funpay(initial=True)
@@ -174,7 +192,7 @@ class App:
             await self.fp.__aexit__(None, None, None)
         if self.tg is not None:
             with suppress(Exception):
-                await self.tg.info("Бот остановлен ⏹")
+                await self.tg.send("🔴 <b>Бот остановлен</b>")
             await self.tg.__aexit__(None, None, None)
         if self.ns is not None:
             await self.ns.__aexit__(None, None, None)
