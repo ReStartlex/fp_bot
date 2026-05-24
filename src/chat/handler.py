@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -20,12 +21,15 @@ from src.chat import templates
 from src.chat.schedule import WorkingHours
 from src.config import Settings, get_settings
 from src.db.repo import (
+    CONFIRMED_BY_ADMIN,
+    CONFIRMED_BY_BUYER,
     get_or_create_chat_state,
     hold_active_orders_for_chat,
     list_active_orders_for_chat,
     mark_greeted,
     mark_help_requested,
     mark_manual_intervention,
+    mark_order_confirmed,
     mark_paid_order_seen,
 )
 from src.db.session import session_factory
@@ -84,6 +88,15 @@ def _classify_funpay_system_message(text: str) -> FunPaySystemKind | None:
     FunPay присылает сервисные уведомления в чат как обычные сообщения.
     Здесь отличаем их от обычного текста покупателя, чтобы не запускать
     pre-purchase greeting там, где нужен order/review flow.
+
+    Возвращает один из:
+      - "paid_order"              — покупатель оплатил
+      - "order_confirmed"         — покупатель сам нажал «подтвердить»
+      - "order_confirmed_by_admin"— админ FunPay подтвердил (по запросу
+                                    в саппорт через 24ч; ~50% наших
+                                    клиентов сами никогда не подтверждают)
+      - "review_written"          — покупатель оставил отзыв
+      - None                      — обычное сообщение покупателя
     """
     cleaned = _clean_chat_text(text).lower()
 
@@ -93,6 +106,25 @@ def _classify_funpay_system_message(text: str) -> FunPaySystemKind | None:
     en_confirm_hint = "don't forget" in cleaned and "confirm" in cleaned
     if (ru_paid_order and ru_confirm_hint) or (en_paid_order and en_confirm_hint):
         return "paid_order"
+
+    # === Подтверждение АДМИНОМ (саппорт FunPay) ===
+    # Пример (видел в логах 24.05.2026):
+    #   «Администратор Palmira подтвердил успешное выполнение заказа
+    #    #UGW9A7CQ и отправил деньги продавцу lol228822.»
+    # Проверяем ДО ветки «покупатель подтвердил», потому что текст
+    # содержит «подтвердил успешное выполнение» и в обоих случаях,
+    # но «администратор» однозначно говорит что это саппорт.
+    ru_admin_confirmed = (
+        "администратор" in cleaned
+        and "подтвердил успешное выполнение заказа" in cleaned
+    )
+    en_admin_confirmed = (
+        "administrator" in cleaned
+        and "confirmed" in cleaned
+        and ("order" in cleaned or "completion" in cleaned)
+    )
+    if ru_admin_confirmed or en_admin_confirmed:
+        return "order_confirmed_by_admin"
 
     ru_order_confirmed = (
         "покупатель" in cleaned
@@ -121,6 +153,24 @@ def _classify_funpay_system_message(text: str) -> FunPaySystemKind | None:
         return "review_written"
 
     return None
+
+
+# Регулярка для извлечения номера заказа из системных сообщений FunPay.
+# Примеры:
+#   «...заказа #UGW9A7CQ и отправил...»  → UGW9A7CQ
+#   «...order #AB12CD34Z...»            → AB12CD34Z
+# FunPay order_id всегда заглавный буквенно-цифровой ASCII длиной 6-12.
+# Жёсткое requirement '#' в начале, чтобы не подцепить случайный
+# подстроки из текста покупателя.
+_FUNPAY_ORDER_ID_RE = re.compile(r"#([A-Z0-9]{6,12})\b")
+
+
+def _extract_funpay_order_id(text: str) -> str | None:
+    """Достать FunPay order_id из системного сообщения. None если нет."""
+    if not text:
+        return None
+    m = _FUNPAY_ORDER_ID_RE.search(text)
+    return m.group(1) if m else None
 
 
 def _looks_like_funpay_system_message(text: str) -> bool:
@@ -244,10 +294,64 @@ class ChatHandler:
             )
             return
 
-        if kind == "order_confirmed":
-            reply = templates.order_confirmed_review_request(event.author_username)
+        # Для confirmation-кейсов: получатель ответа — покупатель из чата,
+        # а НЕ автор сообщения. Когда saппорт подтверждает заказ, FunPay
+        # шлёт сообщение от своего системного аккаунта ("FunPay" с
+        # бэйджем "оповещение"). Если использовать event.author_username
+        # как имя — получится «FunPay, спасибо за подтверждение!» что
+        # выглядит как баг для покупателя.
+        # event.chat_username = ник покупателя на FunPay (всегда корректен
+        # для приватного чата).
+        buyer_name = event.chat_username or event.author_username
+
+        if kind in ("order_confirmed", "order_confirmed_by_admin"):
+            # 1) Обновляем Order в БД (если знаем такой заказ).
+            #    Идемпотентно: повторная обработка того же системного
+            #    сообщения не перетрёт первое подтверждение.
+            order_id = _extract_funpay_order_id(event.text)
+            confirmed_by = (
+                CONFIRMED_BY_ADMIN
+                if kind == "order_confirmed_by_admin"
+                else CONFIRMED_BY_BUYER
+            )
+            if order_id:
+                try:
+                    async with session_factory()() as session:
+                        order = await mark_order_confirmed(
+                            session,
+                            funpay_order_id=order_id,
+                            confirmed_by=confirmed_by,
+                        )
+                        await session.commit()
+                    if order is not None:
+                        log.info(
+                            f"ChatHandler: order #{order_id} помечен confirmed "
+                            f"by={confirmed_by} (kind={kind})"
+                        )
+                    else:
+                        log.debug(
+                            f"ChatHandler: order #{order_id} не найден в БД "
+                            f"(возможно выдан до запуска бота) — только отвечаю в чат"
+                        )
+                except Exception as exc:
+                    log.warning(
+                        f"ChatHandler: не удалось пометить order #{order_id} "
+                        f"как confirmed: {exc}"
+                    )
+            else:
+                log.debug(
+                    f"ChatHandler: kind={kind} но #order_id не извлёкся "
+                    f"из текста: {event.text[:120]!r}"
+                )
+
+            # 2) Шлём шаблон «спасибо за подтверждение, оставьте отзыв».
+            #    Один и тот же шаблон для buyer и admin кейсов — потому
+            #    что покупателю результат одинаковый: его заказ подтвердили
+            #    и нам нужно попросить отзыв. Разница только в Order.confirmed_by
+            #    (для нашего внутреннего учёта).
+            reply = templates.order_confirmed_review_request(buyer_name)
         elif kind == "review_written":
-            reply = templates.post_review(event.author_username)
+            reply = templates.post_review(buyer_name)
         else:
             log.info(f"ChatHandler: неизвестное системное сообщение FunPay: {kind}")
             return

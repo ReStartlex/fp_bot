@@ -138,6 +138,97 @@ def test_handler_replies_to_funpay_order_confirmed_system_message():
     tg.send.assert_not_called()
 
 
+def test_handler_replies_to_funpay_admin_confirmed_system_message():
+    """
+    ГЛАВНЫЙ кейс этой фичи (~50% наших клиентов не подтверждают сами,
+    саппорт FunPay подтверждает заказ через 24ч по запросу).
+    Раньше бот отвечал ПРИВЕТСТВИЕМ на это сообщение.
+    Теперь должен ответить «Спасибо за подтверждение...».
+    """
+    handler, fp, tg = _make_handler(my_username="lol228822")
+    event = FunPayMessageEvent(
+        chat_id=104433092,
+        chat_username="Macan1467",         # покупатель в чате
+        author_id=None,
+        author_username="FunPay",          # системное оповещение — sender = FunPay
+        text=(
+            "Администратор Palmira подтвердил успешное выполнение заказа "
+            "#UGW9A7CQ и отправил деньги продавцу lol228822."
+        ),
+        is_my_message=False,
+    )
+    asyncio.run(handler.on_message(event))
+    fp.send_message.assert_called_once()
+    chat_id, text = fp.send_message.call_args.args
+    assert chat_id == 104433092
+    assert "спасибо за подтверждение" in text.lower()
+    assert "отзыв" in text.lower()
+    tg.send.assert_not_called()
+
+
+def test_handler_admin_confirm_uses_buyer_name_not_funpay_sender():
+    """
+    Критично: ответ адресуется ПОКУПАТЕЛЮ (chat_username='Macan1467'),
+    а не «FunPay» (который технически author_username для системного
+    оповещения). Иначе покупатель увидит «FunPay, спасибо за подтверждение!»
+    — выглядит как баг.
+    """
+    handler, fp, tg = _make_handler(my_username="lol228822")
+    event = FunPayMessageEvent(
+        chat_id=104433092,
+        chat_username="Macan1467",
+        author_id=None,
+        author_username="FunPay",
+        text=(
+            "Администратор Palmira подтвердил успешное выполнение заказа "
+            "#UGW9A7CQ и отправил деньги продавцу lol228822."
+        ),
+        is_my_message=False,
+    )
+    asyncio.run(handler.on_message(event))
+    _, text = fp.send_message.call_args.args
+    # Имя покупателя должно встречаться
+    assert "macan1467" in text.lower(), (
+        f"Ожидали имя покупателя 'Macan1467' в ответе, не нашли. Текст: {text!r}"
+    )
+    # Обращение НЕ должно начинаться/обращаться к «FunPay»
+    # (слово «FunPay» может встречаться в фразе «отзыв на FunPay» — это OK).
+    # Запрещены: «FunPay, спасибо», «FunPay,», «Здравствуйте, FunPay».
+    low = text.lower()
+    assert "funpay, спасибо" not in low, (
+        f"НЕДОПУСТИМО: ответ адресован системному отправителю 'FunPay'. "
+        f"Текст: {text!r}"
+    )
+    assert "funpay," not in low, (
+        f"НЕДОПУСТИМО: обращение к 'FunPay' как к получателю. Текст: {text!r}"
+    )
+
+
+def test_handler_does_not_greet_on_admin_confirm():
+    """
+    Сильнее предыдущего теста: убеждаемся что НЕ ушло приветствие
+    (`Здравствуйте`, `Выдача товара автоматическая` и т.д.).
+    """
+    handler, fp, tg = _make_handler(my_username="lol228822")
+    event = FunPayMessageEvent(
+        chat_id=104433092,
+        chat_username="Macan1467",
+        author_id=None,
+        author_username="FunPay",
+        text=(
+            "Администратор Palmira подтвердил успешное выполнение заказа "
+            "#UGW9A7CQ и отправил деньги продавцу lol228822."
+        ),
+        is_my_message=False,
+    )
+    asyncio.run(handler.on_message(event))
+    fp.send_message.assert_called_once()
+    _, text = fp.send_message.call_args.args
+    low = text.lower()
+    assert "здравствуйте" not in low, "Прислали приветствие на admin-confirm: баг"
+    assert "выдача товара" not in low, "Прислали инструкцию автовыдачи на confirm: баг"
+
+
 def test_handler_replies_to_funpay_review_written_system_message():
     handler, fp, tg = _make_handler(my_username="lol228822")
     event = FunPayMessageEvent(

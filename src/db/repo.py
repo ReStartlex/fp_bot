@@ -287,6 +287,76 @@ async def update_order(session: AsyncSession, order: Order, **fields: Any) -> Or
     return order
 
 
+# Литералы для confirmed_by — единое место правды.
+CONFIRMED_BY_BUYER = "buyer"   # покупатель сам нажал «подтвердить» на FunPay
+CONFIRMED_BY_ADMIN = "admin"   # саппорт FunPay подтвердил по нашему запросу (после 24ч)
+CONFIRMED_BY_VALUES = frozenset({CONFIRMED_BY_BUYER, CONFIRMED_BY_ADMIN})
+
+
+async def mark_order_confirmed(
+    session: AsyncSession,
+    *,
+    funpay_order_id: str,
+    confirmed_by: str,
+) -> Order | None:
+    """
+    Записать подтверждение успешного выполнения заказа от FunPay.
+
+    Идемпотентно: повторный вызов с тем же `funpay_order_id` НЕ
+    перетирает первое подтверждение (важно: бывает что FunPay шлёт
+    дубль системного сообщения, и нам не нужно «перетирать» buyer
+    подтверждением на admin или наоборот, чтобы /pending_confirm
+    показывал честную статистику).
+
+    Возвращает Order если найден и обновлён (либо был уже подтверждён),
+    None если заказ не найден в БД (e.g. был выдан до развёртывания
+    бота, или это вообще не наш заказ).
+    """
+    if confirmed_by not in CONFIRMED_BY_VALUES:
+        raise ValueError(
+            f"mark_order_confirmed: invalid confirmed_by={confirmed_by!r}, "
+            f"допустимо: {sorted(CONFIRMED_BY_VALUES)}"
+        )
+    order = await find_order_by_funpay_id(session, funpay_order_id)
+    if order is None:
+        return None
+    # Идемпотентность: если уже подтверждён — не трогаем (сохраняем
+    # «первое» подтверждение, оно более точное).
+    if order.confirmed_at is None:
+        order.confirmed_at = datetime.utcnow()
+        order.confirmed_by = confirmed_by
+        await session.flush()
+    return order
+
+
+async def list_pending_confirmation(
+    session: AsyncSession,
+    *,
+    older_than_hours: int = 24,
+    limit: int = 200,
+) -> list[Order]:
+    """
+    Заказы, которые мы выдали (status=delivered) более `older_than_hours`
+    часов назад, но покупатель так и не нажал «подтвердить» (и админ
+    тоже). Это именно те заказы, которые нужно отправить в саппорт
+    FunPay для ручного подтверждения.
+
+    Сортируем по `updated_at` от старых к новым — чтобы в выгрузке
+    первыми были самые «горящие» (по которым уже точно прошёл срок).
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=older_than_hours)
+    stmt = (
+        select(Order)
+        .where(Order.status == "delivered")
+        .where(Order.confirmed_at.is_(None))
+        .where(Order.updated_at <= cutoff)
+        .order_by(Order.updated_at, Order.id)
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
 ACTIVE_ORDER_STATUSES = ("received", "ns_created", "ns_paid", "pins_ready", "manual_hold")
 
 

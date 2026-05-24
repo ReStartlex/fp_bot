@@ -97,6 +97,13 @@ def _migrate_sqlite_schema(sync_conn) -> None:
         if "description" not in columns:
             sync_conn.execute(text("ALTER TABLE orders ADD COLUMN description TEXT"))
             logger.info("init_db: добавлена колонка orders.description")
+        # Подтверждение успешного выполнения заказа (см. Order модель)
+        if "confirmed_at" not in columns:
+            sync_conn.execute(text("ALTER TABLE orders ADD COLUMN confirmed_at DATETIME"))
+            logger.info("init_db: добавлена колонка orders.confirmed_at")
+        if "confirmed_by" not in columns:
+            sync_conn.execute(text("ALTER TABLE orders ADD COLUMN confirmed_by VARCHAR(16)"))
+            logger.info("init_db: добавлена колонка orders.confirmed_by")
     if "chat_states" in tables:
         columns = {col["name"] for col in inspector.get_columns("chat_states")}
         for name in ("last_paid_order_at", "last_manual_message_at"):

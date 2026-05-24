@@ -39,8 +39,9 @@ from src.db.repo import (
     assign_mapping_group,
     classify_lot_group,
     find_order_by_funpay_id,
-    list_mappings,
     list_lot_groups,
+    list_mappings,
+    list_pending_confirmation,
     upsert_mapping,
 )
 from src.db.session import session_factory
@@ -75,6 +76,28 @@ def _to_moscow(dt: datetime | None) -> datetime | None:
 def _format_dt(dt: datetime | None) -> str:
     msk = _to_moscow(dt)
     return "—" if msk is None else msk.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_hours_arg(command_text: str | None, *, default: int) -> int:
+    """
+    Достать число часов из текста команды вида `/pending_confirm 12`.
+    Возвращает default если аргумента нет или он некорректен.
+    Clamping: 1..168 (1ч..1неделя), защита от очепяток вроде 100000.
+    """
+    if not command_text:
+        return default
+    parts = command_text.strip().split()
+    if len(parts) < 2:
+        return default
+    try:
+        hours = int(parts[1])
+    except (ValueError, TypeError):
+        return default
+    if hours < 1:
+        return 1
+    if hours > 168:
+        return 168
+    return hours
 
 
 def format_percent(value: float | int | None) -> str:
@@ -254,6 +277,7 @@ class TelegramBot:
         "/status — общий обзор\n"
         "/balance — баланс NS и FunPay\n"
         "/orders — последние 10 заказов\n"
+        "/pending_confirm [часы] — заказы старше Nч без подтверждения (для саппорта)\n"
         "/sync — запустить синхронизацию\n"
         "/funpay_reconnect — переподключить FunPay\n"
         "\n"
@@ -508,6 +532,12 @@ class TelegramBot:
             if not self._is_owner(msg):
                 return
             await self._do_problems(msg)
+
+        @dp.message(Command("pending_confirm"))
+        async def cmd_pending_confirm(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_pending_confirm(msg)
 
         @dp.message(Command("stats"))
         async def cmd_stats(msg: Message) -> None:
@@ -1695,6 +1725,58 @@ class TelegramBot:
             )
             return
         await self._render_paginated_from_cmd(msg, kind="problems", sid=sid, page=0)
+
+    @_guard
+    async def _do_pending_confirm(self, msg: Message) -> None:
+        """
+        /pending_confirm [hours=24] — список заказов status=delivered,
+        прошло >Nh, покупатель не нажал «подтвердить» (и саппорт тоже).
+
+        Выводим:
+        - человекочитаемый список (для понимания);
+        - готовый блок «#ID, #ID, #ID» — копируется в саппорт FunPay
+          одной кнопкой, экономит ручную сборку списка раз в день.
+        """
+        hours = _parse_hours_arg(msg.text, default=24)
+        orders = await self._collect_pending_confirm(hours=hours)
+
+        if not orders:
+            await self._send_view(
+                msg.chat.id,
+                f"✅ Нет заказов, ожидающих подтверждения дольше {hours}ч.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        lines = [
+            f"📋 Заказы старше {hours}ч, не подтверждённые покупателем",
+            f"   ({len(orders)} шт., готовый список для саппорта FunPay):",
+            "",
+        ]
+        now = datetime.utcnow()
+        for o in orders:
+            age_h = int((now - o.updated_at).total_seconds() // 3600)
+            buyer = o.buyer_username or "—"
+            lines.append(f"• #{o.funpay_order_id} — {buyer}, выдан {age_h}ч назад")
+
+        ids_block = ", ".join(f"#{o.funpay_order_id}" for o in orders)
+        lines += [
+            "",
+            "📥 Скопировать для саппорта одной строкой:",
+            f"`{ids_block}`",
+        ]
+
+        await self._send_view(
+            msg.chat.id,
+            "\n".join(lines),
+            reply_markup=ui.single_close_kb(),
+        )
+
+    async def _collect_pending_confirm(self, *, hours: int) -> list[Order]:
+        async with session_factory()() as session:
+            return await list_pending_confirmation(
+                session, older_than_hours=hours, limit=200
+            )
 
     @_guard
     async def _do_stats(self, msg: Message) -> None:
