@@ -54,28 +54,92 @@ def test_update_documents_pin_and_proxy_env_vars():
 def test_fetch_resolves_target_via_runtime():
     text = FETCH_SH.read_text(encoding="utf-8")
     assert "deploy.runtime resolve-target" in text
-    # CLI-вызов должен пробрасывать APP_DIR и default-branch
-    assert "--app-dir \"${APP_DIR}\"" in text
+    # .deploy_pin лежит в production-каталоге, а не в staging. fetch_code.sh
+    # вызывается с APP_DIR=staging, поэтому resolve-target должен смотреть
+    # в PROD_APP_DIR (см. ниже test_fetch_reads_deploy_pin_from_prod_dir).
+    assert "--app-dir \"${PROD_APP_DIR}\"" in text
     assert "--default-branch \"${BRANCH}\"" in text
 
 
 def test_fetch_has_python_free_fallback_for_pin():
-    """На самом первом bootstrap'е .venv ещё нет — должен работать без Python."""
+    """На самом первом bootstrap'е .venv ещё нет — должен работать без Python.
+
+    .deploy_pin читается из production-каталога, не из staging."""
     text = FETCH_SH.read_text(encoding="utf-8")
-    # Простой grep по SHA в .deploy_pin как fallback, без deploy.runtime
-    assert 'grep -E \'^[0-9a-fA-F]{7,40}$\' "${APP_DIR}/.deploy_pin"' in text
+    assert 'grep -E \'^[0-9a-fA-F]{7,40}$\' "${PROD_APP_DIR}/.deploy_pin"' in text
     assert 'TARGET_REF="${PIN_SHA}"' in text
 
 
-def test_fetch_supports_http_proxy_with_cleanup():
+def test_fetch_reads_deploy_pin_from_prod_dir_not_staging():
+    """
+    Главный фикс: при staging-деплое (APP_DIR=/opt/funpay-ns-bot.staging)
+    .deploy_pin живёт в production (/opt/funpay-ns-bot/.deploy_pin),
+    в staging его нет. fetch_code.sh должен явно знать про PROD_APP_DIR,
+    с дефолтом = APP_DIR (для случая когда нет staging).
+    """
+    text = FETCH_SH.read_text(encoding="utf-8")
+    assert "PROD_APP_DIR=${PROD_APP_DIR:-${APP_DIR}}" in text, (
+        "fetch_code.sh должен принимать PROD_APP_DIR из env, по умолчанию = APP_DIR"
+    )
+
+
+def test_fetch_supports_http_proxy_via_per_command_override():
+    """
+    Прокси настраивается через `git -c http.proxy=...` per-команда,
+    а не через `git config --global`. Это критично потому что:
+      1) global-config переживает скрипт и протекает в apt/curl;
+      2) если global уже грязный (другой процесс прописал прокси),
+         наш `--unset` чистит чужие настройки.
+    """
     text = FETCH_SH.read_text(encoding="utf-8")
     assert "GIT_HTTP_PROXY=${GIT_HTTP_PROXY:-}" in text
-    assert 'git config --global http.proxy  "${GIT_HTTP_PROXY}"' in text
-    assert 'git config --global https.proxy "${GIT_HTTP_PROXY}"' in text
-    # cleanup ОБЯЗАН срабатывать на exit, иначе прокси останется висеть
-    # в системном git config и сломает обычный apt update.
-    assert "trap _cleanup_proxy EXIT" in text
-    assert "git config --global --unset http.proxy" in text
+    # НИ ОДНОГО global-config-set proxy в скрипте быть не должно.
+    assert 'git config --global http.proxy' not in text, (
+        "Не используем git config --global для прокси — этот state протекает наружу"
+    )
+    assert 'git config --global https.proxy' not in text
+
+
+def test_fetch_clears_local_proxy_on_start():
+    """
+    Локальный $APP_DIR/.git/config мог остаться грязным от прошлого
+    запуска (или от рук в инциденте). На старте — снимаем local proxy,
+    это наш каталог, безопасно.
+    """
+    text = FETCH_SH.read_text(encoding="utf-8")
+    assert "git config --local --unset-all http.proxy" in text
+    assert "git config --local --unset-all https.proxy" in text
+
+
+def test_fetch_uses_per_command_proxy_args_in_git_fetch():
+    """git fetch выполняется с -c http.proxy=... -c https.proxy=...
+    (per-command), а не полагается на global/local state."""
+    text = FETCH_SH.read_text(encoding="utf-8")
+    # Сборка git-args массива
+    assert "GIT_ARGS=(" in text or "GIT_ARGS=()" in text, (
+        "fetch_code.sh должен собирать массив GIT_ARGS для per-command-конфига"
+    )
+    # И использовать его при fetch
+    assert 'git "${GIT_ARGS[@]}" fetch' in text, (
+        "git fetch должен идти с GIT_ARGS (per-command config), "
+        "иначе global-настройки могут протечь"
+    )
+
+
+def test_fetch_explicit_empty_proxy_when_no_http_proxy_set():
+    """
+    Когда GIT_HTTP_PROXY не задан и мы идём через gh-proxy.com напрямую,
+    унаследованные HTTP_PROXY/HTTPS_PROXY/ALL_PROXY env-переменные
+    могут сломать fetch (libcurl их подхватит). Защищаемся per-command:
+    -c http.proxy= -c https.proxy= (пустые) явно отключают.
+    """
+    text = FETCH_SH.read_text(encoding="utf-8")
+    assert '"http.proxy="' in text, (
+        "При пустом GIT_HTTP_PROXY git должен получить -c http.proxy= "
+        "(пустое значение) — это явно отключает proxy на уровне команды, "
+        "перебивая HTTP_PROXY env-vars"
+    )
+    assert '"https.proxy="' in text
 
 
 def test_fetch_full_clone_when_target_is_pinned_sha():
@@ -83,7 +147,8 @@ def test_fetch_full_clone_when_target_is_pinned_sha():
     text = FETCH_SH.read_text(encoding="utf-8")
     # Должен быть явный режим без --depth для pinned target.
     assert 'USE_SHALLOW=0' in text
-    assert 'git fetch --tags --prune origin' in text
+    # git fetch теперь идёт с GIT_ARGS (per-command proxy override).
+    assert 'git "${GIT_ARGS[@]}" fetch --tags --prune origin' in text
 
 
 def test_fetch_clean_preserves_backups_and_pin():
@@ -138,15 +203,28 @@ def test_update_fetches_to_staging_before_stopping_service():
     только после успешного fetch+verify.
     """
     text = UPDATE_SH.read_text(encoding="utf-8")
-    fetch_pos = text.find('APP_DIR="${STAGING_DIR}" bash "${APP_DIR}/deploy/fetch_code.sh"')
+    fetch_pos = text.find('bash "${APP_DIR}/deploy/fetch_code.sh"')
     stop_pos = text.find("systemctl stop funpay-ns-bot")
     assert fetch_pos != -1, (
-        "update.sh должен вызывать fetch_code.sh с APP_DIR=STAGING_DIR"
+        "update.sh должен вызывать fetch_code.sh"
     )
     assert stop_pos != -1, "update.sh должен останавливать funpay-ns-bot"
     assert fetch_pos < stop_pos, (
         "fetch_code.sh (в staging) ОБЯЗАН вызываться ДО systemctl stop, "
         "иначе сетевой сбой fetch оставит прод без работы"
+    )
+    # Конкретные env-vars: STAGING — целевой каталог, PROD_APP_DIR —
+    # каталог для чтения .deploy_pin.
+    fetch_line_end = text.find("\n", fetch_pos)
+    fetch_line_start = text.rfind("\n", 0, fetch_pos) + 1
+    fetch_invocation = text[fetch_line_start:fetch_line_end]
+    assert 'APP_DIR="${STAGING_DIR}"' in fetch_invocation, (
+        "fetch_code.sh должен вызываться с APP_DIR=STAGING_DIR"
+    )
+    assert 'PROD_APP_DIR="${APP_DIR}"' in fetch_invocation, (
+        "update.sh должен прокидывать PROD_APP_DIR=production-каталог, "
+        "иначе fetch_code.sh не найдёт .deploy_pin (он лежит в production, "
+        "не в staging)"
     )
 
 
@@ -171,8 +249,9 @@ def test_update_exits_without_stop_on_fetch_failure():
     """Если fetch упал — exit 1 БЕЗ остановки сервиса.
     Текст ошибки должен явно говорить, что бот продолжает работать."""
     text = UPDATE_SH.read_text(encoding="utf-8")
-    # ищем ветку else после fetch_code.sh
-    fetch_block_start = text.find("APP_DIR=\"${STAGING_DIR}\" bash \"${APP_DIR}/deploy/fetch_code.sh\"")
+    # ищем ветку else после fetch_code.sh — invocation теперь содержит
+    # и APP_DIR=STAGING_DIR, и PROD_APP_DIR=APP_DIR.
+    fetch_block_start = text.find('bash "${APP_DIR}/deploy/fetch_code.sh"')
     stop_pos = text.find("systemctl stop funpay-ns-bot")
     assert fetch_block_start != -1 and stop_pos != -1
 

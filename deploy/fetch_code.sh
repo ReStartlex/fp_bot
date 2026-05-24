@@ -13,16 +13,29 @@
 #
 # Стратегия выбора TARGET ref для reset --hard:
 #   - переменная окружения PIN_SHA (короткий или полный SHA),
-#   - либо файл <APP_DIR>/.deploy_pin (первая значимая строка),
+#   - либо файл <PROD_APP_DIR>/.deploy_pin (первая значимая строка),
 #   - либо origin/<BRANCH> (обычно origin/main).
 #
 # PIN — защита от случайного повторного выкатывания «плохих» коммитов
 # (см. PROJECT_CONTEXT.md → раздел про откат от 23 мая 2026).
+#
+# Прокси настраивается через `git -c http.proxy=...` per-команда
+# (массив GIT_ARGS), а не через `git config --global`. Это критично:
+#   1) global-config переживает скрипт и протекает в apt/curl;
+#   2) если в окружении уже сидит HTTP_PROXY/HTTPS_PROXY/ALL_PROXY с
+#      опечаткой, libcurl у git их подхватит при пустом GIT_HTTP_PROXY
+#      и сломает fetch. Мы это явно отключаем через -c http.proxy=.
+# Инцидент 2026-05-25: было ALL_PROXY=...:62946 (вместо 62947) в env
+# и второй мёртвый прокси в local .git/config — fetch висел.
 
 set -euo pipefail
 
 # APP_DIR конфигурируемо: update.sh использует staging-каталог.
 APP_DIR=${APP_DIR:-/opt/funpay-ns-bot}
+# PROD_APP_DIR — production-каталог, откуда читается .deploy_pin.
+# По умолчанию = APP_DIR (для случая когда нет staging-режима, т.е.
+# fetch_code.sh запускается напрямую в продовый каталог).
+PROD_APP_DIR=${PROD_APP_DIR:-${APP_DIR}}
 BRANCH=${BRANCH:-main}
 GH_OWNER=ReStartlex
 GH_REPO=fp_bot
@@ -44,21 +57,9 @@ echo "==> Получаем код в ${APP_DIR}"
 git config --global --add safe.directory "${APP_DIR}" 2>/dev/null || true
 git config --system --add safe.directory "${APP_DIR}" 2>/dev/null || true
 
-# Если включён прямой HTTP-прокси для git — настроим. После работы
-# скрипт обязан снять proxy (см. _cleanup_proxy ниже), чтобы не
-# протекать в обычный apt/curl.
-_cleanup_proxy() {
-    if [[ -n "${GIT_HTTP_PROXY}" ]]; then
-        git config --global --unset http.proxy  2>/dev/null || true
-        git config --global --unset https.proxy 2>/dev/null || true
-    fi
-}
-trap _cleanup_proxy EXIT
-
+# Выбор remote.
 if [[ -n "${GIT_HTTP_PROXY}" ]]; then
     echo "    GIT_HTTP_PROXY задан — иду напрямую на github.com через прокси"
-    git config --global http.proxy  "${GIT_HTTP_PROXY}"
-    git config --global https.proxy "${GIT_HTTP_PROXY}"
     REMOTE_URL="${GIT_DIRECT_URL}"
 elif [[ -n "${CODEBERG_URL}" ]]; then
     REMOTE_URL="${CODEBERG_URL}"
@@ -83,6 +84,14 @@ if [[ ! -d "${APP_DIR}/.git" ]]; then
     git remote add origin "${REMOTE_URL}"
 fi
 
+# Локальный .git/config мог содержать прокси-настройки от прошлого
+# запуска (живой инцидент 2026-05-25: в /opt/funpay-ns-bot/.git/config
+# был http.proxy=http://modeler_...@172.235.32.100:10854, fetch висел
+# 134с пытаясь к нему достучаться). Снимаем безусловно: это НАШ
+# каталог, никто кроме нас в него писать не должен.
+git config --local --unset-all http.proxy  2>/dev/null || true
+git config --local --unset-all https.proxy 2>/dev/null || true
+
 # Убеждаемся, что remote.origin.url соответствует выбранному источнику.
 CURRENT_REMOTE=$(git config --get remote.origin.url 2>/dev/null || echo "")
 if [[ "${CURRENT_REMOTE}" != "${REMOTE_URL}" ]]; then
@@ -90,9 +99,27 @@ if [[ "${CURRENT_REMOTE}" != "${REMOTE_URL}" ]]; then
         git remote add origin "${REMOTE_URL}"
 fi
 
+# Per-command git config. Никаких git config --global —
+# чтобы не оставлять state между запусками и не протекать в apt/curl.
+# Если GIT_HTTP_PROXY пустой — явно отключаем proxy (-c http.proxy=
+# с пустым значением), чтобы перебить любые HTTP_PROXY/HTTPS_PROXY/
+# ALL_PROXY env-переменные, которые libcurl у git автоматически
+# подхватывает.
+GIT_ARGS=()
+if [[ -n "${GIT_HTTP_PROXY}" ]]; then
+    GIT_ARGS+=("-c" "http.proxy=${GIT_HTTP_PROXY}")
+    GIT_ARGS+=("-c" "https.proxy=${GIT_HTTP_PROXY}")
+else
+    GIT_ARGS+=("-c" "http.proxy=")
+    GIT_ARGS+=("-c" "https.proxy=")
+fi
+
 # Определяем целевой ref до fetch'a — чтобы понять, нужен ли --depth=1
 # (для pinned SHA --depth=1 может не дотянуться до старого объекта).
-RESOLVE_PIN_VENV="${APP_DIR}/.venv/bin/python"
+# Важно: .deploy_pin живёт в PROD_APP_DIR (production-каталог), а не
+# в APP_DIR (который при staging-деплое — пустой staging-каталог без
+# .deploy_pin).
+RESOLVE_PIN_VENV="${PROD_APP_DIR}/.venv/bin/python"
 RESOLVE_PIN_PYTHON=""
 if [[ -x "${RESOLVE_PIN_VENV}" ]]; then
     RESOLVE_PIN_PYTHON="${RESOLVE_PIN_VENV}"
@@ -103,11 +130,11 @@ elif command -v python >/dev/null 2>&1; then
 fi
 
 TARGET_REF=""
-if [[ -n "${RESOLVE_PIN_PYTHON}" && -f "${APP_DIR}/deploy/runtime.py" ]]; then
+if [[ -n "${RESOLVE_PIN_PYTHON}" && -f "${PROD_APP_DIR}/deploy/runtime.py" ]]; then
     if TARGET_REF=$(
-        cd "${APP_DIR}" && PIN_SHA="${PIN_SHA}" \
+        cd "${PROD_APP_DIR}" && PIN_SHA="${PIN_SHA}" \
         "${RESOLVE_PIN_PYTHON}" -m deploy.runtime resolve-target \
-            --app-dir "${APP_DIR}" --default-branch "${BRANCH}" 2>/dev/null
+            --app-dir "${PROD_APP_DIR}" --default-branch "${BRANCH}" 2>/dev/null
     ); then
         TARGET_REF="$(printf '%s' "${TARGET_REF}" | tr -d '[:space:]')"
     else
@@ -121,8 +148,8 @@ fi
 if [[ -z "${TARGET_REF}" ]]; then
     if [[ -n "${PIN_SHA}" ]]; then
         TARGET_REF="${PIN_SHA}"
-    elif [[ -f "${APP_DIR}/.deploy_pin" ]]; then
-        TARGET_REF=$(grep -E '^[0-9a-fA-F]{7,40}$' "${APP_DIR}/.deploy_pin" \
+    elif [[ -f "${PROD_APP_DIR}/.deploy_pin" ]]; then
+        TARGET_REF=$(grep -E '^[0-9a-fA-F]{7,40}$' "${PROD_APP_DIR}/.deploy_pin" \
             | head -1 || true)
         if [[ -z "${TARGET_REF}" ]]; then
             TARGET_REF="origin/${BRANCH}"
@@ -142,16 +169,16 @@ if [[ "${TARGET_REF}" != origin/* ]]; then
 fi
 
 if [[ "${USE_SHALLOW}" -eq 1 ]]; then
-    if ! git fetch --depth=1 origin "${BRANCH}"; then
+    if ! git "${GIT_ARGS[@]}" fetch --depth=1 origin "${BRANCH}"; then
         echo "    [git] fetch --depth=1 упал, пробую без --depth"
-        if ! git fetch --tags --prune origin "${BRANCH}"; then
+        if ! git "${GIT_ARGS[@]}" fetch --tags --prune origin "${BRANCH}"; then
             echo "    [git] fetch упал — нет доступа к remote"
             exit 1
         fi
     fi
 else
     # При pinned SHA берём всё с тегами, чтобы найти любой объект.
-    if ! git fetch --tags --prune origin; then
+    if ! git "${GIT_ARGS[@]}" fetch --tags --prune origin; then
         echo "    [git] fetch (full) упал — нет доступа к remote"
         exit 1
     fi

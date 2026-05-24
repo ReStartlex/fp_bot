@@ -90,9 +90,11 @@ fi
 # 2. FETCH в STAGING. Бот продолжает работать.
 #    PIN_SHA / GIT_HTTP_PROXY пробрасываются прозрачно через env.
 #    fetch_code.sh теперь смотрит APP_DIR — указываем staging.
+#    PROD_APP_DIR — production-каталог, откуда fetch_code.sh читает
+#    .deploy_pin (в staging его нет, он лежит только в production).
 echo "==> Fetch кода в staging: ${STAGING_DIR}"
 mkdir -p "${STAGING_DIR}"
-if APP_DIR="${STAGING_DIR}" bash "${APP_DIR}/deploy/fetch_code.sh"; then
+if APP_DIR="${STAGING_DIR}" PROD_APP_DIR="${APP_DIR}" bash "${APP_DIR}/deploy/fetch_code.sh"; then
     echo "    staging fetch OK"
 else
     echo
