@@ -314,24 +314,42 @@ class ChatHandler:
                 if kind == "order_confirmed_by_admin"
                 else CONFIRMED_BY_BUYER
             )
+            # Guard от дубля reply: FunPay часто шлёт второе системное
+            # сообщение (admin-confirm после buyer-confirm) спустя 24+ч,
+            # и без этого флага бот писал покупателю «спасибо за
+            # подтверждение» дважды. Если order известен и уже
+            # подтверждён ранее — reply пропускаем.
+            #
+            # Defaults подобраны так, чтобы при exception в БД или
+            # неизвестном order reply всё равно ушёл (lose-safe: лучше
+            # отправить лишнее, чем пропустить корректное подтверждение).
+            is_known_order = False
+            was_first_confirmation = True
             if order_id:
                 try:
                     async with session_factory()() as session:
-                        order = await mark_order_confirmed(
+                        order, was_first_confirmation = await mark_order_confirmed(
                             session,
                             funpay_order_id=order_id,
                             confirmed_by=confirmed_by,
                         )
                         await session.commit()
-                    if order is not None:
+                    is_known_order = order is not None
+                    if order is None:
+                        log.debug(
+                            f"ChatHandler: order #{order_id} не найден в БД "
+                            f"(возможно выдан до запуска бота) — отправляю reply"
+                        )
+                    elif was_first_confirmation:
                         log.info(
                             f"ChatHandler: order #{order_id} помечен confirmed "
                             f"by={confirmed_by} (kind={kind})"
                         )
                     else:
-                        log.debug(
-                            f"ChatHandler: order #{order_id} не найден в БД "
-                            f"(возможно выдан до запуска бота) — только отвечаю в чат"
+                        log.info(
+                            f"ChatHandler: order #{order_id} уже подтверждён "
+                            f"ранее (by={order.confirmed_by}); kind={kind} "
+                            f"— пропускаю повторный reply"
                         )
                 except Exception as exc:
                     log.warning(
@@ -343,6 +361,9 @@ class ChatHandler:
                     f"ChatHandler: kind={kind} но #order_id не извлёкся "
                     f"из текста: {event.text[:120]!r}"
                 )
+
+            if is_known_order and not was_first_confirmation:
+                return
 
             # 2) Шлём шаблон «спасибо за подтверждение, оставьте отзыв».
             #    Один и тот же шаблон для buyer и admin кейсов — потому

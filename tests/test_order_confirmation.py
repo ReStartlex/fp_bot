@@ -76,7 +76,7 @@ async def test_mark_order_confirmed_by_buyer(session_factory):
     await _create_order(session_factory, funpay_order_id="C4KPFX6M")
 
     async with session_factory() as session:
-        order = await mark_order_confirmed(
+        order, was_first = await mark_order_confirmed(
             session,
             funpay_order_id="C4KPFX6M",
             confirmed_by=CONFIRMED_BY_BUYER,
@@ -86,6 +86,7 @@ async def test_mark_order_confirmed_by_buyer(session_factory):
     assert order is not None
     assert order.confirmed_at is not None
     assert order.confirmed_by == "buyer"
+    assert was_first is True
 
 
 @pytest.mark.asyncio
@@ -94,7 +95,7 @@ async def test_mark_order_confirmed_by_admin(session_factory):
     await _create_order(session_factory, funpay_order_id="UGW9A7CQ")
 
     async with session_factory() as session:
-        order = await mark_order_confirmed(
+        order, was_first = await mark_order_confirmed(
             session,
             funpay_order_id="UGW9A7CQ",
             confirmed_by=CONFIRMED_BY_ADMIN,
@@ -104,25 +105,33 @@ async def test_mark_order_confirmed_by_admin(session_factory):
     assert order is not None
     assert order.confirmed_at is not None
     assert order.confirmed_by == "admin"
+    assert was_first is True
 
 
 @pytest.mark.asyncio
 async def test_mark_order_confirmed_returns_none_when_not_found(session_factory):
-    """Заказа нет в БД (например, выдан до запуска бота) → None."""
+    """Заказа нет в БД (например, выдан до запуска бота) → (None, False)."""
     async with session_factory() as session:
-        order = await mark_order_confirmed(
+        order, was_first = await mark_order_confirmed(
             session,
             funpay_order_id="UNKNOWN12",
             confirmed_by=CONFIRMED_BY_ADMIN,
         )
         await session.commit()
     assert order is None
+    assert was_first is False, (
+        "Для неизвестного заказа возвращаем False — handler сам решит, "
+        "слать ли reply (по умолчанию шлёт, чтобы не пропускать)."
+    )
 
 
 @pytest.mark.asyncio
 async def test_mark_order_confirmed_is_idempotent(session_factory):
     """
-    Повторный вызов с тем же order_id НЕ перетирает первое подтверждение.
+    Повторный вызов с тем же order_id НЕ перетирает первое подтверждение
+    и возвращает was_first_confirmation=False (это и есть сигнал handler'у
+    не дублировать reply покупателю).
+
     Важно потому что:
     1) FunPay может прислать дубль системного сообщения;
     2) Сценарий: buyer подтвердил → потом саппорт тоже жмёт «подтвердить»
@@ -132,7 +141,7 @@ async def test_mark_order_confirmed_is_idempotent(session_factory):
     await _create_order(session_factory, funpay_order_id="C4KPFX6M")
 
     async with session_factory() as session:
-        order1 = await mark_order_confirmed(
+        order1, first_call_was_first = await mark_order_confirmed(
             session,
             funpay_order_id="C4KPFX6M",
             confirmed_by=CONFIRMED_BY_BUYER,
@@ -140,8 +149,10 @@ async def test_mark_order_confirmed_is_idempotent(session_factory):
         await session.commit()
         first_confirmed_at = order1.confirmed_at
 
+    assert first_call_was_first is True
+
     async with session_factory() as session:
-        order2 = await mark_order_confirmed(
+        order2, second_call_was_first = await mark_order_confirmed(
             session,
             funpay_order_id="C4KPFX6M",
             confirmed_by=CONFIRMED_BY_ADMIN,  # пытаемся «перетереть» админом
@@ -154,6 +165,10 @@ async def test_mark_order_confirmed_is_idempotent(session_factory):
     )
     assert order2.confirmed_at == first_confirmed_at, (
         "confirmed_at не должен меняться при повторном подтверждении"
+    )
+    assert second_call_was_first is False, (
+        "Повторный вызов должен вернуть was_first_confirmation=False — "
+        "это блокирует дубль reply в handler.py."
     )
 
 

@@ -298,7 +298,7 @@ async def mark_order_confirmed(
     *,
     funpay_order_id: str,
     confirmed_by: str,
-) -> Order | None:
+) -> tuple[Order | None, bool]:
     """
     Записать подтверждение успешного выполнения заказа от FunPay.
 
@@ -308,9 +308,15 @@ async def mark_order_confirmed(
     подтверждением на admin или наоборот, чтобы /pending_confirm
     показывал честную статистику).
 
-    Возвращает Order если найден и обновлён (либо был уже подтверждён),
-    None если заказ не найден в БД (e.g. был выдан до развёртывания
-    бота, или это вообще не наш заказ).
+    Возвращает `(order, was_first_confirmation)`:
+      - `order`: Order если найден; None если заказ не найден в БД
+        (e.g. был выдан до развёртывания бота, или это не наш заказ).
+      - `was_first_confirmation`: True если этот вызов реально пометил
+        заказ как confirmed (был первым); False если заказ уже был
+        подтверждён ранее (повтор от FunPay). Для `order is None`
+        флаг = False — мы не знаем, дубль это или нет, а handler
+        интерпретирует «известный + не первое подтверждение» как
+        запрет на отправку повторного reply.
     """
     if confirmed_by not in CONFIRMED_BY_VALUES:
         raise ValueError(
@@ -319,14 +325,15 @@ async def mark_order_confirmed(
         )
     order = await find_order_by_funpay_id(session, funpay_order_id)
     if order is None:
-        return None
+        return None, False
     # Идемпотентность: если уже подтверждён — не трогаем (сохраняем
     # «первое» подтверждение, оно более точное).
     if order.confirmed_at is None:
         order.confirmed_at = datetime.utcnow()
         order.confirmed_by = confirmed_by
         await session.flush()
-    return order
+        return order, True
+    return order, False
 
 
 async def list_pending_confirmation(
