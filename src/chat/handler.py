@@ -26,7 +26,7 @@ from src.db.repo import (
     get_or_create_chat_state,
     hold_active_orders_for_chat,
     list_active_orders_for_chat,
-    mark_greeted,
+    mark_greeted_if_due,
     mark_help_requested,
     mark_manual_intervention,
     mark_order_confirmed,
@@ -551,17 +551,32 @@ class ChatHandler:
     ) -> None:
         cooldown = timedelta(hours=self._settings.chat_greeting_cooldown_hours)
 
+        # Атомарный conditional UPDATE через mark_greeted_if_due — защищает
+        # от race: если watcher продублировал одно сообщение через listen
+        # и poll каналы (разные ключи дедупа), параллельные таски не
+        # отправят два одинаковых приветствия в чат.
         async with session_factory()() as session:
-            state = await get_or_create_chat_state(
+            await get_or_create_chat_state(
                 session,
                 chat_id=state_chat_id,
                 buyer_username=event.author_username,
             )
-            if state.greeted_at is not None and datetime.utcnow() - state.greeted_at < cooldown:
-                # Здоровались недавно — молчим.
-                return
-            await mark_greeted(session, state)
+            won_race = await mark_greeted_if_due(
+                session,
+                chat_id=state_chat_id,
+                cooldown=cooldown,
+            )
             await session.commit()
+
+        if not won_race:
+            # Либо ещё активен cooldown с прошлого приветствия,
+            # либо параллельный таск этого же сообщения уже зарезервировал
+            # отправку. В обоих случаях шуметь нельзя.
+            logger.debug(
+                f"ChatHandler: greeting skip chat={state_chat_id} — "
+                f"cooldown active или race с параллельным dispatch"
+            )
+            return
 
         working_now = self._wh.is_working_now()
         greeting = templates.greeting_pre_purchase(

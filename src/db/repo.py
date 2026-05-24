@@ -455,13 +455,26 @@ async def get_or_create_chat_state(
     chat_id: int,
     buyer_username: str | None,
 ) -> ChatState:
+    """
+    Атомарно вернуть chat_state, создав его при необходимости.
+
+    Используем INSERT OR IGNORE (SQLite ON CONFLICT DO NOTHING), чтобы
+    параллельные таски watcher-а (listen + poll отдают одно сообщение
+    через разные ключи дедупа) не падали с UNIQUE constraint при
+    одновременном INSERT для нового чата.
+    """
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    insert_stmt = (
+        sqlite_insert(ChatState)
+        .values(chat_id=chat_id, buyer_username=buyer_username)
+        .on_conflict_do_nothing(index_elements=[ChatState.chat_id])
+    )
+    await session.execute(insert_stmt)
+
     stmt = select(ChatState).where(ChatState.chat_id == chat_id)
-    state = (await session.execute(stmt)).scalar_one_or_none()
-    if state is None:
-        state = ChatState(chat_id=chat_id, buyer_username=buyer_username)
-        session.add(state)
-        await session.flush()
-    elif buyer_username and state.buyer_username != buyer_username:
+    state = (await session.execute(stmt)).scalar_one()
+    if buyer_username and state.buyer_username != buyer_username:
         state.buyer_username = buyer_username
         await session.flush()
     return state
@@ -472,6 +485,38 @@ async def mark_greeted(session: AsyncSession, state: ChatState) -> None:
 
     state.greeted_at = datetime.utcnow()
     await session.flush()
+
+
+async def mark_greeted_if_due(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    cooldown: timedelta,
+) -> bool:
+    """
+    Атомарно отметить chat_state.greeted_at = now() ТОЛЬКО если предыдущее
+    приветствие было давно (>= cooldown назад) или его ещё не было.
+
+    Возвращает True, если строка была обновлена (этот таск — первый в
+    cooldown-окне и должен отправить приветствие), False иначе (значит
+    другой таск уже зарезервировал отправку — молчим, иначе будет дубль
+    в чате).
+
+    Защищает от race-condition между параллельными вызовами `_maybe_greet`
+    для одного и того же сообщения, которое watcher продublirovал через
+    оба канала (listen-loop с text-key + poll-loop с id-key).
+    """
+    now = datetime.utcnow()
+    cutoff = now - cooldown
+    result = await session.execute(
+        sa_update(ChatState)
+        .where(ChatState.chat_id == chat_id)
+        .where(
+            (ChatState.greeted_at.is_(None)) | (ChatState.greeted_at < cutoff)
+        )
+        .values(greeted_at=now)
+    )
+    return (result.rowcount or 0) > 0
 
 
 async def mark_help_requested(session: AsyncSession, state: ChatState) -> None:
