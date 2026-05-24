@@ -15,12 +15,20 @@ class TelegramNotifier:
     Безопасен в выключенном состоянии (telegram_enabled=false / нет токена).
 
     Использует raw httpx, чтобы не тянуть весь aiogram только ради sendMessage.
-    Опционально использует прокси.
+    Опционально использует прокси с auto-fallback на direct: если прокси
+    становится недоступен (TCP timeout, connect error и т.п.) — нotifier
+    один раз пробует direct и, если direct работает, в этом процессе
+    больше не пытается через прокси. Это защита от частого боевого кейса:
+    aiogram-бот ходит к api.telegram.org напрямую и работает, а notifier
+    с прокси из .env молча теряет все уведомления, потому что VPS не
+    видит прокси (egress-блок).
     """
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self._settings = settings or get_settings()
-        self._client = None
+        self._proxy_client = None
+        self._direct_client = None
+        self._proxy_dead = False
         self._lock = asyncio.Lock()
 
     @property
@@ -39,16 +47,38 @@ class TelegramNotifier:
 
         proxy_url = self._settings.telegram_proxy_url
         if proxy_url:
-            self._client = httpx.AsyncClient(proxy=proxy_url, timeout=15.0)
-            logger.info(f"Telegram: использую прокси {self._settings.telegram_proxy_host}")
+            self._proxy_client = httpx.AsyncClient(proxy=proxy_url, timeout=15.0)
+            logger.info(
+                f"Telegram: использую прокси {self._settings.telegram_proxy_host} "
+                f"(с auto-fallback на direct при network error)"
+            )
         else:
-            self._client = httpx.AsyncClient(timeout=15.0)
+            self._direct_client = httpx.AsyncClient(timeout=15.0)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        for client_attr in ("_proxy_client", "_direct_client"):
+            client = getattr(self, client_attr, None)
+            if client is not None:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+                setattr(self, client_attr, None)
+
+    def _active_client(self):
+        """Какой клиент использовать прямо сейчас."""
+        if self._proxy_dead or self._proxy_client is None:
+            return self._direct_client
+        return self._proxy_client
+
+    async def _ensure_direct_client(self):
+        """Лениво создать direct-клиент (только когда понадобится для fallback)."""
+        if self._direct_client is None:
+            import httpx
+
+            self._direct_client = httpx.AsyncClient(timeout=15.0)
+        return self._direct_client
 
     async def send(
         self,
@@ -58,7 +88,7 @@ class TelegramNotifier:
         reply_markup: dict | None = None,
     ) -> bool:
         """Отправить сообщение. Если выключено — silently no-op."""
-        if not self.enabled or self._client is None:
+        if not self.enabled:
             return False
         s = self._settings
         token = s.telegram_bot_token.get_secret_value()  # type: ignore[union-attr]
@@ -72,20 +102,69 @@ class TelegramNotifier:
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup
         async with self._lock:
+            client = self._active_client()
+            if client is None:
+                return False
+            via_proxy = (
+                self._proxy_client is not None
+                and not self._proxy_dead
+                and client is self._proxy_client
+            )
             try:
-                r = await self._client.post(url, json=payload)
-                if r.status_code != 200:
-                    logger.warning(
-                        f"Telegram sendMessage HTTP {r.status_code}: {r.text[:200]}"
-                    )
-                    return False
-                return True
+                r = await client.post(url, json=payload)
             except Exception as exc:
+                # Сетевая ошибка через прокси → один шанс на direct.
+                if via_proxy:
+                    logger.warning(
+                        f"Telegram через прокси упал ({type(exc).__name__}: {exc!r}). "
+                        "Пробую direct..."
+                    )
+                    return await self._try_direct_fallback(
+                        url, payload, original_exc=exc
+                    )
                 logger.warning(
                     f"Telegram sendMessage failed: "
                     f"{type(exc).__name__}: {exc!r}"
                 )
                 return False
+
+            if r.status_code == 200:
+                return True
+
+            # HTTP-ошибка (400/403/...) — не сетевая проблема, fallback
+            # её не исправит, просто логируем.
+            logger.warning(
+                f"Telegram sendMessage HTTP {r.status_code}: {r.text[:200]}"
+            )
+            return False
+
+    async def _try_direct_fallback(
+        self, url: str, payload: dict, *, original_exc: Exception
+    ) -> bool:
+        """Однократный fallback на direct после провала через прокси."""
+        try:
+            direct = await self._ensure_direct_client()
+            r = await direct.post(url, json=payload)
+        except Exception as fallback_exc:
+            logger.warning(
+                f"Telegram direct fallback тоже упал "
+                f"({type(fallback_exc).__name__}: {fallback_exc!r}). "
+                f"Изначальная ошибка прокси: "
+                f"{type(original_exc).__name__}: {original_exc!r}"
+            )
+            return False
+        if r.status_code == 200:
+            self._proxy_dead = True
+            logger.warning(
+                f"Telegram-прокси {self._settings.telegram_proxy_host} "
+                f"недоступен с этого хоста; direct работает. Дальше шлю "
+                "напрямую без прокси (до рестарта процесса)."
+            )
+            return True
+        logger.warning(
+            f"Telegram direct fallback HTTP {r.status_code}: {r.text[:200]}"
+        )
+        return False
 
     # ----- Шорткаты для разных типов событий -----
 
