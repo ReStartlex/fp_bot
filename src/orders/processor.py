@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Optional
@@ -308,6 +309,23 @@ def _is_hard_timeout(
     if limit <= 0:
         return False
     return _order_age_seconds(order, now=now) >= limit
+
+
+def _is_valid_uuid4(value: str | None) -> bool:
+    """
+    Истина если value — корректный UUID4-string в каноническом формате.
+
+    NS API проверяет custom_id регуляркой uuid4 (8-4-4-4-12, version=4),
+    поэтому нам недостаточно `uuid.UUID(value)` — он принимает и v5/v3/v1.
+    UUID версия кодируется в 13-м hex-символе: для v4 это всегда `4`.
+    """
+    if not value:
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return parsed.version == 4
 
 
 async def _ns_check_existing_order(
@@ -709,14 +727,29 @@ async def _process_locked(
                 return {"status": "failed", "reason": error_text}
 
             # Аудит #1: idempotency NS create_order.
-            # 1) Deterministic custom_id (`fp-{funpay_order_id}`): при retry
-            #    обращаемся к ТОМУ ЖЕ NS-заказу, никакого UUID-дубля.
-            # 2) Intent marker: сохраняем custom_id в БД ДО вызова NS, чтобы
-            #    при crash до ответа retry уже знал, какой id проверять.
+            # 1) UUID4 custom_id, генерируется ОДИН раз и сразу пишется в БД
+            #    — при retry мы возьмём этот же UUID и обратимся к ТОМУ ЖЕ
+            #    NS-заказу, никакого UUID-дубля.
+            #    NB: до 2026-05-25 здесь была детерминистическая схема
+            #    `fp-{funpay_order_id}`, но NS обновил валидацию и теперь
+            #    требует строго UUID4 ({400, custom_id must be a valid UUID4}).
+            # 2) Intent marker: сохраняем UUID в БД ДО вызова NS, чтобы при
+            #    crash до ответа retry уже знал, какой id проверять.
             # 3) Pre-check `order_info`: если предыдущий attempt успел дойти
             #    до NS — пропускаем create.
-            if ns_custom_id is None:
-                ns_custom_id = f"fp-{event.funpay_order_id}"
+            if ns_custom_id is None or not _is_valid_uuid4(ns_custom_id):
+                # Либо новый заказ, либо в БД остался legacy "fp-..." id
+                # (с предыдущей версии кода). В обоих случаях генерим UUID4
+                # и перезаписываем — старый "fp-..." не существует в NS,
+                # обращение к нему по order_info даст 404 / валидационную
+                # ошибку. Перегенерация безопасна, потому что create_order
+                # для legacy-id всё равно бы провалился с 400.
+                if ns_custom_id is not None:
+                    log.warning(
+                        f"legacy ns_custom_id={ns_custom_id!r} в БД не UUID4 — "
+                        "перегенерирую"
+                    )
+                ns_custom_id = NSClient.new_custom_id()
             async with session_factory()() as session:
                 db_order = await find_order_by_funpay_id(session, event.funpay_order_id)
                 assert db_order is not None

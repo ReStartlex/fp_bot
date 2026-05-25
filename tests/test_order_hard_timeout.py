@@ -371,8 +371,12 @@ async def test_ns_timeout_during_wait_becomes_manual_hold_not_failed(
     order = await _get_order(db_factory, "fp-nstimeout")
     assert order is not None
     assert order.status == "manual_hold"
-    # Аудит #1: ns_custom_id теперь deterministic = f"fp-{funpay_order_id}".
-    assert order.ns_custom_id == "fp-fp-nstimeout"
+    # Аудит #1: ns_custom_id это UUID4 (NS-требование), не deterministic
+    # больше. Главное — он валидный UUID4 и непустой.
+    from src.orders.processor import _is_valid_uuid4
+    assert _is_valid_uuid4(order.ns_custom_id), (
+        f"ns_custom_id должен быть UUID4, был: {order.ns_custom_id!r}"
+    )
 
 
 @pytest.mark.asyncio

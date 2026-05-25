@@ -11,8 +11,11 @@
      возможно ДВОЙНОЕ списание.
 
 Фикс:
-  1. Deterministic custom_id = f"fp-{funpay_order_id}" — позволяет при
-     retry опознать тот же заказ.
+  1. NS требует UUID4 (с 2026-05-25, см. test_orders_uuid_custom_id.py).
+     Раньше использовали deterministic f"fp-{funpay_order_id}"; теперь —
+     uuid.uuid4(), который пишется в БД ДО вызова NS как intent marker.
+     При retry (без commit'a status'a) мы видим тот же UUID в БД и
+     обращаемся к ТОМУ ЖЕ NS-заказу через order_info.
   2. Перед create_order: order_info(custom_id). Если найден — пропустить
      create.
   3. Перед pay_order: order_info(custom_id). Если status != CREATED —
@@ -201,11 +204,13 @@ async def _coro(v): return v
 
 
 @pytest.mark.asyncio
-async def test_create_order_uses_deterministic_custom_id(
+async def test_create_order_uses_valid_uuid4(
     db_factory, settings, monkeypatch
 ):
-    """custom_id должен быть детерминированным (fp-{funpay_order_id}),
-    чтобы при retry NS мог опознать тот же заказ."""
+    """custom_id должен быть валидным UUID4 (NS-требование от 2026-05-25).
+    И сохранён в БД для idempotency при retry."""
+    from src.orders.processor import _is_valid_uuid4
+
     monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
 
@@ -221,9 +226,14 @@ async def test_create_order_uses_deterministic_custom_id(
     assert result["status"] == "delivered"
     assert len(ns.created_calls) == 1
     _, used_custom_id = ns.created_calls[0]
-    assert used_custom_id == "fp-fp-X1", (
-        f"Ожидался deterministic custom_id 'fp-fp-X1', получен {used_custom_id!r}"
+    assert _is_valid_uuid4(used_custom_id), (
+        f"NS отвергает не-UUID4: {used_custom_id!r}"
     )
+    # И тот же UUID должен быть в БД (intent marker)
+    async with db_factory() as s:
+        order = await find_order_by_funpay_id(s, "fp-X1")
+        assert order is not None
+        assert order.ns_custom_id == used_custom_id
 
 
 # ───────────────── #1b: retry create_order не создаёт дубль ─────────
@@ -233,12 +243,17 @@ async def test_create_order_uses_deterministic_custom_id(
 async def test_retry_does_not_recreate_existing_ns_order(
     db_factory, settings, monkeypatch
 ):
-    """Сценарий A: predyduщая попытка create_order дошла до NS, но crash
+    """Сценарий A: predыдущая попытка create_order дошла до NS, но crash
     случился до commit'a ns_created в БД (статус остался received).
     Retry должен через order_info обнаружить заказ и НЕ создавать дубль.
     """
+    import uuid
+
     monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
+
+    # Intent marker UUID4 от прошлой попытки (NS-формат)
+    saved_uuid = str(uuid.uuid4())
 
     # БД: статус received, ns_custom_id уже сохранён (intent marker от прошлой попытки).
     async with db_factory() as s:
@@ -247,7 +262,7 @@ async def test_retry_does_not_recreate_existing_ns_order(
                 funpay_order_id="fp-X2",
                 funpay_lot_id=1001,
                 ns_service_id=20,
-                ns_custom_id="fp-fp-X2",
+                ns_custom_id=saved_uuid,
                 buyer_username="alice",
                 chat_id=555,
                 quantity=1,
@@ -259,8 +274,8 @@ async def test_retry_does_not_recreate_existing_ns_order(
     # NS: заказ уже существует с этим custom_id (предыдущий create успел).
     ns = FakeNSIdempotent(
         existing_orders={
-            "fp-fp-X2": OrderInfo(
-                custom_id="fp-fp-X2", status=OrderStatus.CREATED.value,
+            saved_uuid: OrderInfo(
+                custom_id=saved_uuid, status=OrderStatus.CREATED.value,
                 status_message="created", total_price=1.5,
             )
         }
@@ -279,7 +294,7 @@ async def test_retry_does_not_recreate_existing_ns_order(
         f"вызовы: {ns.created_calls}"
     )
     # order_info должен был вызваться хотя бы один раз для проверки.
-    assert "fp-fp-X2" in ns.order_info_calls
+    assert saved_uuid in ns.order_info_calls
 
 
 # ───────────────── #1c: retry pay_order не оплачивает повторно ─────────
@@ -292,8 +307,11 @@ async def test_retry_does_not_repay_when_ns_order_already_in_progress(
     """Сценарий B: pay_order дошёл до NS (статус IN_PROGRESS или COMPLETED),
     но crash до commit'a ns_paid в БД. Retry должен через order_info
     опознать что заказ уже оплачен и НЕ вызывать pay_order повторно."""
+    import uuid
     monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
+
+    saved_uuid = str(uuid.uuid4())
 
     # БД: статус ns_created (commit ns_paid не дошёл).
     async with db_factory() as s:
@@ -302,7 +320,7 @@ async def test_retry_does_not_repay_when_ns_order_already_in_progress(
                 funpay_order_id="fp-X3",
                 funpay_lot_id=1001,
                 ns_service_id=20,
-                ns_custom_id="fp-fp-X3",
+                ns_custom_id=saved_uuid,
                 ns_price_usd=1.5,
                 buyer_username="alice",
                 chat_id=555,
@@ -315,8 +333,8 @@ async def test_retry_does_not_repay_when_ns_order_already_in_progress(
     # NS: заказ уже COMPLETED с pins.
     ns = FakeNSIdempotent(
         existing_orders={
-            "fp-fp-X3": OrderInfo(
-                custom_id="fp-fp-X3", status=OrderStatus.COMPLETED.value,
+            saved_uuid: OrderInfo(
+                custom_id=saved_uuid, status=OrderStatus.COMPLETED.value,
                 status_message="completed", total_price=1.5,
                 pins=["RECOVERED-PIN"],
             )
@@ -346,11 +364,14 @@ async def test_retry_does_not_repay_when_ns_order_already_in_progress(
 async def test_create_order_proceeds_when_ns_returns_404(
     db_factory, settings, monkeypatch
 ):
-    """Если ns_custom_id есть в БД (intent marker), но NS возвращает 404
-    (предыдущий create НЕ дошёл) — должны нормально вызвать create_order
-    с тем же deterministic custom_id."""
+    """Если ns_custom_id есть в БД (intent marker, UUID4), но NS возвращает
+    404 (предыдущий create НЕ дошёл) — должны нормально вызвать create_order
+    с тем же UUID."""
+    import uuid
     monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
+
+    saved_uuid = str(uuid.uuid4())
 
     # БД: ns_custom_id сохранён, но в NS заказа НЕТ.
     async with db_factory() as s:
@@ -359,7 +380,7 @@ async def test_create_order_proceeds_when_ns_returns_404(
                 funpay_order_id="fp-X4",
                 funpay_lot_id=1001,
                 ns_service_id=20,
-                ns_custom_id="fp-fp-X4",
+                ns_custom_id=saved_uuid,
                 buyer_username="alice",
                 chat_id=555,
                 quantity=1,
@@ -379,7 +400,8 @@ async def test_create_order_proceeds_when_ns_returns_404(
 
     assert result["status"] == "delivered"
     assert len(ns.created_calls) == 1
-    assert ns.created_calls[0][1] == "fp-fp-X4"
+    # Тот же UUID4 из БД (не перегенерён, потому что он валидный)
+    assert ns.created_calls[0][1] == saved_uuid
 
 
 # ───────────────── #1e: intent marker сохранён ДО NS-вызова ─────────
@@ -419,7 +441,65 @@ async def test_ns_custom_id_persisted_before_ns_call(
         ns_client=ns, funpay_client=fp, telegram=tg,
     )
 
-    assert db_state_at_create["ns_custom_id"] == "fp-fp-X5", (
-        "ns_custom_id должен быть сохранён в БД ДО вызова NS.create_order, "
-        f"но в момент вызова было: {db_state_at_create['ns_custom_id']!r}"
+    from src.orders.processor import _is_valid_uuid4
+    saved = db_state_at_create["ns_custom_id"]
+    assert _is_valid_uuid4(saved), (
+        "ns_custom_id должен быть сохранён в БД ДО вызова NS.create_order "
+        f"и быть валидным UUID4 (NS-требование), но было: {saved!r}"
     )
+
+
+# ───────────────── #1f: legacy "fp-..." перегенерируется в UUID4 ───────
+
+
+@pytest.mark.asyncio
+async def test_legacy_fp_id_in_db_is_regenerated_to_uuid4(
+    db_factory, settings, monkeypatch
+):
+    """
+    Регрессионный тест: до 2026-05-25 мы писали в БД custom_id вида
+    `fp-WR3MVAKX`. После апгрейда NS отвергает такие id с 400. Код должен
+    автоматически перегенерировать legacy-id в UUID4 при первой попытке
+    обработки. Заказ при этом обрабатывается успешно.
+    """
+    from src.orders.processor import _is_valid_uuid4
+
+    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    await _make_mapping(db_factory)
+
+    async with db_factory() as s:
+        s.add(
+            Order(
+                funpay_order_id="fp-LEGACY",
+                funpay_lot_id=1001,
+                ns_service_id=20,
+                ns_custom_id="fp-fp-LEGACY",  # legacy не-UUID4 формат
+                buyer_username="alice",
+                chat_id=555,
+                quantity=1,
+                status="received",
+            )
+        )
+        await s.commit()
+
+    ns = FakeNSIdempotent()
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    result = await process_funpay_order(
+        _event(order_id="fp-LEGACY"), settings=settings,
+        ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "delivered"
+    assert len(ns.created_calls) == 1
+    used_id = ns.created_calls[0][1]
+    assert _is_valid_uuid4(used_id), (
+        f"Legacy 'fp-fp-LEGACY' должен был перегенериться в UUID4, "
+        f"но в NS ушло: {used_id!r}"
+    )
+    assert used_id != "fp-fp-LEGACY"
+    # И в БД теперь — новый UUID
+    async with db_factory() as s:
+        order = await find_order_by_funpay_id(s, "fp-LEGACY")
+        assert order.ns_custom_id == used_id

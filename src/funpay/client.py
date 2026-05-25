@@ -436,10 +436,31 @@ class FunPayClient:
                 }
 
             data: dict[str, Any] = {"used_lot_id": target_lot}
-            for attr in ("total", "available", "currency", "rub", "usd", "eur"):
+
+            # FunPayAPI обновили модель Balance: вместо устаревших полей
+            # `total`/`available` теперь приходят `total_rub`/`available_rub`
+            # (и аналогичные для USD/EUR). Поддерживаем оба контракта,
+            # чтобы при следующем апгрейде FunPayAPI не сломаться снова.
+            modern_attrs = (
+                "total_rub", "available_rub",
+                "total_usd", "available_usd",
+                "total_eur", "available_eur",
+            )
+            legacy_attrs = ("total", "available", "currency", "rub", "usd", "eur")
+            for attr in modern_attrs + legacy_attrs:
                 value = getattr(bal, attr, None)
                 if value is not None:
                     data[attr] = value
+
+            # Удобные алиасы для UI: бот рендерит fp_bal["rub"] первым делом.
+            # У современной модели поле называется total_rub — мэппим его.
+            if "rub" not in data and "total_rub" in data:
+                data["rub"] = data["total_rub"]
+            if "usd" not in data and "total_usd" in data:
+                data["usd"] = data["total_usd"]
+            if "eur" not in data and "total_eur" in data:
+                data["eur"] = data["total_eur"]
+
             data["raw_repr"] = repr(bal)
             return data
 
