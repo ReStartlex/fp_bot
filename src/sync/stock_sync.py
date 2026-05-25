@@ -511,12 +511,6 @@ async def sync_once(
         cache_check_now = datetime.utcnow()  # фиксируем "now" для всех проверок цикла
 
         decisions: list[LotSyncDecision] = []
-        # Маппинги, попавшие в diff-cache fast-path — они НЕ идут в
-        # _decide_for_one (нет FunPay GET), и их last_synced_at нужно
-        # обновить, чтобы TTL не истёк и cache оставался свежим.
-        # Не обновляем _значения_, только _at — потому что
-        # last_synced_* уже корректны (мы только что подтвердили равенство).
-        cache_hits_to_refresh_at: list[int] = []
 
         for mapping in mappings:
             ns_service = services_index.get(mapping.ns_service_id)
@@ -552,10 +546,13 @@ async def sync_once(
                         f"stock={quick_target.stock}) — skip FunPay"
                     )
                     lots_unchanged += 1
-                    # Освежаем last_synced_at, чтобы cache не «протух»
-                    # сам по себе (TTL — это защита от рассинхрона, а
-                    # не «истечение» данных, которые ещё валидны).
-                    cache_hits_to_refresh_at.append(mapping.id)
+                    # ВАЖНО: НЕ обновляем last_synced_at при cache-hit!
+                    # TTL должен срабатывать честно — это гарантия того,
+                    # что мы периодически переоткалибруем кеш с реальным
+                    # FunPay-стоком. Иначе FunPay сам при продаже снижает
+                    # сток (100→97), наш target всё ещё 100 (cap), cache
+                    # видит совпадение и пропускает sync навсегда —
+                    # см. инцидент 2026-05-25.
                     continue
 
             # === Обычный путь: FunPay GET для проверки текущего состояния ===
@@ -642,12 +639,13 @@ async def sync_once(
                 # Не спамим FunPay: пауза согласно rate-limit
                 await asyncio.sleep(1.0 / settings.funpay_update_rate_limit_per_second)
 
-        # === Сохранение diff-cache: только успешные обновления + cache-hits ===
-        # Накопили в pending_cache_updates (после save_lot success или
-        # после verified no-action) и cache_hits_to_refresh_at (мы только
-        # что подтвердили равенство без FunPay GET).
-        # Если sync_stock упал в середине — пишем хотя бы то что успели.
-        if pending_cache_updates or cache_hits_to_refresh_at:
+        # === Сохранение diff-cache: только успешные save_lot + verified-no-action ===
+        # pending_cache_updates наполняется в двух местах:
+        #   1. После успешного save_lot (мы знаем что FunPay теперь == target)
+        #   2. После verified no-action (FunPay-GET подтвердил FunPay уже == target)
+        # Cache-hits (fast-path) сюда НЕ попадают — их last_synced_at должен
+        # истекать честно через TTL, чтобы периодически переоткалибровываться.
+        if pending_cache_updates:
             try:
                 async with session_factory()() as session:
                     for mid, price, stock, active in pending_cache_updates:
@@ -657,16 +655,6 @@ async def sync_once(
                             price=price,
                             stock=stock,
                             active=active,
-                        )
-                    # Cache hits: освежаем last_synced_at без изменения значений.
-                    # Делаем простой SQL UPDATE last_synced_at=NOW WHERE id IN (...)
-                    if cache_hits_to_refresh_at:
-                        from sqlalchemy import update as sa_update
-                        from src.db.models import Mapping
-                        await session.execute(
-                            sa_update(Mapping)
-                            .where(Mapping.id.in_(cache_hits_to_refresh_at))
-                            .values(last_synced_at=datetime.utcnow())
                         )
                     await session.commit()
             except Exception as exc:  # noqa: BLE001

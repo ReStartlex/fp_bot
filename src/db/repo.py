@@ -184,6 +184,41 @@ async def update_mapping_last_synced(
     )
 
 
+async def invalidate_mapping_cache_for_funpay_lot(
+    session: AsyncSession,
+    *,
+    funpay_lot_id: int,
+) -> int:
+    """
+    Сбросить diff-cache для одного лота (last_synced_at -> NULL).
+
+    Зачем. FunPay при продаже САМ внутренне списывает сток с лота
+    (100 → 97), не дожидаясь нашего save_lot. NS-сток тоже снизился,
+    но `target = min(NS, cap=100)` всё ещё 100, поэтому diff-cache
+    видит `target == last_synced` и пропускает FunPay-запрос —
+    в итоге FunPay-сток так и торчит на 97, не возвращается к 100.
+
+    Решение: при обработке заказа в OrderProcessor мы знаем какой
+    funpay_lot_id «потрогали», и явно инвалидируем его кеш. Следующий
+    sync-цикл (≤30с) видит last_synced_at=NULL → cache miss → реальный
+    FunPay GET → видит 97 ≠ 100 → save_lot(100).
+
+    Возвращает кол-во затронутых строк (обычно 1, или 0 если по
+    funpay_lot_id маппинга нет — заказ с лота, который ещё не
+    замаплен; это норма, не ошибка).
+
+    Намеренно НЕ обнуляем `last_synced_price/stock/active` — это
+    просто метаданные «последнего известного состояния», они
+    игнорируются если `last_synced_at` IS NULL.
+    """
+    result = await session.execute(
+        sa_update(Mapping)
+        .where(Mapping.funpay_lot_id == int(funpay_lot_id))
+        .values(last_synced_at=None)
+    )
+    return result.rowcount or 0
+
+
 # ---------- FX rates ----------
 
 async def save_fx_rate(

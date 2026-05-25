@@ -45,6 +45,7 @@ from src.db.models import KnownLot, Mapping, Order
 from src.db.repo import (
     create_order,
     find_order_by_funpay_id,
+    invalidate_mapping_cache_for_funpay_lot,
     update_order,
 )
 from src.db.session import session_factory
@@ -1067,6 +1068,22 @@ async def _deliver_pins(
             profit_rub=profit_rub,
             profit_margin_percent=profit_margin_percent,
         )
+        # Инвалидация diff-cache. FunPay при продаже САМ списывает сток
+        # (100→97), наш target = min(NS, cap) = 100 не меняется, поэтому
+        # без инвалидации diff-cache видит совпадение и пропускает sync
+        # — FunPay-сток так и торчит на 97 до истечения TTL. Сбрасываем
+        # last_synced_at, чтобы следующий sync-цикл (≤30с) пошёл через
+        # реальный FunPay GET и поднял сток обратно к target.
+        if event.funpay_lot_id and event.funpay_lot_id > 0:
+            try:
+                await invalidate_mapping_cache_for_funpay_lot(
+                    session, funpay_lot_id=event.funpay_lot_id
+                )
+            except Exception as exc:
+                log.warning(
+                    f"invalidate_mapping_cache_for_funpay_lot упал "
+                    f"(lot={event.funpay_lot_id}): {exc}"
+                )
         await session.commit()
 
     if telegram is not None:
