@@ -111,6 +111,26 @@ class Settings(BaseSettings):
     telegram_proxy_username: SecretStr | None = None
     telegram_proxy_password: SecretStr | None = None
 
+    # === Phase 1: TG-shop ===
+    # Отдельный бот для покупателей (не путать с owner-ботом выше).
+    # Если shop_enabled=true, но shop_telegram_bot_token не задан, shop
+    # стартует в дегенерированном режиме (бот не запускается, БД остаётся
+    # рабочей — admin API всё ещё может что-то прочитать).
+    shop_enabled: bool = False
+    shop_telegram_bot_token: SecretStr | None = None
+    # Markup для shop-цен. Дешевле FunPay-площадки (~13% сверху), даёт нам
+    # комфортную маржу 8% против ~2% net на FunPay (после комиссий и вывода).
+    # Может быть переопределён через RuntimeSetting key=shop_markup_percent.
+    shop_markup_percent: float = Field(default=8.0, ge=0, le=100)
+    # 1% от покупки реферала → на внутренний баланс пригласившего.
+    # Может быть переопределён через RuntimeSetting key=shop_referral_percent.
+    shop_referral_percent: float = Field(default=1.0, ge=0, le=100)
+    # Как часто обновлять shop_catalog_cache из NS.get_stock(). NS-каталог
+    # сам по себе меняется медленно (часы), но цены/наличие — каждые
+    # 1-2 минуты. 90с — sweet spot: пользователь не видит "out of stock"
+    # после первого захода, и нагрузка на NS API ничтожна (1 запрос в 90с).
+    shop_catalog_refresh_seconds: int = Field(default=90, ge=30, le=3600)
+
     web_api_enabled: bool = False
     web_api_host: str = "127.0.0.1"
     web_api_port: int = Field(default=8080, ge=1, le=65535)

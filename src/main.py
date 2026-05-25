@@ -33,6 +33,7 @@ from src.logging_setup import setup_logging
 from src.ns import NSClient
 from src.orders.reconciler import reconcile_orders_once
 from src.orders.processor import FunPayOrderEvent, process_funpay_order
+from src.shop.bot import ShopBot
 from src.sync.stock_sync import sync_once
 
 
@@ -49,6 +50,7 @@ class App:
         self.fp: FunPayClient | None = None
         self.watcher: FunPayWatcher | None = None
         self.bot: TelegramBot | None = None
+        self.shop_bot: ShopBot | None = None
         self.tg: TelegramNotifier | None = None
         self.chat_handler: ChatHandler | None = None
         self._stop_evt = asyncio.Event()
@@ -119,6 +121,25 @@ class App:
         )
         await self.bot.start()
 
+        # 4b. Shop-бот (Phase 1). Запускается только если shop_enabled=true
+        # и shop_telegram_bot_token задан. Если упадёт на старте — не валим
+        # bridge-бот, просто отключаем shop и шлём алерт владельцу.
+        try:
+            self.shop_bot = ShopBot(
+                self.settings,
+                owner_notify=self._notify_owner_safe,
+            )
+            await self.shop_bot.start()
+        except Exception as exc:
+            logger.exception(f"Shop-бот не стартовал: {exc}")
+            if self.tg is not None:
+                short = f"{type(exc).__name__}: {str(exc)[:160]}"
+                await self.tg.error(
+                    f"Shop-бот не стартовал: <code>{short}</code>. "
+                    "Bridge продолжит работать, shop останется выключенным."
+                )
+            self.shop_bot = None
+
         # 5. Планировщик: sync + heartbeat + low-balance
         self.scheduler = AsyncIOScheduler(timezone=self.settings.timezone)
         self.scheduler.add_job(
@@ -188,6 +209,9 @@ class App:
             self.watcher.stop()
         if self.bot is not None:
             await self.bot.stop()
+        if self.shop_bot is not None:
+            with suppress(Exception):
+                await self.shop_bot.stop()
         if self.fp is not None:
             await self.fp.__aexit__(None, None, None)
         if self.tg is not None:
@@ -409,6 +433,21 @@ class App:
             telegram=self.tg,
             force_delivery=True,
         )
+
+    # ---------- Shop helpers ----------
+
+    async def _notify_owner_safe(self, text: str) -> None:
+        """
+        Уведомление владельца из shop-бота. Никогда не бросает исключения —
+        shop-бот не должен ронять основной процесс, если Telegram временно
+        недоступен.
+        """
+        if self.tg is None:
+            return
+        try:
+            await self.tg.send(text)
+        except Exception as exc:
+            logger.debug(f"_notify_owner_safe: {exc}")
 
     # ---------- Health ----------
 

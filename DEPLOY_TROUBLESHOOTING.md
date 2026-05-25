@@ -11,6 +11,8 @@
 > **Открыл новый чат, надо задеплоить свежий коммит?** Сначала прочитай
 > этот блок, §0.1 «Грабли» и §0.2 «Зеркала GitHub».
 > Команды ниже — проверены на Timeweb VPS, обновляются при каждом инциденте.
+>
+> **Phase 1 (TG-shop)?** Перед первым деплоем shop-фазы — см. §0.4 «Включение Shop».
 
 ```bash
 APP=/opt/funpay-ns-bot
@@ -107,6 +109,52 @@ head -c 30 /tmp/probe
   `iRt8qjaa:Wdk3Gycf`) — основное «оружие» для обхода. См. п. 1.
 - Текущий стабильный SHA для деплоя: `71426518cd038d57f647afcb5d37b90a606d55d4`
   (далее `7142651`).
+
+---
+
+## 0.4 Включение Phase 1 (TG-shop) на VPS
+
+> Эта секция нужна **только при ПЕРВОМ** деплое после добавления shop-кода.
+> Дальше — обычный TL;DR деплой через `update.sh`.
+
+**Чек-лист для включения shop'а в проде:**
+
+1. **Создать shop-бота через @BotFather:**
+   - `/newbot` → задать имя (например, *MyShop Bot*) и username (например, `myshop_cards_bot`).
+   - Сохранить токен в безопасное место.
+   - (Опционально) `/setdescription`, `/setabouttext`, `/setuserpic`.
+
+2. **Задеплоить новый код по обычному TL;DR** (см. выше) — без `SHOP_ENABLED=true`
+   код безопасен: shop-бот не стартует, остальное работает как раньше.
+
+3. **Добавить переменные в `/opt/funpay-ns-bot/.env`:**
+
+   ```bash
+   # на VPS, в веб-консоли Timeweb
+   sudo nano /opt/funpay-ns-bot/.env
+   # добавить в конец:
+   SHOP_ENABLED=true
+   SHOP_TELEGRAM_BOT_TOKEN=<твой_токен_от_BotFather>
+   SHOP_MARKUP_PERCENT=8
+   SHOP_REFERRAL_PERCENT=1
+   SHOP_CATALOG_REFRESH_SECONDS=90
+   ```
+
+4. **Рестарт сервиса:**
+
+   ```bash
+   sudo systemctl restart funpay-ns-bot
+   sudo journalctl -u funpay-ns-bot -n 50 --no-pager | grep -i shop
+   ```
+
+   Ожидаемо в логе: `Shop-бот @<username> стартовал (long-polling)`.
+   В owner-чат прилетит: `🛒 Shop-бот @<username> запущен`.
+
+5. **Проверить из Telegram:** `/start` в shop-боте → приветствие, регистрация
+   в `shop_users`, `/balance` → 0₽, `/ref` → реф-ссылка.
+
+**Откат:** выставить `SHOP_ENABLED=false` в `.env` и рестартануть — bridge-бот
+продолжит работать, shop отключится.
 
 ---
 
