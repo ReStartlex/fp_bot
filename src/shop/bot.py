@@ -86,6 +86,7 @@ from src.shop.repo import (
     list_categories_in_group,
     list_category_groups_for_ui,
     list_services_in_category,
+    list_similar_services,
     mark_payment_failed,
     parse_referral_payload,
     search_services,
@@ -589,7 +590,15 @@ class ShopBot:
                 cnt = await count_categories_in_group(session, group_slug=slug)
                 if cnt > 1:
                     back_slug = slug
-        text, markup = service_card_keyboard(svc=svc, group_slug=back_slug)
+            # «Похожее»: другие услуги того же бренда. Дешёвый запрос
+            # (LIKE по base_name). Если пусто — keyboard просто не
+            # отрисует блок.
+            similar = await list_similar_services(
+                session, ns_service_id=sid, limit=5,
+            )
+        text, markup = service_card_keyboard(
+            svc=svc, group_slug=back_slug, similar=similar,
+        )
         await self._safe_edit(cb, text=text, markup=markup)
 
     async def _on_cb_buy_stub(self, cb: CallbackQuery) -> None:

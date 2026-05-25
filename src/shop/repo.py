@@ -653,6 +653,53 @@ async def get_catalog_service(
     return res.scalar_one_or_none()
 
 
+async def list_similar_services(
+    session: AsyncSession,
+    *,
+    ns_service_id: int,
+    limit: int = 5,
+) -> list[ShopCatalogCache]:
+    """
+    Возвращает «похожие» услуги — другие сервисы того же бренда (base_name)
+    из других category_id, чтобы покупатель видел альтернативные регионы/
+    номиналы прямо в карточке товара.
+
+    Алгоритм:
+      1. Найти services_id → base_name (исходный сервис);
+      2. Выбрать enabled+in_stock>0 услуги с тем же base_name, ИСКЛЮЧАЯ
+         сам исходный;
+      3. Отсортировать по цене (растущая) — обычно дешёвые номиналы более
+         популярны;
+      4. Limit (default 5, отдадим в UI до 3 — но запас на случай дубликатов).
+
+    Возвращает [] если:
+      * исходный сервис не найден / disabled;
+      * у исходного нет base_name (тогда «похожих» определить нельзя);
+      * других услуг этого бренда нет.
+
+    NOTE: не используем `group_slug` напрямую, потому что в БД он может
+    быть NULL для старых записей (миграция backfill'ила, но всё же).
+    base_name гарантированно есть после catalog_sync.
+    """
+    if limit <= 0:
+        return []
+    origin = await get_catalog_service(session, ns_service_id)
+    if origin is None or not origin.base_name:
+        return []
+    stmt = (
+        select(ShopCatalogCache)
+        .where(
+            ShopCatalogCache.enabled.is_(True),
+            ShopCatalogCache.in_stock > 0,
+            ShopCatalogCache.base_name == origin.base_name,
+            ShopCatalogCache.ns_service_id != ns_service_id,
+        )
+        .order_by(ShopCatalogCache.rub_price_kopecks.asc())
+        .limit(limit)
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
 # ════════════════════════════════════════════════════════════════════════
 #                    Phase 1: payments (CryptoBot и далее)
 # ════════════════════════════════════════════════════════════════════════

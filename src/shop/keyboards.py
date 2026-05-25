@@ -41,6 +41,14 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
 )
 
+from src.shop.taxonomy_icons import (
+    brand_emoji,
+    featured_badge,
+    region_flag,
+    stock_bar,
+    stock_status_text,
+)
+
 
 # ─── public sizing constants ────────────────────────────────────────
 
@@ -188,24 +196,35 @@ def catalog_groups_keyboard(
     page: int,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """
-    Главный экран каталога: пагинированный список групп.
+    Главный экран каталога: пагинированный список групп с brand-эмодзи
+    и featured-бейджами для топа.
 
     Header:
-      🛍 Каталог
-      стр. 1 из 23 · всего 230
+      🛍 NeuroDrop · Каталог
+      <i>23 раздела · стр. 1/3</i>
 
     Items (10):
-      [ Apple Gift Card · 13 регионов · от 91 ₽ ]
+      [ 🔥 🍎 Apple Gift Card · 13 регионов · от 91 ₽ ]   (топ-1 → 🔥)
+      [ ⭐ 🎮 Steam Wallet Code · 9 регионов · от 29 ₽ ]   (топ-2 → ⭐)
+      [ 💎 🎲 Roblox · 5 номиналов · от 238 ₽ ]            (топ-3 → 💎)
+      [ 🎮 PlayStation®Store · 2 региона · от 426 ₽ ]
       ...
 
+    Featured-ранжирование на первой странице:
+      Топ-3 по variants_count получают бейдж 🔥 ⭐ 💎. Логика «авто»:
+      больше вариантов = больше покупателю выбора = более ходовая
+      категория. Когда добавим runtime override (operator вручную)
+      — этот fallback останется как «default sort».
+
     Footer:
-      [ ‹ ] [ 1/23 ] [ › ]
-      [ 🔍 Поиск ] [ ✖ Закрыть ]
+      [ ‹ ] [ 1/3 ] [ › ]
+      [ 🔍 Поиск ]   [ ✖ Закрыть ]
     """
     if not groups:
         return (
             "📭 <b>Каталог пока пуст.</b>\n\n"
-            "Загляни через 1–2 минуты — каталог обновляется автоматически.",
+            "Загляни через 1–2 минуты — каталог обновляется автоматически.\n"
+            "<i>Иногда поставщик NS.gifts кратко уходит на профилактику.</i>",
             InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Обновить", callback_data="cats:0")],
             ]),
@@ -214,19 +233,39 @@ def catalog_groups_keyboard(
     page_items, page, total_pages = _paginate(
         list(groups), page=page, page_size=CATALOG_GROUPS_PAGE_SIZE,
     )
-    header = (
-        f"🛍 <b>Каталог</b>\n"
-        f"<i>стр. {page + 1} из {total_pages} · всего {len(groups)} разделов</i>"
-    )
+    # Заголовок: бренд + краткая статистика. NeuroDrop вставляем
+    # эксплицитно, чтобы пользователь видел identitiy на каждой странице.
+    header_lines = [
+        "🛍 <b>NeuroDrop · Каталог</b>",
+        f"<i>{len(groups)} раздел{_plural_razdel(len(groups))} · "
+        f"стр. {page + 1}/{total_pages}</i>",
+    ]
+    header = "\n".join(header_lines)
 
     rows: list[list[InlineKeyboardButton]] = []
+    # Топ-3 по variants_count (на ВСЕЙ выборке, не только текущей странице).
+    # Сортируем descending; ничьи — стабильны по исходному порядку.
+    # Берём id из page_items для сопоставления, но badge'и считаем по
+    # глобальной позиции, чтобы featured был «на главной».
+    sorted_for_rank = sorted(
+        list(groups), key=lambda g: -g.variants_count,
+    )
+    rank_by_slug = {g.group_slug: i for i, g in enumerate(sorted_for_rank)}
+
     for grp in page_items:
+        brand = brand_emoji(grp.base_name)
         cheapest = _format_rub_compact(grp.cheapest_price_kopecks)
+        # Middle часть: для одиночных — без «X регионов», иначе видно
+        # сколько вариантов есть.
         if grp.variants_count > 1:
-            mid = f"· {grp.variants_count} регионов "
+            mid = f" · {grp.variants_count} {_plural_region(grp.variants_count)}"
         else:
             mid = ""
-        label = f"{grp.base_name} {mid}· от {cheapest}"
+        rank = rank_by_slug.get(grp.group_slug, 9999)
+        badge = featured_badge(rank)
+        # Сборка: [badge] brand base_name · X регионов · от Y ₽
+        prefix = f"{badge} {brand} " if badge else f"{brand} "
+        label = f"{prefix}{grp.base_name}{mid} · от {cheapest}"
         rows.append([InlineKeyboardButton(
             text=_truncate(label),
             callback_data=f"grp:{grp.group_slug}:0",
@@ -242,6 +281,30 @@ def catalog_groups_keyboard(
     return header, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _plural_razdel(n: int) -> str:
+    """Русское склонение «раздел/раздела/разделов» для счётчика."""
+    if 11 <= (n % 100) <= 14:
+        return "ов"
+    last = n % 10
+    if last == 1:
+        return ""
+    if 2 <= last <= 4:
+        return "а"
+    return "ов"
+
+
+def _plural_region(n: int) -> str:
+    """Русское склонение «регион/региона/регионов»."""
+    if 11 <= (n % 100) <= 14:
+        return "регионов"
+    last = n % 10
+    if last == 1:
+        return "регион"
+    if 2 <= last <= 4:
+        return "региона"
+    return "регионов"
+
+
 # ─── catalog: variants of a group (grid) ────────────────────────────
 
 
@@ -255,45 +318,56 @@ def variants_grid_keyboard(
     в grid VARIANTS_GRID_COLS × N.
 
     Header:
-      🛍 Apple Gift Card
-      13 регионов · от 91 ₽
+      🍎 Apple Gift Card
+      <i>13 регионов · от 91 ₽</i>
+      Выбери регион:
 
     Grid (2 col):
-      [ US · от 1 084 ]  [ EU · от 1 350 ]
-      [ UK · от 1 530 ]  [ DE · от 1 453 ]
+      [ 🇺🇸 US · от 1 084 ]  [ 🇪🇺 EU · от 1 350 ]
+      [ 🇬🇧 UK · от 1 530 ]  [ 🇩🇪 DE · от 1 453 ]
       ...
 
     Footer:
       [ « К каталогу ]
     """
+    brand = brand_emoji(base_name)
     if not variants:
         return (
-            f"📭 В группе <b>{html.escape(base_name)}</b> пока ничего нет.",
+            f"📭 В группе {brand} <b>{html.escape(base_name)}</b> "
+            "пока ничего нет.\n"
+            "<i>Скорее всего, временно нет в наличии у поставщика. "
+            "Загляни позже.</i>",
             InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="« К каталогу", callback_data="cats:0"),
             ]]),
         )
 
     cheapest_overall = min(v.cheapest_price_kopecks for v in variants)
+    # Pluralisation: «1 регион», «2 региона», «5 регионов»
+    region_word = _plural_region(len(variants))
     header = (
-        f"🛍 <b>{html.escape(base_name)}</b>\n"
-        f"<i>{len(variants)} вариантов · от {_format_rub_compact(cheapest_overall)}</i>\n"
-        f"Выбери регион/платформу:"
+        f"{brand} <b>{html.escape(base_name)}</b>\n"
+        f"<i>{len(variants)} {region_word} · "
+        f"от {_format_rub_compact(cheapest_overall)}</i>\n"
+        f"Выбери регион:"
     )
 
     rows: list[list[InlineKeyboardButton]] = []
     current_row: list[InlineKeyboardButton] = []
     for v in variants:
-        # Хвост после `|` — он же variant. Если разделителя нет, показываем
-        # имя целиком (но base_name уже в заголовке — будет дубль; так и
-        # должно быть для одиночных категорий, чтобы юзер не путался).
+        # Хвост после `|` — он же variant. Если разделителя нет, берём
+        # имя целиком (тогда base_name уже в заголовке — дубль; нормально
+        # для одиночных категорий, чтобы юзер не путался).
         if "|" in v.category_name:
             _, _, tail = v.category_name.partition("|")
             tail = tail.strip()
         else:
             tail = v.category_name
+        flag = region_flag(v.category_name)
         price = _format_rub_compact(v.cheapest_price_kopecks)
-        label = f"{tail} · от {price}"
+        # Сборка: [флаг] tail · от X ₽. Если флага нет — без emoji.
+        prefix = f"{flag} " if flag else ""
+        label = f"{prefix}{tail} · от {price}"
         current_row.append(InlineKeyboardButton(
             text=_truncate(label, BUTTON_TEXT_MAX // VARIANTS_GRID_COLS + 16),
             callback_data=f"cat:{v.category_id}:0",
@@ -338,8 +412,9 @@ def services_page_keyboard(
     """
     if not services:
         text = (
-            "📭 Здесь временно ничего нет — поставщик не подвёз. "
-            "Загляни позже или поищи похожее через 🔍 Поиск."
+            "📭 <b>Тут пока пусто.</b>\n"
+            "Поставщик временно без наличия. Загляни позже или "
+            "поищи похожее через 🔍 Поиск — другие регионы могут быть в строю."
         )
         markup = InlineKeyboardMarkup(inline_keyboard=[
             _back_button_row(group_slug=group_slug),
@@ -348,17 +423,29 @@ def services_page_keyboard(
 
     total_pages = max(1, (total + SERVICES_PAGE_SIZE - 1) // SERVICES_PAGE_SIZE)
     cat_name = services[0].category_name or "Категория"
+    # Подмешиваем brand-эмодзи + флаг страны в заголовок категории.
+    # Это даёт мгновенное визуальное распознавание «где я».
+    base = getattr(services[0], "base_name", None) or cat_name
+    brand = brand_emoji(base)
+    flag = region_flag(cat_name)
+    flag_part = f"{flag} " if flag else ""
     header = (
-        f"🛍 <b>{html.escape(cat_name)}</b>\n"
-        f"<i>стр. {page + 1} из {total_pages} · всего {total}</i>"
+        f"{brand} {flag_part}<b>{html.escape(cat_name)}</b>\n"
+        f"<i>стр. {page + 1}/{total_pages} · всего {total}</i>"
     )
 
     rows: list[list[InlineKeyboardButton]] = []
     for svc in services:
         price = _format_rub_compact(svc.rub_price_kopecks)
-        label = f"{svc.service_name} — {price}"
-        if svc.in_stock < 5:
-            label = f"⚠ {label} (мало: {svc.in_stock})"
+        # Stock-маркер:
+        #   * 0     — отсеяно репозиторием (in_stock=0 не приходит сюда);
+        #   * 1..4  — ⚠ + точное число (низкий запас, юзер видит риск);
+        #   * 5..9  — без маркера (нормально, не отвлекаем);
+        #   * ≥10   — без маркера (тоже нормально).
+        if 0 < svc.in_stock < 5:
+            label = f"⚠ {svc.service_name} — {price} · {svc.in_stock} шт."
+        else:
+            label = f"{svc.service_name} — {price}"
         rows.append([InlineKeyboardButton(
             text=_truncate(label),
             callback_data=f"svc:{svc.ns_service_id}",
@@ -392,39 +479,106 @@ def service_card_keyboard(
     *,
     svc,
     group_slug: str | None,
+    similar: Sequence | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
     """
-    Карточка услуги с хлебными крошками и кнопкой «Купить» (если в наличии).
+    Карточка услуги с хлебными крошками, бэйджами, графическим stock-bar
+    и блоком «Похожее» (другие номиналы того же бренда).
+
+    Текст:
+      🍎 🇹🇷 Apple Gift Card | TR | 10 TRY
+      <i>🛍 → Apple Gift Card → Apple Gift Card | TR</i>
+
+      🚀 Мгновенная выдача · ⚡ В наличии · 🛡 Гарантия
+
+      💰 <b>Цена: 205,30 ₽</b>
+      🟢 В наличии (доступно: 100)
+      🟩🟩🟩🟩🟩
+
+      <i>Оплата с внутреннего баланса. Пополнить —
+      💰 Баланс → 🪙 CryptoBot (1 минута).</i>
+
+    Кнопки (если в наличии):
+      [ 💳 Купить за 205,30 ₽ ]
+      [ 🔄 Похожее: Apple TR 5 TRY · 102 ₽ ]    (similar[0])
+      [ 🔄 Похожее: Apple TR 25 TRY · 513 ₽ ]   (similar[1])
+      [ « К категории ]   [ 🏪 Каталог ]
+
+    Параметр similar: список ShopCatalogCache — другие услуги с тем же
+    base_name. None = «не передавали», блок не показываем. Пустой
+    список = «искали, но ничего больше нет».
     """
     price = _format_rub_full(svc.rub_price_kopecks)
-    in_stock = svc.in_stock > 0
-    stock_line = (
-        f"📦 В наличии: <b>{svc.in_stock}</b> шт."
-        if in_stock else "🚫 <b>Нет в наличии</b>"
-    )
+    in_stock_n = int(getattr(svc, "in_stock", 0) or 0)
+    in_stock = in_stock_n > 0
 
+    base_name = getattr(svc, "base_name", None) or svc.category_name
+    brand = brand_emoji(base_name or "")
+    flag = region_flag(svc.category_name or "")
+    flag_part = f"{flag} " if flag else ""
+
+    # Хлебные крошки: 🛍 → Brand → Category. Без дубля если category==base.
     crumbs = "🛍"
-    base_name = getattr(svc, "base_name", None)
     if base_name:
         crumbs += f" → {html.escape(base_name)}"
     if svc.category_name and svc.category_name != base_name:
         crumbs += f" → {html.escape(svc.category_name)}"
 
+    # Бэйджи (доверие + UX-сигналы). Показываем разные в зависимости
+    # от состояния:
+    #   - в наличии: 🚀 Мгновенная выдача + ⚡ В наличии + 🛡 Гарантия
+    #   - OOS: только 🛡 Гарантия (не врём про мгновенную выдачу)
+    if in_stock:
+        badges = "🚀 Мгновенная выдача · ⚡ В наличии · 🛡 Гарантия"
+    else:
+        badges = "🛡 Гарантия · ⏳ Ждём поставку"
+
+    # Stock-секция: текстовый статус + графический bar.
+    # Bar показываем только если есть наличие — для OOS будет визуально
+    # «пусто, серое» что плохо для морального духа покупателя.
+    stock_status = stock_status_text(in_stock_n)
+    if in_stock:
+        # cap=max(10, текущий запас) — чтобы bar не показывал «overflow»
+        # для крупных запасов (200 шт. → full bar, как и должно быть).
+        stock_visual = f"\n{stock_bar(in_stock_n, cap=max(10, in_stock_n))}"
+    else:
+        stock_visual = ""
+
     text = (
+        f"{brand} {flag_part}<b>{html.escape(svc.service_name)}</b>\n"
         f"<i>{crumbs}</i>\n\n"
-        f"🛒 <b>{html.escape(svc.service_name)}</b>\n\n"
-        f"💰 Цена: <b>{price}</b>\n"
-        f"{stock_line}\n\n"
-        "<i>Оплата откроется в ближайшие дни. "
-        "Пока изучи ассортимент и пригласи друзей по реф-ссылке "
-        "(👥 Рефералы) — получишь 1% с их покупок.</i>"
+        f"<i>{badges}</i>\n\n"
+        f"💰 <b>Цена: {price}</b>\n"
+        f"{stock_status}{stock_visual}\n\n"
+        "<i>Оплата с внутреннего баланса NeuroDrop. "
+        "Пополнить — 💰 Баланс → 🪙 CryptoBot (1 минута, "
+        "криптой USDT/TON/BTC).</i>"
     )
 
     rows: list[list[InlineKeyboardButton]] = []
     if in_stock:
+        # «Купить за X ₽» — цена прямо на кнопке. Это снижает frictiоn:
+        # юзер не возвращается к строке выше чтобы свериться с ценой.
         rows.append([InlineKeyboardButton(
-            text="💳 Купить", callback_data=f"buy:{svc.ns_service_id}",
+            text=f"💳 Купить за {_format_rub_compact(svc.rub_price_kopecks)}",
+            callback_data=f"buy:{svc.ns_service_id}",
         )])
+    # Блок «Похожее»: до 3 кнопок по 1 в ряд (короткие, информативные).
+    # Показываем ТОЛЬКО реально другие услуги — текущую исключает
+    # источник данных (см. list_similar_services в repo).
+    if similar:
+        for s in list(similar)[:3]:
+            s_id = getattr(s, "ns_service_id", None)
+            if s_id is None or s_id == svc.ns_service_id:
+                continue
+            s_flag = region_flag(getattr(s, "category_name", "") or "")
+            s_price = _format_rub_compact(getattr(s, "rub_price_kopecks", 0) or 0)
+            s_name = getattr(s, "service_name", "") or ""
+            s_prefix = f"{s_flag} " if s_flag else ""
+            rows.append([InlineKeyboardButton(
+                text=_truncate(f"🔄 {s_prefix}{s_name} · {s_price}"),
+                callback_data=f"svc:{s_id}",
+            )])
     cat_id = getattr(svc, "category_id", 0) or 0
     rows.append([
         InlineKeyboardButton(
@@ -628,10 +782,15 @@ def search_results_keyboard(
     rows: list[list[InlineKeyboardButton]] = []
     for svc in page_items:
         price = _format_rub_compact(svc.rub_price_kopecks)
-        cat_tail = ""
-        if getattr(svc, "category_name", None):
-            cat_tail = f" · {svc.category_name}"
-        label = f"{svc.service_name} — {price}{cat_tail}"
+        base = getattr(svc, "base_name", None) or ""
+        brand = brand_emoji(base) if base else ""
+        flag = region_flag(getattr(svc, "category_name", "") or "")
+        # Сборка: [brand] [flag] service_name — price.
+        # Category name в результатах поиска уже дублирует флаг/бренд,
+        # так что хвост убираем — кнопка чище.
+        prefix_parts = [p for p in (brand, flag) if p]
+        prefix = (" ".join(prefix_parts) + " ") if prefix_parts else ""
+        label = f"{prefix}{svc.service_name} — {price}"
         rows.append([InlineKeyboardButton(
             text=_truncate(label),
             callback_data=f"svc:{svc.ns_service_id}",

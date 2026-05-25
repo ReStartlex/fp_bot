@@ -129,14 +129,18 @@ async def test_catalog_shows_groups(db_setup):
     button_texts = [btn.text for row in markup.inline_keyboard for btn in row]
     # Spotify скрыт (OOS)
     assert not any("Spotify" in t for t in button_texts)
-    # Apple и Steam — две группы
+    # Apple и Steam — две группы. После Sprint 4 кнопки начинаются с
+    # brand-эмодзи (🍎 Apple…, 🎮 Steam…) и featured-бейджа (🔥/⭐/💎)
+    # для топ-3 — поэтому ищем «Apple» внутри текста, а не префиксом.
     apple_btn = next(
         btn for row in markup.inline_keyboard for btn in row
-        if btn.text.startswith("Apple")
+        if "Apple" in btn.text
     )
-    # У Apple одна категория, поэтому "вариантов" не упоминаем
+    # У Apple одна категория, поэтому «регион»/«вариант» не упоминаем
     assert "вариант" not in apple_btn.text.lower()
     assert "регион" not in apple_btn.text.lower()
+    # Brand-эмодзи 🍎 должен быть рядом с названием
+    assert "🍎" in apple_btn.text
     # Callback ведёт на drill-down группы
     assert apple_btn.callback_data.startswith("grp:")
 
@@ -162,7 +166,7 @@ async def test_catalog_with_regional_variants_groups_them(db_setup):
     markup = msg.answer.call_args.kwargs["reply_markup"]
     apple_btn = next(
         btn for row in markup.inline_keyboard for btn in row
-        if btn.text.startswith("Apple Gift Card")
+        if "Apple Gift Card" in btn.text
     )
     # 3 региональных category_id → должно появиться "3 региона"
     assert "3" in apple_btn.text
