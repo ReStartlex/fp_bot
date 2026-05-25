@@ -2,9 +2,11 @@
 Тесты shop/repo.py для catalog-функций:
 - upsert_catalog_service (insert + update);
 - enabled-флаг не перетирается upsert'ом (если оператор выключил услугу);
-- list_categories_for_ui: группировка, фильтр по in_stock>0 и enabled;
+- mark_services_unseen: in_stock=0 для исчезнувших, защита от mass-wipe;
 - list_services_in_category: pagination, sort by price asc;
 - get_catalog_service: возвращает None для disabled.
+
+Группировка по base_name тестируется отдельно в test_shop_catalog_groups.py.
 """
 from __future__ import annotations
 
@@ -15,7 +17,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from src.db.models import Base, ShopCatalogCache
 from src.shop.repo import (
     get_catalog_service,
-    list_categories_for_ui,
     list_services_in_category,
     mark_services_unseen,
     upsert_catalog_service,
@@ -142,57 +143,6 @@ async def test_mark_unseen_empty_seen_does_not_wipe(factory):
         assert marked == 0
         rows = (await s.execute(select(ShopCatalogCache))).scalars().all()
         assert all(r.in_stock == 10 for r in rows)
-
-
-# ─── list_categories_for_ui ─────────────────────────────────────────
-
-
-async def test_list_categories_groups_and_filters(factory):
-    async with factory() as s:
-        # Apple: 2 in-stock, 1 oos
-        await upsert_catalog_service(
-            s, ns_service_id=1, category_id=10, category_name="Apple",
-            service_name="A1", ns_price_usd=5.0, rub_price_kopecks=50000,
-            in_stock=100, fields_json=None,
-        )
-        await upsert_catalog_service(
-            s, ns_service_id=2, category_id=10, category_name="Apple",
-            service_name="A2", ns_price_usd=10.0, rub_price_kopecks=80000,
-            in_stock=50, fields_json=None,
-        )
-        oos_row = await upsert_catalog_service(
-            s, ns_service_id=3, category_id=10, category_name="Apple",
-            service_name="A3", ns_price_usd=15.0, rub_price_kopecks=120000,
-            in_stock=0, fields_json=None,  # OOS — не должен попасть
-        )
-        # Steam: 1 in-stock, 1 disabled
-        await upsert_catalog_service(
-            s, ns_service_id=4, category_id=20, category_name="Steam",
-            service_name="St1", ns_price_usd=20.0, rub_price_kopecks=150000,
-            in_stock=10, fields_json=None,
-        )
-        disabled_row = await upsert_catalog_service(
-            s, ns_service_id=5, category_id=20, category_name="Steam",
-            service_name="St2", ns_price_usd=25.0, rub_price_kopecks=180000,
-            in_stock=10, fields_json=None,
-        )
-        disabled_row.enabled = False
-        # Spotify: вообще все OOS — категория не должна попасть
-        await upsert_catalog_service(
-            s, ns_service_id=6, category_id=30, category_name="Spotify",
-            service_name="Sp1", ns_price_usd=5.0, rub_price_kopecks=40000,
-            in_stock=0, fields_json=None,
-        )
-        await s.commit()
-
-        cats = await list_categories_for_ui(s)
-        names = [c.category_name for c in cats]
-        assert names == ["Apple", "Steam"]  # отсортировано по имени
-        apple = next(c for c in cats if c.category_name == "Apple")
-        assert apple.services_count == 2  # OOS не считается
-        assert apple.cheapest_price_kopecks == 50000
-        steam = next(c for c in cats if c.category_name == "Steam")
-        assert steam.services_count == 1  # disabled не считается
 
 
 # ─── list_services_in_category ──────────────────────────────────────

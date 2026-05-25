@@ -417,6 +417,15 @@ class ShopCatalogCache(Base):
     category_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     service_name: Mapped[str] = mapped_column(String(255), nullable=False)
 
+    # «Базовое» имя категории — то, что до первого `|`. Используется для
+    # группировки региональных/платформенных вариантов в UI:
+    # «Apple Gift Card | US», «Apple Gift Card | EU» → одна группа.
+    # См. src/shop/taxonomy.py.
+    base_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Стабильный 10-символьный hash от base_name. Используется как ключ
+    # в Telegram callback_data (sha1[:10], коллизия маловероятна).
+    group_slug: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+
     ns_price_usd: Mapped[float] = mapped_column(Float, nullable=False)
     rub_price_kopecks: Mapped[int] = mapped_column(Integer, nullable=False)
     in_stock: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

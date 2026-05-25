@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Iterable, Optional
 
 from loguru import logger
-from sqlalchemy import func, select, update as sa_update
+from sqlalchemy import func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import (
@@ -198,11 +198,26 @@ async def get_user_by_tg(
 
 @dataclass(frozen=True)
 class CategoryGroup:
-    """Категория, агрегированная из shop_catalog_cache для UI."""
+    """
+    Группа NS-категорий, агрегированная по base_name (см. taxonomy.py).
+    Используется на верхнем уровне UI каталога: «Apple Gift Card · 3 региона · от 396 ₽».
+    """
+    group_slug: str
+    base_name: str
+    # Сколько РАЗНЫХ NS-категорий внутри (региональные/платформенные варианты).
+    variants_count: int
+    # Сколько сервисов с in_stock>0 в этой группе суммарно.
+    services_count: int
+    cheapest_price_kopecks: int
+
+
+@dataclass(frozen=True)
+class CategoryInGroup:
+    """Одна региональная/платформенная категория внутри группы (drill-down)."""
     category_id: int
     category_name: str
-    services_count: int  # сколько активных сервисов с in_stock > 0
-    cheapest_price_kopecks: int  # минимальная цена для preview
+    services_count: int
+    cheapest_price_kopecks: int
 
 
 async def upsert_catalog_service(
@@ -216,6 +231,8 @@ async def upsert_catalog_service(
     rub_price_kopecks: int,
     in_stock: int,
     fields_json: str | None,
+    base_name: str | None = None,
+    group_slug: str | None = None,
 ) -> ShopCatalogCache:
     """
     Идемпотентный upsert одного service'а в каталог. enabled НЕ меняется
@@ -234,6 +251,8 @@ async def upsert_catalog_service(
             category_id=category_id,
             category_name=category_name,
             service_name=service_name,
+            base_name=base_name,
+            group_slug=group_slug,
             ns_price_usd=ns_price_usd,
             rub_price_kopecks=rub_price_kopecks,
             in_stock=in_stock,
@@ -245,6 +264,8 @@ async def upsert_catalog_service(
         row.category_id = category_id
         row.category_name = category_name
         row.service_name = service_name
+        row.base_name = base_name
+        row.group_slug = group_slug
         row.ns_price_usd = ns_price_usd
         row.rub_price_kopecks = rub_price_kopecks
         row.in_stock = in_stock
@@ -296,13 +317,59 @@ async def mark_services_unseen(
     return len(stale)
 
 
-async def list_categories_for_ui(session: AsyncSession) -> list[CategoryGroup]:
+async def list_category_groups_for_ui(
+    session: AsyncSession,
+) -> list[CategoryGroup]:
     """
-    Группировка для UI-уровня /catalog: список категорий с числом
-    активных (enabled=True И in_stock>0) сервисов и самой дешёвой ценой.
+    Группировка по `base_name` (см. taxonomy.py). Все региональные/платформенные
+    варианты одной игры сворачиваются в одну строку UI.
 
-    Категории без активных сервисов в выдачу не попадают (нет смысла
-    показывать пустую).
+    Например: «Apple Gift Card | US», «Apple Gift Card | EU», «Apple Gift Card | UK»
+    превратятся в одну группу «Apple Gift Card · 3 варианта · от 1 083 ₽».
+
+    Категории без активных сервисов в выдачу не попадают.
+    """
+    stmt = (
+        select(
+            ShopCatalogCache.group_slug,
+            func.min(ShopCatalogCache.base_name).label("base_name"),
+            func.count(func.distinct(ShopCatalogCache.category_id)).label("variants"),
+            func.count(ShopCatalogCache.ns_service_id).label("services"),
+            func.min(ShopCatalogCache.rub_price_kopecks).label("cheapest"),
+        )
+        .where(
+            ShopCatalogCache.enabled.is_(True),
+            ShopCatalogCache.in_stock > 0,
+            # Legacy fallback: записи, для которых catalog_sync ещё не
+            # проставил group_slug, не попадают сюда; будут видны после
+            # следующего sync'а (≤90 с). Это безопаснее, чем «пропихивать»
+            # их в неструктурированный bucket.
+            ShopCatalogCache.group_slug.is_not(None),
+        )
+        .group_by(ShopCatalogCache.group_slug)
+        .order_by(func.lower(func.min(ShopCatalogCache.base_name)))
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        CategoryGroup(
+            group_slug=slug,
+            base_name=bname or "Без категории",
+            variants_count=variants,
+            services_count=services,
+            cheapest_price_kopecks=cheapest or 0,
+        )
+        for slug, bname, variants, services, cheapest in rows
+    ]
+
+
+async def list_categories_in_group(
+    session: AsyncSession, *, group_slug: str
+) -> list[CategoryInGroup]:
+    """
+    Drill-down: внутри группы (по group_slug) показать все её
+    NS-категории — это региональные/платформенные варианты.
+
+    Сортировка по category_name алфавитно (ASIA / CIS / EU / US / ...).
     """
     stmt = (
         select(
@@ -314,13 +381,14 @@ async def list_categories_for_ui(session: AsyncSession) -> list[CategoryGroup]:
         .where(
             ShopCatalogCache.enabled.is_(True),
             ShopCatalogCache.in_stock > 0,
+            ShopCatalogCache.group_slug == group_slug,
         )
         .group_by(ShopCatalogCache.category_id, ShopCatalogCache.category_name)
         .order_by(ShopCatalogCache.category_name)
     )
     rows = (await session.execute(stmt)).all()
     return [
-        CategoryGroup(
+        CategoryInGroup(
             category_id=cid if cid is not None else 0,
             category_name=cname or "Без категории",
             services_count=cnt,
@@ -328,6 +396,42 @@ async def list_categories_for_ui(session: AsyncSession) -> list[CategoryGroup]:
         )
         for cid, cname, cnt, cheapest in rows
     ]
+
+
+async def search_services(
+    session: AsyncSession,
+    *,
+    query: str,
+    limit: int = 50,
+) -> list[ShopCatalogCache]:
+    """
+    Поиск по shop-каталогу: LIKE по service_name и base_name (case-insensitive).
+    Возвращает услуги отсортированные по цене.
+
+    query: подстрока, минимум 2 символа после strip. Короче — пустой результат
+    (избегаем выдачи «всех 5000 услуг» на пустую строку или 1 букву).
+    """
+    q = (query or "").strip().lower()
+    if len(q) < 2:
+        return []
+    pattern = f"%{q}%"
+    stmt = (
+        select(ShopCatalogCache)
+        .where(
+            ShopCatalogCache.enabled.is_(True),
+            ShopCatalogCache.in_stock > 0,
+            or_(
+                func.lower(ShopCatalogCache.service_name).like(pattern),
+                func.lower(ShopCatalogCache.base_name).like(pattern),
+            ),
+        )
+        .order_by(
+            ShopCatalogCache.rub_price_kopecks.asc(),
+            ShopCatalogCache.service_name.asc(),
+        )
+        .limit(limit)
+    )
+    return list((await session.execute(stmt)).scalars().all())
 
 
 async def list_services_in_category(

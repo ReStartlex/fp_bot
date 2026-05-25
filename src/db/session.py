@@ -115,6 +115,53 @@ def _migrate_sqlite_schema(sync_conn) -> None:
                 text("ALTER TABLE chat_states ADD COLUMN manual_messages_count INTEGER DEFAULT 0")
             )
             logger.info("init_db: добавлена колонка chat_states.manual_messages_count")
+    if "shop_catalog_cache" in tables:
+        # Phase 1 Sprint 2.1: группировка категорий по «базовому имени»
+        # (см. src/shop/taxonomy.py).
+        columns = {col["name"] for col in inspector.get_columns("shop_catalog_cache")}
+        added = False
+        if "base_name" not in columns:
+            sync_conn.execute(
+                text("ALTER TABLE shop_catalog_cache ADD COLUMN base_name VARCHAR(255)")
+            )
+            logger.info("init_db: добавлена колонка shop_catalog_cache.base_name")
+            added = True
+        if "group_slug" not in columns:
+            sync_conn.execute(
+                text("ALTER TABLE shop_catalog_cache ADD COLUMN group_slug VARCHAR(16)")
+            )
+            logger.info("init_db: добавлена колонка shop_catalog_cache.group_slug")
+            added = True
+        # Backfill: заполняем base_name/group_slug для существующих записей,
+        # чтобы /catalog сразу после деплоя показывал группы (а не ждал 90с
+        # следующего catalog_sync'а). Делаем поштучно — записей ≤ нескольких
+        # сотен, это секунда.
+        if added:
+            # Импорт здесь, а не наверху файла, чтобы не вводить циклическую
+            # зависимость src.shop → src.db → src.shop.
+            from src.shop.taxonomy import make_group_slug, parse_category_name
+
+            rows = sync_conn.execute(text(
+                "SELECT ns_service_id, category_name FROM shop_catalog_cache "
+                "WHERE group_slug IS NULL"
+            )).fetchall()
+            for ns_service_id, category_name in rows:
+                base_name, _ = parse_category_name(category_name or "")
+                if not base_name:
+                    base_name = f"Без названия #{ns_service_id}"
+                slug = make_group_slug(base_name)
+                sync_conn.execute(
+                    text(
+                        "UPDATE shop_catalog_cache "
+                        "SET base_name = :bn, group_slug = :gs "
+                        "WHERE ns_service_id = :sid"
+                    ),
+                    {"bn": base_name, "gs": slug, "sid": ns_service_id},
+                )
+            if rows:
+                logger.info(
+                    f"init_db: backfill base_name/group_slug для {len(rows)} услуг"
+                )
 
 
 async def close_db() -> None:

@@ -1,80 +1,120 @@
 """
 Telegram-бот для покупателей (отдельный от owner-бота из src/alerts/bot.py).
 
-Архитектурно идентичен `TelegramBot` из alerts/bot.py:
-    - aiogram 3.x, long-polling
-    - lifecycle start/stop
-    - все handler'ы как методы класса
-Но это — public-bot, авторизация по telegram_user_id (любой человек).
+Архитектура (Sprint 2.2 — Pro UX):
+  - aiogram 3, long-polling, MemoryStorage FSM
+  - persistent reply-меню как primary navigation (юзер не печатает команды,
+    а тапает кнопки 🛍 Каталог / 🔍 Поиск / 💰 Баланс / 📦 Заказы / 👥 Рефералы / 🆘 Поддержка)
+  - inline-keyboard внутри сообщений с пагинацией и хлебными крошками
+  - FSM-flow поиска: тап → бот спрашивает фразу → выдаёт результаты
+  - inline-query: `@bot apple` в любом чате — нативные подсказки Telegram
+  - rate-limit на FSM-search (защита от brute-force)
 
-В этом файле — только skeleton Спринта 1:
-    /start [ref_N]  — регистрация + парсинг реф-ссылки
-    /help           — короткая справка
-    /balance        — показать внутренний баланс
-    /ref            — выдать персональную реф-ссылку
-Каталог, оплата, заказы — будут в следующих спринтах.
+Все клавиатуры/тексты — в src/shop/keyboards.py (pure-функции, тестируются
+отдельно). Этот файл отвечает только за aiogram-маршрутизацию.
+
+Не запускается если shop_enabled=False или shop_telegram_bot_token не задан —
+silently no-op (можно деплоить код в прод без токена и включать тумблером в .env).
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
+import time
+from types import SimpleNamespace
 from typing import Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     Message,
 )
 from loguru import logger
 
+from src.alerts.sessions import PaginationStore
 from src.config import Settings, get_settings
 from src.db.session import session_factory
+from src.shop.keyboards import (
+    BTN_BALANCE,
+    BTN_CANCEL,
+    BTN_CATALOG,
+    BTN_ORDERS,
+    BTN_REF,
+    BTN_SEARCH,
+    BTN_SUPPORT,
+    CATALOG_GROUPS_PAGE_SIZE,
+    SERVICES_PAGE_SIZE,
+    cancel_keyboard,
+    catalog_groups_keyboard,
+    main_menu_keyboard,
+    search_results_keyboard,
+    service_card_keyboard,
+    services_page_keyboard,
+    variants_grid_keyboard,
+)
 from src.shop.repo import (
     apply_balance_change,
     attach_referral,
     get_catalog_service,
     get_or_create_user,
-    list_categories_for_ui,
+    list_categories_in_group,
+    list_category_groups_for_ui,
     list_services_in_category,
     parse_referral_payload,
+    search_services,
 )
+from src.shop.states import SearchState
 
 
-CATALOG_PAGE_SIZE = 8
+# Сколько результатов поиска отдаём максимум (в FSM и inline-query).
+SEARCH_MAX_RESULTS = 50
+
+# Минимум между двумя последовательными /search от одного user'а (anti-spam).
+SEARCH_RATE_LIMIT_SECONDS = 1.0
 
 
-# Алерт-callback в owner-бота при первом старте бота, новой регистрации и т.п.
-# (опциональный — если None, просто логируем).
+# Алерт-callback в owner-бота — для уведомлений о новых юзерах и пр.
 OwnerNotify = Callable[[str], Awaitable[None]]
 
 
 HELP_TEXT = (
     "🛒 <b>Магазин подарочных карт</b>\n\n"
-    "<b>Доступные команды</b>\n"
-    "/start — начать пользоваться ботом\n"
-    "/catalog — каталог товаров (скоро)\n"
-    "/balance — мой внутренний баланс\n"
-    "/ref — моя реферальная ссылка (1% кэшбэка с покупок друзей)\n"
-    "/orders — мои заказы (скоро)\n"
-    "/support — связаться с оператором (скоро)\n"
-    "/help — это сообщение\n\n"
-    "💡 <i>Магазин в режиме раннего доступа: оплата и каталог "
-    "включатся в ближайшие дни.</i>"
+    "Внизу — постоянное меню с разделами:\n"
+    "• 🛍 <b>Каталог</b> — все товары по категориям\n"
+    "• 🔍 <b>Поиск</b> — найти товар по названию\n"
+    "• 💰 <b>Баланс</b> — твой внутренний баланс (кэшбэк от рефералов)\n"
+    "• 📦 <b>Заказы</b> — история покупок\n"
+    "• 👥 <b>Рефералы</b> — реф-ссылка, 1% с покупок друзей\n"
+    "• 🆘 <b>Поддержка</b> — связаться с оператором\n\n"
+    "<b>Команды</b>\n"
+    "/start — главное меню\n"
+    "/catalog — каталог\n"
+    "/search <i>&lt;слово&gt;</i> — быстрый поиск\n"
+    "/help — эта справка\n\n"
+    "💎 <b>Inline-поиск:</b> в любом чате набери "
+    "<code>@USERNAME слово</code> — увидишь подсказки прямо в Telegram "
+    "(где <code>USERNAME</code> — имя этого бота).\n\n"
+    "💡 <i>Магазин в режиме раннего доступа: оплата подключается в ближайшие дни.</i>"
 )
 
 
 def format_rub(kopecks: int) -> str:
-    """1234500 копеек → '12 345 ₽' для отображения."""
+    """1234500 копеек → '12 345 ₽' (полный формат с копейками)."""
     rub_int = kopecks // 100
     rub_frac = kopecks % 100
-    # Группируем тысячи неразрывным пробелом для красивого отображения.
     groups = []
     s = str(rub_int)
     while s:
@@ -86,19 +126,26 @@ def format_rub(kopecks: int) -> str:
     return f"{integer_part}\u00a0₽"
 
 
+def format_rub_compact(kopecks: int) -> str:
+    """Компактный формат: округление до рубля. Для inline-кнопок и preview."""
+    rub_int = (kopecks + 50) // 100
+    groups = []
+    s = str(rub_int)
+    while s:
+        groups.append(s[-3:])
+        s = s[:-3]
+    return "\u00a0".join(reversed(groups)) + "\u00a0₽"
+
+
 class ShopBot:
     """
     Покупательский Telegram-бот для shop-витрины.
 
     Контракт жизненного цикла:
         bot = ShopBot(settings)
-        await bot.start()      # neблокирует, запускает polling в task
+        await bot.start()      # не блокирует, запускает polling в task
         ...
         await bot.stop()       # graceful shutdown
-
-    Не запускается если shop_enabled=False или shop_telegram_bot_token не задан —
-    silently no-op (это позволяет деплоить код в прод без shop-токена и
-    включать shop тумблером в .env).
     """
 
     def __init__(
@@ -113,6 +160,10 @@ class ShopBot:
         self._dp: Dispatcher | None = None
         self._task: asyncio.Task | None = None
         self._username: str | None = None
+        # Кэш результатов поиска: callback_data не вмещает запрос целиком.
+        self._search_sessions: PaginationStore = PaginationStore()
+        # Rate-limit для FSM-поиска: tg_user_id → timestamp последнего search.
+        self._search_last_at: dict[int, float] = {}
 
     @property
     def enabled(self) -> bool:
@@ -121,7 +172,7 @@ class ShopBot:
 
     @property
     def username(self) -> str | None:
-        """@username бота для построения реф-ссылок. None пока не стартовал."""
+        """@username бота для реф-ссылок. None пока не стартовал."""
         return self._username
 
     # ─────────────── lifecycle ───────────────
@@ -138,7 +189,9 @@ class ShopBot:
             token=token,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
-        self._dp = Dispatcher()
+        # MemoryStorage хватит для MVP; для горизонтального масштабирования
+        # подменить на RedisStorage без изменений в handler'ах.
+        self._dp = Dispatcher(storage=MemoryStorage())
         self._register_handlers()
 
         try:
@@ -194,8 +247,9 @@ class ShopBot:
         if self._bot is None:
             return
         await self._bot.set_my_commands([
-            BotCommand(command="start", description="Начать"),
+            BotCommand(command="start", description="Главное меню"),
             BotCommand(command="catalog", description="Каталог товаров"),
+            BotCommand(command="search", description="Поиск по магазину"),
             BotCommand(command="balance", description="Мой баланс"),
             BotCommand(command="ref", description="Реф-ссылка"),
             BotCommand(command="orders", description="Мои заказы"),
@@ -203,42 +257,79 @@ class ShopBot:
             BotCommand(command="help", description="Справка"),
         ])
 
-    # ─────────────── handlers ───────────────
+    # ─────────────── handler registration ────
 
     def _register_handlers(self) -> None:
         assert self._dp is not None
-        self._dp.message.register(self._on_start, CommandStart())
-        self._dp.message.register(self._on_help, Command("help"))
-        self._dp.message.register(self._on_balance, Command("balance"))
-        self._dp.message.register(self._on_ref, Command("ref"))
-        self._dp.message.register(self._on_catalog, Command("catalog"))
-        self._dp.message.register(self._on_orders_stub, Command("orders"))
-        self._dp.message.register(self._on_support_stub, Command("support"))
+        dp = self._dp
 
-        # Callback'и для inline-навигации каталога.
-        # cat:{cid}:{page}  — показать сервисы категории cid, страница page
-        # svc:{sid}         — карточка сервиса sid
-        # cats              — назад в список категорий
-        # buy:{sid}         — заглушка покупки (откроется в Sprint 3)
-        # close             — закрыть/удалить сообщение
-        self._dp.callback_query.register(self._on_cb_cats, F.data == "cats")
-        self._dp.callback_query.register(self._on_cb_close, F.data == "close")
-        self._dp.callback_query.register(
-            self._on_cb_category, F.data.startswith("cat:")
+        # Команды (slash). Главное меню всегда висит — это для гиков/легаси.
+        dp.message.register(self._on_start, CommandStart())
+        dp.message.register(self._on_help, Command("help"))
+        dp.message.register(self._on_catalog_cmd, Command("catalog"))
+        dp.message.register(self._on_search_cmd, Command("search"))
+        dp.message.register(self._on_balance_cmd, Command("balance"))
+        dp.message.register(self._on_ref_cmd, Command("ref"))
+        dp.message.register(self._on_orders_cmd, Command("orders"))
+        dp.message.register(self._on_support_cmd, Command("support"))
+        dp.message.register(
+            self._on_cancel_cmd, Command("cancel"), StateFilter("*"),
         )
-        self._dp.callback_query.register(
-            self._on_cb_service, F.data.startswith("svc:")
+
+        # FSM: пользователь в состоянии «жду слово для поиска» — его сообщения
+        # должны идти ИМЕННО сюда, обходя reply-button matchers ниже.
+        dp.message.register(
+            self._on_search_query, StateFilter(SearchState.waiting_for_query),
         )
-        self._dp.callback_query.register(
-            self._on_cb_buy_stub, F.data.startswith("buy:")
+
+        # Reply-buttons из главного меню (matches по точному тексту).
+        # Регистрируем ПОСЛЕ FSM-хендлера, чтобы FSM выигрывал по приоритету.
+        dp.message.register(self._on_catalog_cmd, F.text == BTN_CATALOG)
+        dp.message.register(self._on_search_btn, F.text == BTN_SEARCH)
+        dp.message.register(self._on_balance_cmd, F.text == BTN_BALANCE)
+        dp.message.register(self._on_orders_cmd, F.text == BTN_ORDERS)
+        dp.message.register(self._on_ref_cmd, F.text == BTN_REF)
+        dp.message.register(self._on_support_cmd, F.text == BTN_SUPPORT)
+        dp.message.register(self._on_cancel_cmd, F.text == BTN_CANCEL)
+
+        # Callback'и для inline-навигации. Префикс → handler.
+        # Порядок важен: более специфичные F.data == "x" регистрируем
+        # ПЕРЕД startswith("x:"), иначе они никогда не сработают.
+        dp.callback_query.register(self._on_cb_close, F.data == "close")
+        dp.callback_query.register(self._on_cb_noop, F.data == "noop")
+        dp.callback_query.register(
+            self._on_cb_search_prompt, F.data == "search_prompt",
         )
+        dp.callback_query.register(
+            self._on_cb_cats, F.data.startswith("cats:"),
+        )
+        dp.callback_query.register(
+            self._on_cb_group, F.data.startswith("grp:"),
+        )
+        dp.callback_query.register(
+            self._on_cb_category, F.data.startswith("cat:"),
+        )
+        dp.callback_query.register(
+            self._on_cb_service, F.data.startswith("svc:"),
+        )
+        dp.callback_query.register(
+            self._on_cb_buy_stub, F.data.startswith("buy:"),
+        )
+        dp.callback_query.register(
+            self._on_cb_search_page, F.data.startswith("srh:"),
+        )
+
+        # Inline-mode: @bot слово → нативные подсказки Telegram.
+        dp.inline_query.register(self._on_inline_query)
+
+    # ─────────────── /start ───────────────
 
     async def _on_start(self, message: Message, command: CommandObject) -> None:
         from_user = message.from_user
         if from_user is None:
             return
 
-        # Парсим deep-link payload: /start ref_42 или /start 42
+        # Парсим deep-link payload: /start ref_42 или /start 42.
         ref_user_id = parse_referral_payload(command.args)
 
         async with session_factory()() as session:
@@ -259,7 +350,6 @@ class ShopBot:
                 ref_attached = ref is not None
             await session.commit()
 
-        # Алерт в owner-бота: новая регистрация (не спамим репитами).
         if is_new and self._owner_notify is not None:
             try:
                 username_disp = (
@@ -280,29 +370,402 @@ class ShopBot:
         greeting_lines = [
             f"👋 Привет, <b>{html.escape(from_user.first_name or 'друг')}</b>!",
             "",
-            "Это магазин подарочных карт (Apple, Steam, Spotify и другие).",
+            "🛒 <b>Магазин подарочных карт</b>",
+            "Apple, Steam, Google Play, EA, Nintendo и ещё сотни товаров.",
         ]
         if ref_attached:
             greeting_lines.append(
-                "🎁 Ты пришёл по реферальной ссылке — друг будет получать 1% "
-                "с каждой твоей покупки на свой внутренний баланс."
+                "\n🎁 Ты пришёл по реферальной ссылке — друг будет получать "
+                "<b>1%</b> с каждой твоей покупки на свой баланс."
             )
         greeting_lines.extend([
             "",
-            "<b>Что умеет бот</b>",
-            "• <b>/catalog</b> — посмотреть товары",
-            "• <b>/balance</b> — внутренний баланс (кэшбэк за рефералов)",
-            "• <b>/ref</b> — твоя реф-ссылка",
-            "• <b>/help</b> — все команды",
+            "✨ <b>Что нового:</b>",
+            "• Удобный каталог с поиском",
+            "• Прозрачные цены и копейки",
+            "• Реферальная программа и кэшбэк",
+            "• Поддержка 24/7",
             "",
-            "💡 <i>Магазин в режиме раннего доступа. Каталог и оплата откроются в ближайшие дни.</i>",
+            "👇 <i>Используй меню внизу, чтобы навигировать.</i>",
         ])
-        await message.answer("\n".join(greeting_lines))
+        await message.answer(
+            "\n".join(greeting_lines),
+            reply_markup=main_menu_keyboard(),
+        )
 
     async def _on_help(self, message: Message) -> None:
-        await message.answer(HELP_TEXT)
+        await message.answer(HELP_TEXT, reply_markup=main_menu_keyboard())
 
-    async def _on_balance(self, message: Message) -> None:
+    # ─────────────── catalog ───────────────
+
+    async def _on_catalog_cmd(self, message: Message, state: FSMContext) -> None:
+        """Команда /catalog или reply-кнопка 🛍 Каталог."""
+        await state.clear()
+        async with session_factory()() as session:
+            groups = await list_category_groups_for_ui(session)
+        text, markup = catalog_groups_keyboard(groups=groups, page=0)
+        await message.answer(text, reply_markup=markup)
+
+    async def _on_cb_cats(self, cb: CallbackQuery) -> None:
+        """cats:{page} — обновить экран каталога с пагинацией."""
+        page = self._parse_int_or(cb.data, idx=1, default=0)
+        async with session_factory()() as session:
+            groups = await list_category_groups_for_ui(session)
+        text, markup = catalog_groups_keyboard(groups=groups, page=page)
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    async def _on_cb_group(self, cb: CallbackQuery) -> None:
+        """grp:{slug} — drill-down в группу. Если 1 вариант — сразу к услугам."""
+        parts = (cb.data or "").split(":")
+        if len(parts) < 2:
+            await cb.answer()
+            return
+        slug = parts[1]
+        async with session_factory()() as session:
+            variants = await list_categories_in_group(session, group_slug=slug)
+        if not variants:
+            await cb.answer("Группа пуста или временно недоступна", show_alert=True)
+            return
+        if len(variants) == 1:
+            await self._show_services_for_cb(
+                cb, category_id=variants[0].category_id, page=0,
+                group_slug=slug,
+            )
+            return
+        # base_name берём из репозитория категории (parse_category_name).
+        first_name = variants[0].category_name
+        base = first_name.split("|", 1)[0].strip() if "|" in first_name else first_name
+        text, markup = variants_grid_keyboard(variants=variants, base_name=base)
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    async def _on_cb_category(self, cb: CallbackQuery) -> None:
+        """cat:{cid}:{page} — список услуг внутри NS-категории."""
+        parts = (cb.data or "").split(":")
+        if len(parts) < 2:
+            await cb.answer()
+            return
+        try:
+            cid = int(parts[1])
+            page = int(parts[2]) if len(parts) >= 3 else 0
+        except ValueError:
+            await cb.answer("Битая ссылка")
+            return
+        # Выясняем group_slug этой категории для кнопки «назад к группе».
+        async with session_factory()() as session:
+            services_for_meta, _ = await list_services_in_category(
+                session, category_id=cid, limit=1, offset=0,
+            )
+        group_slug = (
+            services_for_meta[0].group_slug if services_for_meta else None
+        )
+        await self._show_services_for_cb(
+            cb, category_id=cid, page=page, group_slug=group_slug,
+        )
+
+    async def _show_services_for_cb(
+        self,
+        cb: CallbackQuery,
+        *,
+        category_id: int,
+        page: int,
+        group_slug: str | None,
+    ) -> None:
+        offset = max(0, page) * SERVICES_PAGE_SIZE
+        async with session_factory()() as session:
+            rows, total = await list_services_in_category(
+                session,
+                category_id=category_id,
+                limit=SERVICES_PAGE_SIZE,
+                offset=offset,
+            )
+        text, markup = services_page_keyboard(
+            services=rows, total=total,
+            category_id=category_id, page=page,
+            group_slug=group_slug,
+        )
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    async def _on_cb_service(self, cb: CallbackQuery) -> None:
+        """svc:{sid} — карточка услуги."""
+        parts = (cb.data or "").split(":")
+        if len(parts) < 2:
+            await cb.answer()
+            return
+        try:
+            sid = int(parts[1])
+        except ValueError:
+            await cb.answer("Битая ссылка")
+            return
+        async with session_factory()() as session:
+            svc = await get_catalog_service(session, ns_service_id=sid)
+        if svc is None:
+            await cb.answer("Товар временно недоступен", show_alert=True)
+            return
+        group_slug = getattr(svc, "group_slug", None)
+        text, markup = service_card_keyboard(svc=svc, group_slug=group_slug)
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    async def _on_cb_buy_stub(self, cb: CallbackQuery) -> None:
+        """Покупка появится в Sprint 3 (CryptoBot)."""
+        await cb.answer(
+            "💳 Оплата подключается в ближайшие дни. Скоро откроем!",
+            show_alert=True,
+        )
+
+    async def _on_cb_close(self, cb: CallbackQuery) -> None:
+        try:
+            if cb.message is not None:
+                await cb.message.delete()
+        except Exception:
+            pass
+        await cb.answer()
+
+    async def _on_cb_noop(self, cb: CallbackQuery) -> None:
+        await cb.answer()
+
+    # ─────────────── search ───────────────
+
+    async def _on_cb_search_prompt(self, cb: CallbackQuery) -> None:
+        """Кнопка «🔍 Поиск» в каталоге — открывает FSM-flow."""
+        await cb.answer()
+        if cb.message is None or cb.from_user is None:
+            return
+        # Откроем поиск в новом сообщении, чтобы оставить экран каталога.
+        await self._enter_search_state(
+            chat_id=cb.message.chat.id, user_id=cb.from_user.id,
+        )
+
+    async def _on_search_btn(self, message: Message, state: FSMContext) -> None:
+        """Reply-кнопка 🔍 Поиск в главном меню."""
+        if message.from_user is None:
+            return
+        await self._enter_search_state_for_message(message, state)
+
+    async def _on_search_cmd(
+        self, message: Message, command: CommandObject, state: FSMContext,
+    ) -> None:
+        """
+        /search [запрос]:
+        - /search apple → сразу показать результаты (для гиков и deep-links);
+        - /search → войти в FSM (для обычных юзеров).
+        """
+        query = (command.args or "").strip()
+        if query:
+            await state.clear()
+            await self._do_search_and_reply(message, query=query)
+            return
+        await self._enter_search_state_for_message(message, state)
+
+    async def _enter_search_state_for_message(
+        self, message: Message, state: FSMContext
+    ) -> None:
+        if message.from_user is None:
+            return
+        await state.set_state(SearchState.waiting_for_query)
+        await message.answer(
+            "🔍 <b>Поиск по магазину</b>\n\n"
+            "Напиши слово или фразу — найду подходящие товары.\n"
+            "Например: <code>apple</code>, <code>ea sports</code>, <code>steam</code>.\n\n"
+            "<i>Чтобы выйти — нажми «Отмена».</i>",
+            reply_markup=cancel_keyboard(),
+        )
+
+    async def _enter_search_state(self, *, chat_id: int, user_id: int) -> None:
+        """Альтернативный вход в FSM из callback'а (без объекта Message FSM-юзера)."""
+        assert self._bot is not None and self._dp is not None
+        # Aiogram FSM key: (bot_id, chat_id, user_id).
+        from aiogram.fsm.storage.base import StorageKey
+        key = StorageKey(
+            bot_id=self._bot.id, chat_id=chat_id, user_id=user_id,
+        )
+        await self._dp.storage.set_state(key, SearchState.waiting_for_query)
+        await self._bot.send_message(
+            chat_id,
+            "🔍 <b>Поиск по магазину</b>\n\n"
+            "Напиши слово или фразу — найду подходящие товары.\n\n"
+            "<i>Чтобы выйти — нажми «Отмена».</i>",
+            reply_markup=cancel_keyboard(),
+        )
+
+    async def _on_search_query(
+        self, message: Message, state: FSMContext,
+    ) -> None:
+        """Пользователь в SearchState.waiting_for_query пишет текст."""
+        if message.from_user is None:
+            return
+        # Кнопка «Отмена» в reply-keyboard приходит как обычный текст
+        # и должна была быть обработана раньше matcher'ом BTN_CANCEL,
+        # но FSM-хендлер регистрируется первым → проверим явно.
+        if message.text and message.text.strip() == BTN_CANCEL:
+            await self._on_cancel_cmd(message, state)
+            return
+
+        # Rate-limit: 1 поиск/сек на user_id.
+        now = time.monotonic()
+        last = self._search_last_at.get(message.from_user.id, 0.0)
+        if now - last < SEARCH_RATE_LIMIT_SECONDS:
+            await message.answer("⏳ Слишком быстро — подожди секунду.")
+            return
+        self._search_last_at[message.from_user.id] = now
+
+        query = (message.text or "").strip()
+        if len(query) < 2:
+            await message.answer(
+                "Слишком короткий запрос — введи минимум 2 символа.",
+            )
+            return
+
+        await state.clear()
+        await self._do_search_and_reply(message, query=query)
+
+    async def _do_search_and_reply(self, message: Message, *, query: str) -> None:
+        async with session_factory()() as session:
+            results = await search_services(
+                session, query=query, limit=SEARCH_MAX_RESULTS,
+            )
+
+        if not results:
+            await message.answer(
+                f"🔍 По запросу <b>«{html.escape(query)}»</b> ничего не нашлось.\n\n"
+                "Попробуй другое слово или загляни в 🛍 Каталог.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        # Сохраняем results в session-store по короткому id, чтобы пагинация
+        # шла без повторного похода в БД и без долгого callback_data.
+        sid = self._search_sessions.put(
+            items=[self._serialize_svc_for_cache(r) for r in results],
+            title=query,
+        )
+        text, markup = search_results_keyboard(
+            page_items=results[:SERVICES_PAGE_SIZE],
+            total=len(results), page=0, session_id=sid,
+            query=query, truncated_at=SEARCH_MAX_RESULTS,
+        )
+        await message.answer(
+            text,
+            reply_markup=markup,
+        )
+        # Восстановим главное меню (если до этого был cancel_keyboard).
+        await message.answer(
+            "Готово. Можешь продолжить навигацию через меню внизу.",
+            reply_markup=main_menu_keyboard(),
+        )
+
+    async def _on_cb_search_page(self, cb: CallbackQuery) -> None:
+        """srh:{sid}:{page} — пагинация в результатах поиска."""
+        parts = (cb.data or "").split(":")
+        if len(parts) < 3:
+            await cb.answer()
+            return
+        sid, raw_page = parts[1], parts[2]
+        try:
+            page = int(raw_page)
+        except ValueError:
+            await cb.answer()
+            return
+        sess = self._search_sessions.get(sid)
+        if sess is None:
+            await cb.answer(
+                "Поиск устарел. Открой 🔍 Поиск и попробуй снова.",
+                show_alert=True,
+            )
+            return
+        total = len(sess.items)
+        start = max(0, page) * SERVICES_PAGE_SIZE
+        page_items_raw = sess.items[start : start + SERVICES_PAGE_SIZE]
+        page_items = [self._deserialize_svc(row) for row in page_items_raw]
+        text, markup = search_results_keyboard(
+            page_items=page_items, total=total, page=page,
+            session_id=sid, query=sess.title,
+            truncated_at=SEARCH_MAX_RESULTS,
+        )
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    @staticmethod
+    def _serialize_svc_for_cache(svc) -> tuple:
+        """Сериализуем ShopCatalogCache в tuple для PaginationStore.
+        Tuple дёшево хешится и не тянет SQLAlchemy session."""
+        return (
+            svc.ns_service_id, svc.service_name, svc.rub_price_kopecks,
+            svc.in_stock, svc.category_name,
+        )
+
+    @staticmethod
+    def _deserialize_svc(row: tuple) -> SimpleNamespace:
+        return SimpleNamespace(
+            ns_service_id=row[0],
+            service_name=row[1],
+            rub_price_kopecks=row[2],
+            in_stock=row[3],
+            category_name=row[4],
+        )
+
+    # ─────────────── inline-query (@bot слово) ───────────────
+
+    async def _on_inline_query(self, q: InlineQuery) -> None:
+        """
+        Нативный inline-search Telegram: пользователь пишет `@MyBot apple`
+        в любом чате — получает выпадающий список товаров с превью.
+
+        Тап на результат → вставляет в чат текст с реф-ссылкой бота
+        (открывается сразу карточка товара через deep-link).
+        """
+        if self._bot is None:
+            return
+        query = (q.query or "").strip()
+        if len(query) < 2:
+            try:
+                await q.answer(results=[], cache_time=1, is_personal=True)
+            except Exception:
+                pass
+            return
+
+        async with session_factory()() as session:
+            results = await search_services(session, query=query, limit=25)
+
+        articles = []
+        for svc in results:
+            price = format_rub_compact(svc.rub_price_kopecks)
+            title = f"{svc.service_name} — {price}"
+            desc = svc.category_name or ""
+            if svc.in_stock < 5:
+                desc = f"⚠ Осталось: {svc.in_stock} · {desc}"
+            else:
+                desc = f"В наличии · {desc}"
+            # Deep-link открывает наш бот и автоматически шлёт /start svc_{id}.
+            # Для MVP — просто текст с upsell'ом.
+            content = InputTextMessageContent(
+                message_text=(
+                    f"🛒 <b>{html.escape(svc.service_name)}</b>\n"
+                    f"💰 {price}\n\n"
+                    f"Купить в боте: https://t.me/{self._username}"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            articles.append(InlineQueryResultArticle(
+                # Telegram требует уникальный id ≤64 байт.
+                id=hashlib.md5(
+                    f"{svc.ns_service_id}".encode()
+                ).hexdigest()[:16],
+                title=title[:64],
+                description=desc[:128],
+                input_message_content=content,
+            ))
+        try:
+            await q.answer(
+                results=articles,
+                cache_time=15,  # Telegram кэширует один и тот же query на 15с
+                is_personal=False,
+            )
+        except Exception as exc:
+            logger.debug(f"shop inline_query answer: {exc}")
+
+    # ─────────────── balance / ref / orders / support ───────────────
+
+    async def _on_balance_cmd(self, message: Message, state: FSMContext) -> None:
+        await state.clear()
         from_user = message.from_user
         if from_user is None:
             return
@@ -316,12 +779,13 @@ class ShopBot:
             await session.commit()
         text = (
             f"💰 <b>Твой баланс:</b> {format_rub(user.balance_kopecks)}\n\n"
-            "<i>Баланс пополняется на 1% от каждой покупки твоих рефералов "
-            "и может использоваться для частичной/полной оплаты заказов в этом боте.</i>"
+            "<i>Баланс пополняется на 1% от покупок твоих рефералов и "
+            "может использоваться для оплаты заказов в этом боте.</i>"
         )
-        await message.answer(text)
+        await message.answer(text, reply_markup=main_menu_keyboard())
 
-    async def _on_ref(self, message: Message) -> None:
+    async def _on_ref_cmd(self, message: Message, state: FSMContext) -> None:
+        await state.clear()
         from_user = message.from_user
         if from_user is None:
             return
@@ -340,227 +804,84 @@ class ShopBot:
             await session.commit()
         ref_link = f"https://t.me/{self._username}?start=ref_{user.id}"
         text = (
-            "🔗 <b>Твоя реферальная ссылка</b>\n\n"
-            f"<code>{ref_link}</code>\n\n"
-            "С каждой покупки приглашённого друга <b>1%</b> поступит на твой "
-            "внутренний баланс. Балансом можно оплачивать заказы в этом боте."
+            "👥 <b>Реферальная программа</b>\n\n"
+            "Делись ссылкой — получай <b>1%</b> с каждой покупки приглашённого "
+            "друга на свой внутренний баланс. Балансом можно оплачивать заказы.\n\n"
+            f"🔗 <b>Твоя ссылка:</b>\n<code>{ref_link}</code>"
         )
-        markup = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📤 Поделиться",
-                                 url=f"https://t.me/share/url?url={ref_link}"
-                                     f"&text=Магазин подарочных карт"),
-        ]])
-        await message.answer(text, reply_markup=markup)
-
-    # ─────────────── /catalog + navigation ───────────────
-
-    async def _on_catalog(self, message: Message) -> None:
-        async with session_factory()() as session:
-            cats = await list_categories_for_ui(session)
-        text, markup = self._render_categories(cats)
-        await message.answer(text, reply_markup=markup)
-
-    async def _on_cb_cats(self, cb: CallbackQuery) -> None:
-        async with session_factory()() as session:
-            cats = await list_categories_for_ui(session)
-        text, markup = self._render_categories(cats)
-        await self._safe_edit(cb, text=text, markup=markup)
-
-    async def _on_cb_category(self, cb: CallbackQuery) -> None:
-        parts = (cb.data or "").split(":")
-        if len(parts) < 2:
-            await cb.answer()
-            return
-        try:
-            cid = int(parts[1])
-            page = int(parts[2]) if len(parts) >= 3 else 0
-        except ValueError:
-            await cb.answer("Битая ссылка")
-            return
-        offset = max(0, page) * CATALOG_PAGE_SIZE
-        async with session_factory()() as session:
-            rows, total = await list_services_in_category(
-                session,
-                category_id=cid,
-                limit=CATALOG_PAGE_SIZE,
-                offset=offset,
-            )
-        text, markup = self._render_services(
-            category_id=cid,
-            services=rows,
-            total=total,
-            page=page,
+        share_url = (
+            f"https://t.me/share/url?url={ref_link}"
+            f"&text=%F0%9F%9B%92%20%D0%9C%D0%B0%D0%B3%D0%B0%D0%B7%D0%B8%D0%BD"
+            "%20%D0%BF%D0%BE%D0%B4%D0%B0%D1%80%D0%BE%D1%87%D0%BD%D1%8B%D1%85"
+            "%20%D0%BA%D0%B0%D1%80%D1%82"
         )
-        await self._safe_edit(cb, text=text, markup=markup)
-
-    async def _on_cb_service(self, cb: CallbackQuery) -> None:
-        parts = (cb.data or "").split(":")
-        if len(parts) < 2:
-            await cb.answer()
-            return
-        try:
-            sid = int(parts[1])
-        except ValueError:
-            await cb.answer("Битая ссылка")
-            return
-        async with session_factory()() as session:
-            svc = await get_catalog_service(session, ns_service_id=sid)
-        if svc is None:
-            await cb.answer("Товар временно недоступен", show_alert=True)
-            return
-        text, markup = self._render_service_card(svc)
-        await self._safe_edit(cb, text=text, markup=markup)
-
-    async def _on_cb_buy_stub(self, cb: CallbackQuery) -> None:
-        """Покупка появится в Sprint 3 (CryptoBot) и Sprint 4 (Stars)."""
-        await cb.answer(
-            "💳 Оплата подключается. Скоро откроем!",
-            show_alert=True,
-        )
-
-    async def _on_cb_close(self, cb: CallbackQuery) -> None:
-        try:
-            if cb.message is not None:
-                await cb.message.delete()
-        except Exception:
-            pass
-        await cb.answer()
-
-    # ─────────────── renderers ───────────────
-
-    @staticmethod
-    def _render_categories(
-        cats: list,
-    ) -> tuple[str, InlineKeyboardMarkup | None]:
-        if not cats:
-            return (
-                "📭 <b>Каталог пока пуст.</b>\n\n"
-                "Каталог обновляется автоматически — попробуй "
-                "через 1–2 минуты.",
-                None,
-            )
-        lines = ["🛍 <b>Каталог</b>", "", "Выбери категорию:"]
-        rows = []
-        for cat in cats:
-            cheapest = format_rub(cat.cheapest_price_kopecks)
-            label = (
-                f"{cat.category_name} · {cat.services_count} · от {cheapest}"
-            )
-            rows.append([
-                InlineKeyboardButton(
-                    text=label,
-                    callback_data=f"cat:{cat.category_id}:0",
-                )
-            ])
-        rows.append([
-            InlineKeyboardButton(text="✖ Закрыть", callback_data="close"),
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Поделиться", url=share_url)],
         ])
-        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+        await message.answer(text, reply_markup=markup)
+        await message.answer(
+            "<i>Готово — лови приглашённых через 💰 Баланс.</i>",
+            reply_markup=main_menu_keyboard(),
+        )
+
+    async def _on_orders_cmd(self, message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer(
+            "📦 <b>Мои заказы</b>\n\n"
+            "Когда оформишь первую покупку — увидишь её здесь: статус, "
+            "пины, дату. Сейчас раздел пуст.",
+            reply_markup=main_menu_keyboard(),
+        )
+
+    async def _on_support_cmd(self, message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await message.answer(
+            "🆘 <b>Поддержка</b>\n\n"
+            "Опиши проблему в этот чат — оператор увидит сообщение и ответит "
+            "лично. В период бета-доступа отвечаем в течение нескольких часов.\n\n"
+            "<b>Часто спрашивают</b>\n"
+            "• <i>Когда откроется оплата?</i> — в ближайшие дни (CryptoBot и "
+            "Telegram Stars).\n"
+            "• <i>Безопасно ли?</i> — да: оплата через официальные шлюзы "
+            "Telegram, доставка моментальная.\n"
+            "• <i>Что с кэшбэком?</i> — 1% от покупок друзей идёт на твой баланс.",
+            reply_markup=main_menu_keyboard(),
+        )
+
+    async def _on_cancel_cmd(
+        self, message: Message, state: FSMContext,
+    ) -> None:
+        await state.clear()
+        await message.answer(
+            "Окей, отменил. Чем ещё помочь?",
+            reply_markup=main_menu_keyboard(),
+        )
+
+    # ─────────────── helpers ───────────────
 
     @staticmethod
-    def _render_services(
-        *,
-        category_id: int,
-        services: list,
-        total: int,
-        page: int,
-    ) -> tuple[str, InlineKeyboardMarkup]:
-        if not services:
-            text = (
-                "📭 В этой категории пока нечего показать.\n\n"
-                "Возможно, временно нет в наличии — загляни чуть позже."
-            )
-            markup = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="« К категориям", callback_data="cats"),
-            ]])
-            return text, markup
-
-        cat_name = services[0].category_name or "Без категории"
-        total_pages = max(1, (total + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
-        header = (
-            f"🛍 <b>{html.escape(cat_name)}</b>\n"
-            f"<i>стр. {page + 1} из {total_pages} · всего {total}</i>"
-        )
-        rows = []
-        for svc in services:
-            price = format_rub(svc.rub_price_kopecks)
-            label = f"{svc.service_name} — {price}"
-            if svc.in_stock < 5:
-                label = f"⚠ {label} (мало: {svc.in_stock})"
-            rows.append([
-                InlineKeyboardButton(
-                    text=label[:64],  # Telegram лимит на текст кнопки
-                    callback_data=f"svc:{svc.ns_service_id}",
-                )
-            ])
-
-        # Pagination
-        nav = []
-        if page > 0:
-            nav.append(InlineKeyboardButton(
-                text="‹",
-                callback_data=f"cat:{category_id}:{page - 1}",
-            ))
-        nav.append(InlineKeyboardButton(
-            text=f"{page + 1}/{total_pages}",
-            callback_data="noop",
-        ))
-        if (page + 1) * CATALOG_PAGE_SIZE < total:
-            nav.append(InlineKeyboardButton(
-                text="›",
-                callback_data=f"cat:{category_id}:{page + 1}",
-            ))
-        if len(nav) > 1:  # не показываем pagination если только одна страница
-            rows.append(nav)
-        rows.append([
-            InlineKeyboardButton(text="« К категориям", callback_data="cats"),
-        ])
-        return header, InlineKeyboardMarkup(inline_keyboard=rows)
-
-    @staticmethod
-    def _render_service_card(svc) -> tuple[str, InlineKeyboardMarkup]:
-        price = format_rub(svc.rub_price_kopecks)
-        stock_line = (
-            f"📦 В наличии: <b>{svc.in_stock}</b> шт."
-            if svc.in_stock > 0
-            else "🚫 <b>Нет в наличии</b>"
-        )
-        text = (
-            f"🛒 <b>{html.escape(svc.service_name)}</b>\n"
-            f"<i>{html.escape(svc.category_name or '')}</i>\n\n"
-            f"💰 Цена: <b>{price}</b>\n"
-            f"{stock_line}\n\n"
-            "<i>Оплата откроется в ближайшие дни. "
-            "Пока можно изучить ассортимент и поделиться с друзьями "
-            "по реф-ссылке (/ref).</i>"
-        )
-        buy_label = "💳 Купить" if svc.in_stock > 0 else "🚫 Нет в наличии"
-        rows = [
-            [InlineKeyboardButton(
-                text=buy_label,
-                callback_data=(
-                    f"buy:{svc.ns_service_id}"
-                    if svc.in_stock > 0 else "noop"
-                ),
-            )],
-            [
-                InlineKeyboardButton(
-                    text="« К категории",
-                    callback_data=f"cat:{svc.category_id or 0}:0",
-                ),
-                InlineKeyboardButton(text="🏪 Все категории", callback_data="cats"),
-            ],
-        ]
-        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+    def _parse_int_or(data: str | None, *, idx: int, default: int) -> int:
+        if not data:
+            return default
+        parts = data.split(":")
+        if len(parts) <= idx:
+            return default
+        try:
+            return int(parts[idx])
+        except ValueError:
+            return default
 
     @staticmethod
     async def _safe_edit(
-        cb: CallbackQuery, *, text: str, markup: InlineKeyboardMarkup | None
+        cb: CallbackQuery,
+        *,
+        text: str,
+        markup: InlineKeyboardMarkup | None,
     ) -> None:
         """
-        Редактирует сообщение, на котором нажали кнопку. Telegram бросает
+        Редактирует сообщение, на котором нажали кнопку. Telegram кидает
         TelegramBadRequest('message is not modified') если text+markup
-        совпадают с тем, что уже отображено — это безопасный шум, гасим.
+        совпадают — это безопасный шум, гасим.
         """
         try:
             if cb.message is not None:
@@ -569,16 +890,3 @@ class ShopBot:
             if "not modified" not in str(exc).lower():
                 logger.debug(f"shop edit_text: {exc}")
         await cb.answer()
-
-    async def _on_orders_stub(self, message: Message) -> None:
-        await message.answer(
-            "📦 <b>Заказы будут здесь.</b>\n\n"
-            "Когда оформишь первую покупку — увидишь её историю и пины."
-        )
-
-    async def _on_support_stub(self, message: Message) -> None:
-        await message.answer(
-            "🆘 <b>Поддержка</b>\n\n"
-            "Напиши о проблеме в этот чат — оператор ответит лично. "
-            "В период бета-доступа отвечаем в течение нескольких часов."
-        )

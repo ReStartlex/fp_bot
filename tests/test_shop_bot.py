@@ -200,10 +200,19 @@ async def test_start_rejects_self_referral(db_setup):
         assert result is None
 
 
+def _fake_state():
+    """Минимальный fake FSMContext для тестов handler'ов."""
+    state = SimpleNamespace()
+    state.clear = AsyncMock()
+    state.set_state = AsyncMock()
+    state.get_state = AsyncMock(return_value=None)
+    return state
+
+
 async def test_balance_handler_zero_for_new_user(db_setup):
     bot = ShopBot(_settings())
     msg = _fake_message(_fake_user(11, first_name="Z"))
-    await bot._on_balance(msg)
+    await bot._on_balance_cmd(msg, _fake_state())
     text = msg.answer.call_args.args[0]
     assert "0\u00a0₽" in text
 
@@ -224,7 +233,7 @@ async def test_balance_handler_shows_actual_balance(db_setup):
         await s.commit()
 
     msg = _fake_message(_fake_user(33, first_name="R"))
-    await bot._on_balance(msg)
+    await bot._on_balance_cmd(msg, _fake_state())
     text = msg.answer.call_args.args[0]
     # 12345 копеек = 123,45 ₽
     assert "123,45" in text
@@ -234,8 +243,9 @@ async def test_ref_handler_returns_link(db_setup):
     bot = ShopBot(_settings())
     bot._username = "my_shop_bot"
     msg = _fake_message(_fake_user(42, first_name="L"))
-    await bot._on_ref(msg)
-    text = msg.answer.call_args.args[0]
+    await bot._on_ref_cmd(msg, _fake_state())
+    # _on_ref_cmd шлёт 2 answer'а — основной + "готово". Берём первый.
+    text = msg.answer.call_args_list[0].args[0]
     # Ссылка вида https://t.me/my_shop_bot?start=ref_1
     assert "https://t.me/my_shop_bot?start=ref_" in text
 
@@ -244,6 +254,6 @@ async def test_ref_handler_waits_when_bot_not_started_yet(db_setup):
     bot = ShopBot(_settings())
     bot._username = None  # типа ещё не выполнили get_me
     msg = _fake_message(_fake_user(42, first_name="L"))
-    await bot._on_ref(msg)
+    await bot._on_ref_cmd(msg, _fake_state())
     text = msg.answer.call_args.args[0]
     assert "Ещё не готов" in text or "минут" in text.lower()

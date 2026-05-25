@@ -27,6 +27,7 @@ from src.db.session import session_factory
 from src.ns.models import StockResponse
 from src.shop.pricing import compute_shop_price_kopecks
 from src.shop.repo import mark_services_unseen, upsert_catalog_service
+from src.shop.taxonomy import make_group_slug, parse_category_name
 from src.sync.fx import get_rate_breakdown
 
 
@@ -99,6 +100,12 @@ async def sync_catalog_once(
             fields_json = json.dumps(
                 [f.model_dump() for f in cat.fields], ensure_ascii=False
             ) if cat.fields else None
+            base_name, _variant = parse_category_name(cat.category_name or "")
+            # Защита: пустое base_name (категория без имени) → используем
+            # placeholder, чтобы не группировать всё в одну «пустую» группу.
+            if not base_name:
+                base_name = f"Без названия #{cat.category_id}"
+            group_slug = make_group_slug(base_name)
 
             for svc in cat.services:
                 if svc.price <= 0:
@@ -126,6 +133,8 @@ async def sync_catalog_once(
                     category_id=cat.category_id,
                     category_name=cat.category_name,
                     service_name=svc.service_name,
+                    base_name=base_name,
+                    group_slug=group_slug,
                     ns_price_usd=svc.price,
                     rub_price_kopecks=price_kopecks,
                     in_stock=svc.in_stock,
