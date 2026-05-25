@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from loguru import logger
-from sqlalchemy import inspect, text
+from sqlalchemy import event, inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.config import get_settings
@@ -13,14 +13,84 @@ _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 
+# Сколько миллисекунд SQLite ждёт освобождения замка БД до того, как
+# поднять OperationalError("database is locked"). 30с с запасом покрывает
+# любую штатную нагрузку: catalog_sync вставка ~50 строк ≈ 10мс, самая
+# тяжёлая операция reconcile-loop ~1с. С 30с timeout «is locked» в проде
+# означает реальный deadlock, а не просто параллельный writer.
+SQLITE_BUSY_TIMEOUT_MS = 30_000
+
+
 def _get_engine():
     global _engine
     if _engine is None:
         settings = get_settings()
         db_path = settings.data_path / "bridge.db"
         url = f"sqlite+aiosqlite:///{db_path}"
-        _engine = create_async_engine(url, echo=False, future=True)
+        _engine = create_async_engine(
+            url,
+            echo=False,
+            future=True,
+            # Передаём в aiosqlite: один общий busy_timeout на уровне
+            # драйвера. SQLAlchemy/aiosqlite по умолчанию использует
+            # ~5с — мало для нашей конкурентной нагрузки (funpay_watcher
+            # каждые 5с + sync_once 30с + catalog_sync 90с + cryptobot_poll
+            # 30с одновременно бьются за writer-lock).
+            connect_args={"timeout": SQLITE_BUSY_TIMEOUT_MS / 1000},
+        )
+        _apply_sqlite_pragmas(_engine)
     return _engine
+
+
+def _apply_sqlite_pragmas(engine) -> None:
+    """
+    Включает WAL и подкручивает SQLite под наш профиль нагрузки.
+
+    Что делаем при каждом новом подключении:
+
+      PRAGMA journal_mode=WAL
+        Главный фикс «database is locked». WAL разделяет writer/reader:
+        один процесс пишет, остальные одновременно читают без блокировок.
+        Файл .db-wal появляется рядом с bridge.db — это нормально.
+        Без WAL DELETE-журнал держит эксклюзивный лок на всю БД во время
+        каждого INSERT/UPDATE, и при 4+ воркерах локи копятся.
+
+      PRAGMA synchronous=NORMAL
+        В WAL это безопасно: fsync делается только при checkpoint'е,
+        а не на каждую транзакцию. Даёт ~10x ускорение записи.
+        FULL нужен только если боимся внезапной потери питания внутри
+        транзакции — для нашего use-case (заказы переиграются reconciler'ом
+        даже если упадём) NORMAL приемлем.
+
+      PRAGMA busy_timeout
+        Дублируем на уровне SQLite сам (не только драйвера). Если код
+        запустит сырое .execute через подключение без timeout, оно
+        всё равно подождёт.
+
+      PRAGMA foreign_keys=ON
+        SQLite по умолчанию ВЫКЛЮЧАЕТ FK-checks. Включаем явно —
+        у нас есть FK-связи (shop_payments.order_id → shop_orders.id и др.).
+
+      PRAGMA cache_size=-32000
+        ~32 MiB в памяти под кэш страниц (по умолчанию ~2 MiB).
+        Наша БД на проде <50 MiB — почти вся помещается в кэш.
+
+      PRAGMA temp_store=MEMORY
+        Временные таблицы/индексы из ORDER BY / GROUP BY — в RAM,
+        а не в /tmp на диске.
+    """
+    @event.listens_for(engine.sync_engine, "connect")
+    def _on_connect(dbapi_conn, _conn_record):
+        cursor = dbapi_conn.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA cache_size=-32000")
+            cursor.execute("PRAGMA temp_store=MEMORY")
+        finally:
+            cursor.close()
 
 
 def session_factory() -> async_sessionmaker[AsyncSession]:

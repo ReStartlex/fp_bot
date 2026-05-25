@@ -230,9 +230,13 @@ class App:
                 "interval",
                 seconds=self.settings.cryptobot_polling_seconds,
                 id="cryptobot_poll",
-                # Чуть позже catalog_sync, чтобы первый прогон не толкался
-                # с прогревом БД при холодном старте.
-                next_run_time=datetime.now() + timedelta(seconds=25),
+                # Сдвигаем фазу относительно sync_once (старт+0с,
+                # каждые 30с) и catalog_sync (старт+20с): первый прогон
+                # на +45с, дальше с шагом 30с — это даёт расхождение
+                # с sync_once в 15с (никогда не совпадают по фазе).
+                # WAL и так покрывает конкуренцию, но «гигиена» не
+                # лишняя — меньше шансов на busy_timeout retry.
+                next_run_time=datetime.now() + timedelta(seconds=45),
                 max_instances=1,
                 coalesce=True,
             )

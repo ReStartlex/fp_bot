@@ -190,6 +190,37 @@ FSM-поиском, inline-mode и пагинацией категорий. По
 - Бот для прода: `@neirodropi_bot` (`SHOP_TELEGRAM_BOT_TOKEN` уже настроен).
 Деплой: стандартный `update.sh`, миграций нет — только код.
 
+**Hotfix 3.1 — SQLite `database is locked` (2026-05-25):**
+
+Симптом после деплоя Sprint 3:
+```
+ERROR: Sync run упал: (sqlite3.OperationalError) database is locked
+[SQL: INSERT INTO sync_runs (finished_at, status, lots_checked, ...) VALUES (?, ?, ...)]
+```
+
+Причина: после добавления `cryptobot_poll` (каждые 30с) суммарно
+4-5 воркеров (`funpay_watcher` 5с, `sync_once` 30с, `catalog_sync` 90с,
+`cryptobot_poll` 30с, на запрос — `reconciler` через web-API) конкурировали
+за SQLite writer-lock, дефолтный busy_timeout (~5с) не выдерживал.
+
+Фикс (всё в `src/db/session.py`):
+- `PRAGMA journal_mode=WAL` — writer/reader параллельность.
+- `PRAGMA busy_timeout=30000` — retry до 30с.
+- `PRAGMA synchronous=NORMAL` — ускорение записи (безопасно в WAL).
+- `PRAGMA foreign_keys=ON`, `cache_size=-32000`, `temp_store=MEMORY`.
+- `cryptobot_poll` сдвинут на +45с от старта, чтобы расходиться по фазе
+  с `sync_once` (старт+0с).
+
+После деплоя в `data/` появится новый файл `bridge.db-wal` (это
+журнал WAL, **удалять нельзя**), и `bridge.db-shm` (shared memory
+индекс) — оба автоматически создаются SQLite. Включение WAL —
+**идемпотентно**: после первого PRAGMA режим сохраняется в файле,
+дальнейшие подключения просто видят `journal_mode=wal`.
+
+Деплой: стандартный `update.sh`, миграций нет.
+
+---
+
 **Sprint 3 — CryptoBot (Crypto Pay API) интеграция (2026-05-25):**
 
 Что добавилось:
