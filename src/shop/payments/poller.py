@@ -138,11 +138,16 @@ async def poll_cryptobot_once(
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"cryptobot poll: notify {tg_id} failed: {exc}")
 
-    if applied > 0 or errors > 0:
-        logger.info(
-            f"cryptobot poll: checked={len(paid_invoices)} "
-            f"applied={applied} skipped={skipped} errors={errors}"
-        )
+    # Heartbeat-лог: всегда пишем результат прогона на INFO.
+    # Это полезно для диагностики на VPS: пока нет ни одного пополнения,
+    # tail -f журнала покажет тихую строку «checked=0 applied=0», и сразу
+    # видно что воркер живой и токен валиден. Без этого лога мы не могли
+    # отличить «работает но нет платежей» от «не запустился вообще».
+    # Поток событий низкочастотный (раз в 30с) — спама не будет.
+    logger.info(
+        f"cryptobot poll: checked={len(paid_invoices)} "
+        f"applied={applied} skipped={skipped} errors={errors}"
+    )
     return PollResult(
         checked=len(paid_invoices),
         applied=applied,

@@ -241,12 +241,18 @@ class App:
                 coalesce=True,
             )
         self.scheduler.start()
+        # Лог-сводка реально активных job'ов — критично для диагностики
+        # «job точно запущен или нет?» по journalctl. Если в .env что-то
+        # не настроено (например, shop_telegram_bot_token), соответствующий
+        # job не зарегистрируется, и его не будет в этой строке.
+        active_jobs = [j.id for j in self.scheduler.get_jobs()]
         logger.info(
             f"Планировщик запущен: sync каждые "
             f"{self.settings.sync_interval_seconds}с, "
             f"discovery новых лотов каждые "
             f"{self.settings.new_lots_check_interval_seconds}с, "
-            f"heartbeat каждые {HEARTBEAT_HOURS}ч"
+            f"heartbeat каждые {HEARTBEAT_HOURS}ч; "
+            f"всего job'ов: {len(active_jobs)} ({', '.join(active_jobs)})"
         )
 
     async def stop(self) -> None:
