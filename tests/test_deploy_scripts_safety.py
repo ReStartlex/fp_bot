@@ -163,6 +163,30 @@ def test_fetch_writes_build_info_with_target_ref():
     assert 'target_ref=${TARGET_REF}' in text
 
 
+def test_fetch_reads_sha_from_git_not_only_version_py():
+    """
+    BUILD_INFO должен брать SHA из `git rev-parse HEAD` как primary
+    источник, а не только из src/_version.py.
+
+    Инцидент 2026-05-25: я закоммитил/запушил 4 коммита подряд, но
+    не запускал deploy/stamp_version.py перед каждым push'ем. На
+    VPS в `_version.py` сидел старый SHA `5d330b6`, а реально
+    задеплоен был `6cfffe6`. BUILD_INFO врал → диагностика
+    отвалилась.
+
+    Решение: пусть fetch_code.sh после `git reset --hard ${TARGET_REF}`
+    читает SHA напрямую из git (где он гарантированно актуален).
+    `_version.py` остаётся fallback'ом для случая когда .git/
+    отсутствует (теоретический tarball-deploy).
+    """
+    text = FETCH_SH.read_text(encoding="utf-8")
+    assert "git -C \"${APP_DIR}\" rev-parse HEAD" in text, (
+        "BUILD_INFO должен брать SHA через `git rev-parse HEAD`, "
+        "а не только из src/_version.py — иначе врёт когда забыли "
+        "запустить stamp_version.py перед push (см. инцидент 2026-05-25)."
+    )
+
+
 def test_readme_documents_pin_sha_and_backup_flow():
     docs = (ROOT / "deploy" / "README.md").read_text(encoding="utf-8")
     assert "PIN_SHA" in docs

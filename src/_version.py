@@ -4,6 +4,6 @@ deploy/stamp_version.py перед каждым push'ем.
 
 ВАЖНО: НЕ редактируй вручную — твои изменения будут перезаписаны.
 """
-SHA = "5d330b6837049ad77b21817f87c547137b4c77f7"
-DATE = "2026-05-25T01:38:13+03:00"
-SUBJECT = "fix(deploy): per-command proxy + .deploy_pin from PROD_APP_DIR"
+SHA = "6cfffe61e470a0075e0a0259bb06d2c833905fa1"
+DATE = "2026-05-25T14:28:17+03:00"
+SUBJECT = "fix(sync_stock): diff-cache TTL Р±РѕР»СЊС€Рµ РЅРµ РїСЂРѕРґР»РµРІР°РµС‚СЃСЏ Р±РµСЃРєРѕРЅРµС‡РЅРѕ"

@@ -204,15 +204,33 @@ mkdir -p "${APP_DIR}/logs" "${APP_DIR}/data"
 
 echo "    [git] fetch+reset на ${TARGET_REF}: OK"
 
-# BUILD_INFO пишем из src/_version.py — он обновляется при каждом
-# нашем push'е через deploy/stamp_version.py.
-if [[ -f "${APP_DIR}/src/_version.py" ]]; then
+# BUILD_INFO пишем из git напрямую (HEAD после reset --hard).
+# Source of truth — git, а не src/_version.py: stamp_version.py
+# часто забывают вызывать перед коммитом, и тогда _version.py
+# содержит SHA предыдущего стампа, а не реально задеплоенного
+# коммита. Инцидент 2026-05-25: BUILD_INFO врал про `5d330b6`
+# когда фактический HEAD был `6cfffe6` — потому что я не запустил
+# stamp_version.py перед push.
+#
+# Fallback на _version.py оставлен для случая когда git недоступен
+# (теоретически в нашем pipeline такого не должно быть, но если
+# fetch_code.sh запускается через ручной tarball-deploy без .git/
+# — пригодится).
+SHA="" ; DATE="" ; SUBJECT=""
+if SHA=$(git -C "${APP_DIR}" rev-parse HEAD 2>/dev/null); then
+    DATE=$(git -C "${APP_DIR}" show -s --format=%cI HEAD 2>/dev/null || echo "")
+    SUBJECT=$(git -C "${APP_DIR}" show -s --format=%s HEAD 2>/dev/null \
+              | head -1 | tr -d '\r\n')
+fi
+if [[ -z "${SHA}" ]] && [[ -f "${APP_DIR}/src/_version.py" ]]; then
     SHA=$(grep -E '^SHA' "${APP_DIR}/src/_version.py" | head -1 \
           | sed -E 's/.*"([^"]+)".*/\1/')
     DATE=$(grep -E '^DATE' "${APP_DIR}/src/_version.py" | head -1 \
           | sed -E 's/.*"([^"]+)".*/\1/')
     SUBJECT=$(grep -E '^SUBJECT' "${APP_DIR}/src/_version.py" | head -1 \
           | sed -E 's/.*"(.*)".*/\1/')
+fi
+if [[ -n "${SHA}" ]]; then
     {
         echo "sha=${SHA}"
         echo "branch=${BRANCH}"
