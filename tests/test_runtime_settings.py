@@ -112,6 +112,8 @@ async def test_overrides_snapshot(isolated_db):
         rt.KEY_MARKUP: None,
         rt.KEY_PREMIUM: None,
         rt.KEY_STOCK_CAP: None,
+        rt.KEY_SHOP_MARKUP: None,
+        rt.KEY_SHOP_REFERRAL: None,
     }
     await rt.set_global_markup_percent(5.0)
     snap = await rt.get_overrides_snapshot()

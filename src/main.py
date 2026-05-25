@@ -34,6 +34,7 @@ from src.ns import NSClient
 from src.orders.reconciler import reconcile_orders_once
 from src.orders.processor import FunPayOrderEvent, process_funpay_order
 from src.shop.bot import ShopBot
+from src.shop.catalog_sync import sync_catalog_once
 from src.sync.stock_sync import sync_once
 
 
@@ -57,6 +58,9 @@ class App:
         self._last_low_balance_alert: datetime | None = None
         # Один lock на все sync-вызовы (scheduler + ручной /sync из бота)
         self._sync_lock = asyncio.Lock()
+        # Счётчик последовательных падений shop catalog sync — алертим
+        # только при 2+ подряд, чтобы один сетевой блип не флудил оператора.
+        self._shop_catalog_consecutive_failures = 0
 
     # ---------- Lifecycle ----------
 
@@ -189,6 +193,22 @@ class App:
                 seconds=self.settings.new_lots_check_interval_seconds,
                 id="new_lots",
                 next_run_time=datetime.now() + timedelta(seconds=15),
+                max_instances=1,
+                coalesce=True,
+            )
+        # Shop-каталог: тянем NS.get_stock и обновляем shop_catalog_cache.
+        # Запускаем даже если shop_enabled=false и shop-бот выключен —
+        # пусть кеш накапливается заранее, чтобы при включении был мгновенный
+        # UX. NSClient у нас один на процесс, лишних подключений нет.
+        if self.shop_bot is not None and self.settings.shop_enabled:
+            self.scheduler.add_job(
+                self._safe_shop_catalog_sync,
+                "interval",
+                seconds=self.settings.shop_catalog_refresh_seconds,
+                id="shop_catalog_sync",
+                # Чуть позже старта, чтобы дать NS прогреться и
+                # bridge-sync_once отработал свой первый цикл первым.
+                next_run_time=datetime.now() + timedelta(seconds=20),
                 max_instances=1,
                 coalesce=True,
             )
@@ -435,6 +455,41 @@ class App:
         )
 
     # ---------- Shop helpers ----------
+
+    async def _safe_shop_catalog_sync(self) -> None:
+        """
+        Тонкая обёртка над sync_catalog_once: ловит исключения, чтобы
+        APScheduler не отвалился, и в Telegram владельцу не валит спам
+        (каталог обновляется часто; алертим только на устойчивые сбои —
+        2+ failed подряд).
+        """
+        if self.ns is None:
+            return
+        try:
+            result = await sync_catalog_once(
+                ns_client=self.ns, settings=self.settings
+            )
+        except Exception as exc:
+            logger.exception(f"shop catalog sync упал: {exc}")
+            self._shop_catalog_consecutive_failures += 1
+            if (
+                self._shop_catalog_consecutive_failures == 2
+                and self.tg is not None
+            ):
+                short = f"{type(exc).__name__}: {str(exc)[:160]}"
+                await self.tg.error(
+                    f"Shop catalog sync падает: <code>{short}</code>. "
+                    "Каталог покупателям не обновляется."
+                )
+            return
+        if result.get("status") == "ok":
+            if self._shop_catalog_consecutive_failures >= 2 and self.tg is not None:
+                await self.tg.info(
+                    "✅ Shop catalog sync восстановился"
+                )
+            self._shop_catalog_consecutive_failures = 0
+        elif result.get("status") == "failed":
+            self._shop_catalog_consecutive_failures += 1
 
     async def _notify_owner_safe(self, text: str) -> None:
         """

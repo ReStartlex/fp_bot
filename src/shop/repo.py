@@ -8,14 +8,20 @@ Shop-репозиторий: атомарные операции, которые
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Iterable, Optional
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import ShopBalanceLedger, ShopReferral, ShopUser
+from src.db.models import (
+    ShopBalanceLedger,
+    ShopCatalogCache,
+    ShopReferral,
+    ShopUser,
+)
 
 
 async def get_or_create_user(
@@ -183,6 +189,195 @@ async def get_user_by_tg(
 ) -> Optional[ShopUser]:
     res = await session.execute(
         select(ShopUser).where(ShopUser.telegram_user_id == telegram_user_id)
+    )
+    return res.scalar_one_or_none()
+
+
+# ──────────────────────── Catalog cache ────────────────────────
+
+
+@dataclass(frozen=True)
+class CategoryGroup:
+    """Категория, агрегированная из shop_catalog_cache для UI."""
+    category_id: int
+    category_name: str
+    services_count: int  # сколько активных сервисов с in_stock > 0
+    cheapest_price_kopecks: int  # минимальная цена для preview
+
+
+async def upsert_catalog_service(
+    session: AsyncSession,
+    *,
+    ns_service_id: int,
+    category_id: int | None,
+    category_name: str | None,
+    service_name: str,
+    ns_price_usd: float,
+    rub_price_kopecks: int,
+    in_stock: int,
+    fields_json: str | None,
+) -> ShopCatalogCache:
+    """
+    Идемпотентный upsert одного service'а в каталог. enabled НЕ меняется
+    (если оператор выключил услугу через owner-бота — она остаётся off
+    до явного включения).
+    """
+    res = await session.execute(
+        select(ShopCatalogCache).where(
+            ShopCatalogCache.ns_service_id == ns_service_id
+        )
+    )
+    row = res.scalar_one_or_none()
+    if row is None:
+        row = ShopCatalogCache(
+            ns_service_id=ns_service_id,
+            category_id=category_id,
+            category_name=category_name,
+            service_name=service_name,
+            ns_price_usd=ns_price_usd,
+            rub_price_kopecks=rub_price_kopecks,
+            in_stock=in_stock,
+            fields_json=fields_json,
+            enabled=True,
+        )
+        session.add(row)
+    else:
+        row.category_id = category_id
+        row.category_name = category_name
+        row.service_name = service_name
+        row.ns_price_usd = ns_price_usd
+        row.rub_price_kopecks = rub_price_kopecks
+        row.in_stock = in_stock
+        row.fields_json = fields_json
+        # fetched_at обновится автоматически через onupdate=func.now()
+    await session.flush()
+    return row
+
+
+async def mark_services_unseen(
+    session: AsyncSession,
+    *,
+    seen_service_ids: Iterable[int],
+) -> int:
+    """
+    После полного fetch NS-каталога вызвать с set'ом service_id'ов,
+    которые NS вернул. Все service_id'ы НЕ в этом set'е помечаются
+    in_stock=0 — они «исчезли» из каталога NS. Не trash'им и не disable
+    — оператор может явно их вернуть через owner-команды.
+
+    Возвращает кол-во обновлённых записей.
+    """
+    seen = set(seen_service_ids)
+    if not seen:
+        # NS вернул пустой каталог — НЕ обнуляем cache (вероятно временный сбой NS).
+        logger.warning(
+            "shop catalog: mark_services_unseen called with empty seen set; "
+            "skipping mass-zero to avoid wiping cache during NS hiccup"
+        )
+        return 0
+
+    all_ids_res = await session.execute(
+        select(ShopCatalogCache.ns_service_id, ShopCatalogCache.in_stock)
+    )
+    rows = list(all_ids_res.all())
+    stale = [sid for sid, stock in rows if sid not in seen and stock > 0]
+    if not stale:
+        return 0
+    await session.execute(
+        sa_update(ShopCatalogCache)
+        .where(ShopCatalogCache.ns_service_id.in_(stale))
+        .values(in_stock=0)
+    )
+    await session.flush()
+    logger.info(
+        f"shop catalog: marked {len(stale)} services as out-of-stock "
+        f"(no longer in NS catalog)"
+    )
+    return len(stale)
+
+
+async def list_categories_for_ui(session: AsyncSession) -> list[CategoryGroup]:
+    """
+    Группировка для UI-уровня /catalog: список категорий с числом
+    активных (enabled=True И in_stock>0) сервисов и самой дешёвой ценой.
+
+    Категории без активных сервисов в выдачу не попадают (нет смысла
+    показывать пустую).
+    """
+    stmt = (
+        select(
+            ShopCatalogCache.category_id,
+            ShopCatalogCache.category_name,
+            func.count(ShopCatalogCache.ns_service_id).label("cnt"),
+            func.min(ShopCatalogCache.rub_price_kopecks).label("cheapest"),
+        )
+        .where(
+            ShopCatalogCache.enabled.is_(True),
+            ShopCatalogCache.in_stock > 0,
+        )
+        .group_by(ShopCatalogCache.category_id, ShopCatalogCache.category_name)
+        .order_by(ShopCatalogCache.category_name)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        CategoryGroup(
+            category_id=cid if cid is not None else 0,
+            category_name=cname or "Без категории",
+            services_count=cnt,
+            cheapest_price_kopecks=cheapest or 0,
+        )
+        for cid, cname, cnt, cheapest in rows
+    ]
+
+
+async def list_services_in_category(
+    session: AsyncSession,
+    *,
+    category_id: int,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[ShopCatalogCache], int]:
+    """
+    Сервисы внутри одной категории, отсортированные по возрастанию цены.
+    Возвращает (rows, total_count) для pagination.
+    """
+    where_clause = [
+        ShopCatalogCache.enabled.is_(True),
+        ShopCatalogCache.in_stock > 0,
+    ]
+    if category_id == 0:
+        where_clause.append(ShopCatalogCache.category_id.is_(None))
+    else:
+        where_clause.append(ShopCatalogCache.category_id == category_id)
+
+    count_stmt = (
+        select(func.count(ShopCatalogCache.ns_service_id)).where(*where_clause)
+    )
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    stmt = (
+        select(ShopCatalogCache)
+        .where(*where_clause)
+        .order_by(
+            ShopCatalogCache.rub_price_kopecks.asc(),
+            ShopCatalogCache.service_name.asc(),
+        )
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = list((await session.execute(stmt)).scalars().all())
+    return rows, total
+
+
+async def get_catalog_service(
+    session: AsyncSession, ns_service_id: int
+) -> Optional[ShopCatalogCache]:
+    """Карточка одного сервиса (для checkout). None если нет или disabled."""
+    res = await session.execute(
+        select(ShopCatalogCache).where(
+            ShopCatalogCache.ns_service_id == ns_service_id,
+            ShopCatalogCache.enabled.is_(True),
+        )
     )
     return res.scalar_one_or_none()
 

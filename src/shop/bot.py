@@ -23,9 +23,11 @@ from typing import Awaitable, Callable
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BotCommand,
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -37,9 +39,15 @@ from src.db.session import session_factory
 from src.shop.repo import (
     apply_balance_change,
     attach_referral,
+    get_catalog_service,
     get_or_create_user,
+    list_categories_for_ui,
+    list_services_in_category,
     parse_referral_payload,
 )
+
+
+CATALOG_PAGE_SIZE = 8
 
 
 # Алерт-callback в owner-бота при первом старте бота, новой регистрации и т.п.
@@ -203,9 +211,27 @@ class ShopBot:
         self._dp.message.register(self._on_help, Command("help"))
         self._dp.message.register(self._on_balance, Command("balance"))
         self._dp.message.register(self._on_ref, Command("ref"))
-        self._dp.message.register(self._on_catalog_stub, Command("catalog"))
+        self._dp.message.register(self._on_catalog, Command("catalog"))
         self._dp.message.register(self._on_orders_stub, Command("orders"))
         self._dp.message.register(self._on_support_stub, Command("support"))
+
+        # Callback'и для inline-навигации каталога.
+        # cat:{cid}:{page}  — показать сервисы категории cid, страница page
+        # svc:{sid}         — карточка сервиса sid
+        # cats              — назад в список категорий
+        # buy:{sid}         — заглушка покупки (откроется в Sprint 3)
+        # close             — закрыть/удалить сообщение
+        self._dp.callback_query.register(self._on_cb_cats, F.data == "cats")
+        self._dp.callback_query.register(self._on_cb_close, F.data == "close")
+        self._dp.callback_query.register(
+            self._on_cb_category, F.data.startswith("cat:")
+        )
+        self._dp.callback_query.register(
+            self._on_cb_service, F.data.startswith("svc:")
+        )
+        self._dp.callback_query.register(
+            self._on_cb_buy_stub, F.data.startswith("buy:")
+        )
 
     async def _on_start(self, message: Message, command: CommandObject) -> None:
         from_user = message.from_user
@@ -326,12 +352,223 @@ class ShopBot:
         ]])
         await message.answer(text, reply_markup=markup)
 
-    async def _on_catalog_stub(self, message: Message) -> None:
-        await message.answer(
-            "⏳ <b>Каталог появится скоро.</b>\n\n"
-            "Сейчас идёт подключение к поставщику цифровых товаров. "
-            "Жди новостей в /help — оповестим, когда будет готово."
+    # ─────────────── /catalog + navigation ───────────────
+
+    async def _on_catalog(self, message: Message) -> None:
+        async with session_factory()() as session:
+            cats = await list_categories_for_ui(session)
+        text, markup = self._render_categories(cats)
+        await message.answer(text, reply_markup=markup)
+
+    async def _on_cb_cats(self, cb: CallbackQuery) -> None:
+        async with session_factory()() as session:
+            cats = await list_categories_for_ui(session)
+        text, markup = self._render_categories(cats)
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    async def _on_cb_category(self, cb: CallbackQuery) -> None:
+        parts = (cb.data or "").split(":")
+        if len(parts) < 2:
+            await cb.answer()
+            return
+        try:
+            cid = int(parts[1])
+            page = int(parts[2]) if len(parts) >= 3 else 0
+        except ValueError:
+            await cb.answer("Битая ссылка")
+            return
+        offset = max(0, page) * CATALOG_PAGE_SIZE
+        async with session_factory()() as session:
+            rows, total = await list_services_in_category(
+                session,
+                category_id=cid,
+                limit=CATALOG_PAGE_SIZE,
+                offset=offset,
+            )
+        text, markup = self._render_services(
+            category_id=cid,
+            services=rows,
+            total=total,
+            page=page,
         )
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    async def _on_cb_service(self, cb: CallbackQuery) -> None:
+        parts = (cb.data or "").split(":")
+        if len(parts) < 2:
+            await cb.answer()
+            return
+        try:
+            sid = int(parts[1])
+        except ValueError:
+            await cb.answer("Битая ссылка")
+            return
+        async with session_factory()() as session:
+            svc = await get_catalog_service(session, ns_service_id=sid)
+        if svc is None:
+            await cb.answer("Товар временно недоступен", show_alert=True)
+            return
+        text, markup = self._render_service_card(svc)
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    async def _on_cb_buy_stub(self, cb: CallbackQuery) -> None:
+        """Покупка появится в Sprint 3 (CryptoBot) и Sprint 4 (Stars)."""
+        await cb.answer(
+            "💳 Оплата подключается. Скоро откроем!",
+            show_alert=True,
+        )
+
+    async def _on_cb_close(self, cb: CallbackQuery) -> None:
+        try:
+            if cb.message is not None:
+                await cb.message.delete()
+        except Exception:
+            pass
+        await cb.answer()
+
+    # ─────────────── renderers ───────────────
+
+    @staticmethod
+    def _render_categories(
+        cats: list,
+    ) -> tuple[str, InlineKeyboardMarkup | None]:
+        if not cats:
+            return (
+                "📭 <b>Каталог пока пуст.</b>\n\n"
+                "Каталог обновляется автоматически — попробуй "
+                "через 1–2 минуты.",
+                None,
+            )
+        lines = ["🛍 <b>Каталог</b>", "", "Выбери категорию:"]
+        rows = []
+        for cat in cats:
+            cheapest = format_rub(cat.cheapest_price_kopecks)
+            label = (
+                f"{cat.category_name} · {cat.services_count} · от {cheapest}"
+            )
+            rows.append([
+                InlineKeyboardButton(
+                    text=label,
+                    callback_data=f"cat:{cat.category_id}:0",
+                )
+            ])
+        rows.append([
+            InlineKeyboardButton(text="✖ Закрыть", callback_data="close"),
+        ])
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
+    def _render_services(
+        *,
+        category_id: int,
+        services: list,
+        total: int,
+        page: int,
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        if not services:
+            text = (
+                "📭 В этой категории пока нечего показать.\n\n"
+                "Возможно, временно нет в наличии — загляни чуть позже."
+            )
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="« К категориям", callback_data="cats"),
+            ]])
+            return text, markup
+
+        cat_name = services[0].category_name or "Без категории"
+        total_pages = max(1, (total + CATALOG_PAGE_SIZE - 1) // CATALOG_PAGE_SIZE)
+        header = (
+            f"🛍 <b>{html.escape(cat_name)}</b>\n"
+            f"<i>стр. {page + 1} из {total_pages} · всего {total}</i>"
+        )
+        rows = []
+        for svc in services:
+            price = format_rub(svc.rub_price_kopecks)
+            label = f"{svc.service_name} — {price}"
+            if svc.in_stock < 5:
+                label = f"⚠ {label} (мало: {svc.in_stock})"
+            rows.append([
+                InlineKeyboardButton(
+                    text=label[:64],  # Telegram лимит на текст кнопки
+                    callback_data=f"svc:{svc.ns_service_id}",
+                )
+            ])
+
+        # Pagination
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(
+                text="‹",
+                callback_data=f"cat:{category_id}:{page - 1}",
+            ))
+        nav.append(InlineKeyboardButton(
+            text=f"{page + 1}/{total_pages}",
+            callback_data="noop",
+        ))
+        if (page + 1) * CATALOG_PAGE_SIZE < total:
+            nav.append(InlineKeyboardButton(
+                text="›",
+                callback_data=f"cat:{category_id}:{page + 1}",
+            ))
+        if len(nav) > 1:  # не показываем pagination если только одна страница
+            rows.append(nav)
+        rows.append([
+            InlineKeyboardButton(text="« К категориям", callback_data="cats"),
+        ])
+        return header, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
+    def _render_service_card(svc) -> tuple[str, InlineKeyboardMarkup]:
+        price = format_rub(svc.rub_price_kopecks)
+        stock_line = (
+            f"📦 В наличии: <b>{svc.in_stock}</b> шт."
+            if svc.in_stock > 0
+            else "🚫 <b>Нет в наличии</b>"
+        )
+        text = (
+            f"🛒 <b>{html.escape(svc.service_name)}</b>\n"
+            f"<i>{html.escape(svc.category_name or '')}</i>\n\n"
+            f"💰 Цена: <b>{price}</b>\n"
+            f"{stock_line}\n\n"
+            "<i>Оплата откроется в ближайшие дни. "
+            "Пока можно изучить ассортимент и поделиться с друзьями "
+            "по реф-ссылке (/ref).</i>"
+        )
+        buy_label = "💳 Купить" if svc.in_stock > 0 else "🚫 Нет в наличии"
+        rows = [
+            [InlineKeyboardButton(
+                text=buy_label,
+                callback_data=(
+                    f"buy:{svc.ns_service_id}"
+                    if svc.in_stock > 0 else "noop"
+                ),
+            )],
+            [
+                InlineKeyboardButton(
+                    text="« К категории",
+                    callback_data=f"cat:{svc.category_id or 0}:0",
+                ),
+                InlineKeyboardButton(text="🏪 Все категории", callback_data="cats"),
+            ],
+        ]
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @staticmethod
+    async def _safe_edit(
+        cb: CallbackQuery, *, text: str, markup: InlineKeyboardMarkup | None
+    ) -> None:
+        """
+        Редактирует сообщение, на котором нажали кнопку. Telegram бросает
+        TelegramBadRequest('message is not modified') если text+markup
+        совпадают с тем, что уже отображено — это безопасный шум, гасим.
+        """
+        try:
+            if cb.message is not None:
+                await cb.message.edit_text(text=text, reply_markup=markup)
+        except TelegramBadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                logger.debug(f"shop edit_text: {exc}")
+        await cb.answer()
 
     async def _on_orders_stub(self, message: Message) -> None:
         await message.answer(

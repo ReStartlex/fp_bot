@@ -366,9 +366,11 @@ class TelegramBot:
         "\n"
         "<b>Глобальные настройки (без рестарта)</b>\n"
         "/settings — показать активные значения\n"
-        "/setdefault markup &lt;%|default&gt; — глобальная наценка\n"
+        "/setdefault markup &lt;%|default&gt; — глобальная наценка (FunPay)\n"
         "/setdefault premium &lt;%|default&gt; — премия к курсу USD\n"
         "/setdefault stockcap &lt;N|default&gt; — лимит остатков на FunPay\n"
+        "/setdefault shop_markup &lt;%|default&gt; — наценка TG-shop\n"
+        "/setdefault shop_referral &lt;%|default&gt; — % кэшбэка реф-системы\n"
         "/force_sync &lt;funpay_lot_id&gt; — диагностика одного лота\n"
         "/funpay_check — проверить FunPay-сессию (cookies)\n"
         "\n"
@@ -3234,13 +3236,16 @@ class TelegramBot:
             await msg.answer(
                 "Использование: <code>/setdefault &lt;param&gt; &lt;value|default&gt;</code>\n\n"
                 "Параметры:\n"
-                "  <b>markup</b> — глобальная наценка, % (0..200)\n"
+                "  <b>markup</b> — глобальная наценка FunPay, % (0..200)\n"
                 "  <b>premium</b> — премия к курсу USD, % (0..50)\n"
-                "  <b>stockcap</b> — лимит остатков на FunPay (1..100000)\n\n"
+                "  <b>stockcap</b> — лимит остатков на FunPay (1..100000)\n"
+                "  <b>shop_markup</b> — наценка TG-shop, % (0..100)\n"
+                "  <b>shop_referral</b> — % реф-кэшбэка (0..100)\n\n"
                 "Примеры:\n"
                 "<code>/setdefault markup 5</code>\n"
                 "<code>/setdefault premium 3</code>\n"
                 "<code>/setdefault stockcap 50</code>\n"
+                "<code>/setdefault shop_markup 10</code>\n"
                 "<code>/setdefault markup default</code> — вернуть к .env",
                 reply_markup=ui.single_close_kb(),
             )
@@ -3252,9 +3257,13 @@ class TelegramBot:
             set_global_markup_percent,
             set_premium_percent,
             set_stock_cap,
+            set_shop_markup_percent,
+            set_shop_referral_percent,
             get_global_markup_percent,
             get_premium_percent,
             get_stock_cap,
+            get_shop_markup_percent,
+            get_shop_referral_percent,
         )
 
         try:
@@ -3297,10 +3306,40 @@ class TelegramBot:
                     + ("(runtime override)" if eff != env_v else "(из .env)")
                 )
                 hint = "Лимит остатков для маппингов с stock_cap=NULL."
+            elif param in ("shop_markup", "shopmarkup"):
+                if raw in ("default", "none", "-", ""):
+                    await set_shop_markup_percent(None)
+                else:
+                    await set_shop_markup_percent(float(raw))
+                eff = await get_shop_markup_percent(self._settings)
+                env_v = self._settings.shop_markup_percent
+                shown = (
+                    f"<b>{eff:.2f}%</b> "
+                    + ("(runtime override)" if abs(eff - env_v) > 1e-9 else "(из .env)")
+                )
+                hint = (
+                    "Наценка для shop-каталога. Применится при следующем "
+                    f"sync каталога (≤{self._settings.shop_catalog_refresh_seconds}с)."
+                )
+            elif param in ("shop_referral", "shopreferral", "shop_ref"):
+                if raw in ("default", "none", "-", ""):
+                    await set_shop_referral_percent(None)
+                else:
+                    await set_shop_referral_percent(float(raw))
+                eff = await get_shop_referral_percent(self._settings)
+                env_v = self._settings.shop_referral_percent
+                shown = (
+                    f"<b>{eff:.2f}%</b> "
+                    + ("(runtime override)" if abs(eff - env_v) > 1e-9 else "(из .env)")
+                )
+                hint = (
+                    "% от каждой покупки реферала, который идёт на "
+                    "внутренний баланс пригласившего."
+                )
             else:
                 await msg.answer(
                     f"Неизвестный параметр «{param}». "
-                    "Доступные: markup, premium, stockcap.",
+                    "Доступные: markup, premium, stockcap, shop_markup, shop_referral.",
                     reply_markup=ui.single_close_kb(),
                 )
                 return
@@ -3329,15 +3368,32 @@ class TelegramBot:
         """Показать активные runtime-настройки и .env-исходники."""
         from src.config_runtime import (
             get_global_markup_percent, get_premium_percent, get_stock_cap,
+            get_shop_markup_percent, get_shop_referral_percent,
             get_overrides_snapshot,
         )
         eff_markup = await get_global_markup_percent(self._settings)
         eff_premium = await get_premium_percent(self._settings)
         eff_stock = await get_stock_cap(self._settings)
+        eff_shop_markup = await get_shop_markup_percent(self._settings)
+        eff_shop_referral = await get_shop_referral_percent(self._settings)
         overrides = await get_overrides_snapshot()
 
         def src(env_val, override_val):
             return "<i>override</i>" if override_val is not None else "<i>из .env</i>"
+
+        shop_line = ""
+        if self._settings.shop_enabled:
+            shop_line = (
+                "\n🛒 <b>TG-shop</b>\n"
+                f"   Наценка: <b>{eff_shop_markup:.2f}%</b> "
+                f"{src(self._settings.shop_markup_percent, overrides.get('shop_markup_percent'))}"
+                f" (в .env: {self._settings.shop_markup_percent}%)\n"
+                f"   Реф-кэшбэк: <b>{eff_shop_referral:.2f}%</b> "
+                f"{src(self._settings.shop_referral_percent, overrides.get('shop_referral_percent'))}"
+                f" (в .env: {self._settings.shop_referral_percent}%)\n"
+                f"   Обновление каталога: каждые "
+                f"<b>{self._settings.shop_catalog_refresh_seconds}с</b>\n"
+            )
 
         text = (
             "🔧 <b>Текущие настройки</b>\n\n"
@@ -3347,7 +3403,8 @@ class TelegramBot:
             f"     в .env: {self._settings.usd_rub_premium_percent}%\n"
             f"🏦 Вывод FunPay: <b>{self._settings.funpay_withdrawal_fee_percent:.2f}%</b> <i>из .env</i>\n"
             f"📦 Лимит остатков: <b>{eff_stock}</b> {src(self._settings.funpay_stock_cap, overrides['funpay_stock_cap'])}\n"
-            f"     в .env: {self._settings.funpay_stock_cap}\n\n"
+            f"     в .env: {self._settings.funpay_stock_cap}\n"
+            f"{shop_line}\n"
             f"⏱ Sync каждые: <b>{self._settings.sync_interval_seconds}с</b>\n"
             f"🔁 Discovery новых лотов: <b>{self._settings.new_lots_check_interval_seconds}с</b>\n\n"
             "Меняй на лету:\n"
