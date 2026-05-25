@@ -11,6 +11,7 @@ from fastapi.staticfiles import StaticFiles
 
 from src.api.auth import require_api_auth
 from src.api.cryptobot_webhook import router as cryptobot_router
+from src.api.shop_router import router as shop_router
 from src.config import Settings, get_settings
 from src.db.session import close_db, init_db
 from src.logging_setup import setup_logging
@@ -95,6 +96,38 @@ def create_app() -> FastAPI:
 
     # CryptoBot webhook — без require_api_auth (защищён HMAC-подписью).
     app.include_router(cryptobot_router)
+
+    # Sprint 6: Mini App router — авторизация через Telegram initData
+    # (X-Telegram-Init-Data header), отдельная от admin Bearer token.
+    app.include_router(shop_router)
+
+    # Раздаём Mini App build artifacts: src/web/miniapp/* → /app/*
+    # (npm run build кладёт сюда index.html + assets/).
+    # Если папки нет — Mini App не задеплоен, эндпоинты shop_router всё
+    # равно работают (фронт может быть на отдельном домене).
+    miniapp_dist = Path(__file__).resolve().parents[1] / "web" / "miniapp"
+    if miniapp_dist.exists():
+        app.mount(
+            "/app",
+            StaticFiles(directory=miniapp_dist, html=True),
+            name="miniapp",
+        )
+
+    # CORS: если фронт Mini App работает с отдельного origin'а (например
+    # пока разрабатываешь локально через `npm run dev`), нужно открыть
+    # доступ. Список origin'ов в settings.shop_webapp_cors_origins.
+    settings_for_cors = get_settings()
+    cors_origins = getattr(settings_for_cors, "shop_webapp_cors_origins", None)
+    if cors_origins:
+        from fastapi.middleware.cors import CORSMiddleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["X-Telegram-Init-Data", "Content-Type"],
+            max_age=3600,
+        )
 
     return app
 

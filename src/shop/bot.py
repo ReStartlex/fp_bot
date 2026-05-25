@@ -245,6 +245,14 @@ class ShopBot:
             await self._set_bot_commands()
         except Exception as exc:
             logger.debug(f"shop set_my_commands: {exc}")
+        # Sprint 6: Mini App. Если shop_webapp_url задан — регистрируем
+        # Menu Button (зелёная кнопка слева от поля ввода) как WebApp,
+        # чтобы юзер открывал Mini App одним тапом.
+        try:
+            await self._set_webapp_menu_button()
+        except Exception as exc:
+            # Не критично, бот работает и без Mini App.
+            logger.debug(f"shop set_chat_menu_button: {exc}")
 
         me = await self._bot.get_me()
         self._username = me.username
@@ -299,6 +307,39 @@ class ShopBot:
             BotCommand(command="support", description="Поддержка"),
             BotCommand(command="help", description="Справка"),
         ])
+
+    async def _set_webapp_menu_button(self) -> None:
+        """
+        Регистрирует Mini App как Menu Button (рядом с полем ввода).
+
+        Без этого юзеры могли бы открыть Mini App только через WebApp-кнопку
+        внутри keyboard'а; Menu Button — стандартный «зелёный» хинт от Telegram.
+
+        Если shop_webapp_url=None — снимаем custom menu button (возвращаем
+        дефолтные команды), чтобы не показывать сломанную ссылку.
+        """
+        if self._bot is None:
+            return
+        from aiogram.types import (
+            MenuButtonCommands,
+            MenuButtonWebApp,
+            WebAppInfo,
+        )
+
+        url = getattr(self._settings, "shop_webapp_url", None)
+        if url:
+            await self._bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="🛍 Открыть магазин",
+                    web_app=WebAppInfo(url=url),
+                ),
+            )
+            logger.info(f"Shop Mini App Menu Button → {url}")
+        else:
+            await self._bot.set_chat_menu_button(
+                menu_button=MenuButtonCommands(),
+            )
+            logger.debug("shop_webapp_url не задан — Menu Button = commands")
 
     async def send_message_to_user(self, telegram_user_id: int, text: str) -> None:
         """

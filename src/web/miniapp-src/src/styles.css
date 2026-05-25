@@ -1,0 +1,330 @@
+/*
+ * Mini App styles. Все цвета берутся из --tg-* CSS-переменных, выставленных
+ * theme.ts на основе Telegram themeParams (auto light/dark).
+ *
+ * Принципы:
+ *   - safe-area insets (iOS notch / bottom bar);
+ *   - крупные тач-цели (min 44px);
+ *   - системные шрифты (быстрая загрузка, нативное ощущение);
+ *   - SF Pro / Roboto через -apple-system / sans-serif.
+ */
+
+:root {
+    /* fallback'ы на случай если themeParams не пришли */
+    --tg-bg: #0b1220;
+    --tg-text: #ffffff;
+    --tg-hint: #9aa6c4;
+    --tg-link: #5288f5;
+    --tg-button: #5288f5;
+    --tg-button-text: #ffffff;
+    --tg-secondary-bg: #1a2238;
+    --tg-section-bg: #131b30;
+    --tg-section-header-text: #9aa6c4;
+    --tg-accent: #4ea1ff;
+    --tg-destructive: #e74c3c;
+    --ok: #28c76f;
+    --warn: #ffaf00;
+    --err: #e74c3c;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+    background: var(--tg-bg);
+    color: var(--tg-text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Roboto",
+        "Segoe UI", system-ui, sans-serif;
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+}
+
+#app {
+    min-height: 100vh;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+        env(safe-area-inset-bottom) env(safe-area-inset-left);
+}
+
+/* ─── layout ────────────────────────────────────────────────────── */
+
+.screen {
+    padding: 16px 16px calc(16px + env(safe-area-inset-bottom));
+    max-width: 720px;
+    margin: 0 auto;
+}
+
+.screen-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding-bottom: 12px;
+}
+
+.screen-header h1 {
+    font-size: 22px;
+    font-weight: 600;
+    margin: 0;
+}
+
+/* ─── cards / sections ──────────────────────────────────────────── */
+
+.card {
+    background: var(--tg-section-bg);
+    border-radius: 16px;
+    padding: 16px;
+    margin: 0 0 12px;
+}
+
+.card-title {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--tg-section-header-text);
+    margin: 0 0 8px;
+}
+
+.balance-amount {
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+}
+
+.row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 0;
+    border-top: 1px solid var(--tg-secondary-bg);
+}
+.row:first-child {
+    border-top: none;
+}
+.row-title {
+    color: var(--tg-text);
+    font-size: 15px;
+}
+.row-subtitle {
+    color: var(--tg-hint);
+    font-size: 13px;
+    margin-top: 2px;
+}
+.row-aside {
+    color: var(--tg-hint);
+    font-size: 14px;
+    text-align: right;
+    white-space: nowrap;
+}
+
+/* ─── buttons ───────────────────────────────────────────────────── */
+
+.btn {
+    appearance: none;
+    border: none;
+    outline: none;
+    background: var(--tg-button);
+    color: var(--tg-button-text);
+    font-size: 16px;
+    font-weight: 600;
+    padding: 14px 20px;
+    border-radius: 12px;
+    width: 100%;
+    cursor: pointer;
+    min-height: 50px;
+    transition: opacity 0.15s ease;
+}
+.btn:active {
+    opacity: 0.7;
+}
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.btn-secondary {
+    background: var(--tg-secondary-bg);
+    color: var(--tg-text);
+}
+
+.btn-danger {
+    background: var(--tg-destructive);
+    color: white;
+}
+
+/* Tab-bar (bottom navigation) */
+.tabs {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    background: var(--tg-secondary-bg);
+    border-top: 1px solid color-mix(in srgb, var(--tg-text) 10%, transparent);
+    padding: 6px 0 calc(6px + env(safe-area-inset-bottom));
+}
+.tab {
+    flex: 1;
+    text-align: center;
+    padding: 8px 4px;
+    color: var(--tg-hint);
+    font-size: 11px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+}
+.tab[data-active="true"] {
+    color: var(--tg-accent);
+}
+.tab-icon {
+    display: block;
+    font-size: 22px;
+    line-height: 1;
+    margin-bottom: 2px;
+}
+
+/* ─── catalog grid ──────────────────────────────────────────────── */
+
+.group-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+}
+.group-card {
+    background: var(--tg-section-bg);
+    border-radius: 14px;
+    padding: 14px;
+    cursor: pointer;
+    text-align: left;
+    color: var(--tg-text);
+    border: none;
+    transition: transform 0.1s ease;
+}
+.group-card:active {
+    transform: scale(0.97);
+}
+.group-card .emoji {
+    font-size: 32px;
+    line-height: 1;
+}
+.group-card .name {
+    font-weight: 600;
+    margin: 8px 0 4px;
+    font-size: 15px;
+}
+.group-card .price {
+    color: var(--tg-accent);
+    font-size: 13px;
+}
+.group-card .meta {
+    color: var(--tg-hint);
+    font-size: 12px;
+    margin-top: 2px;
+}
+
+/* ─── service card ──────────────────────────────────────────────── */
+
+.service-name {
+    font-size: 20px;
+    font-weight: 700;
+    margin: 0 0 8px;
+}
+.service-price {
+    font-size: 24px;
+    font-weight: 700;
+    color: var(--tg-accent);
+    margin: 8px 0;
+}
+.stock-bar {
+    height: 6px;
+    background: var(--tg-secondary-bg);
+    border-radius: 3px;
+    overflow: hidden;
+    margin: 10px 0;
+}
+.stock-bar-fill {
+    height: 100%;
+    background: var(--ok);
+    transition: width 0.3s ease;
+}
+
+/* ─── loading & errors ──────────────────────────────────────────── */
+
+.loading,
+.empty {
+    text-align: center;
+    padding: 40px 16px;
+    color: var(--tg-hint);
+}
+.error-box {
+    background: color-mix(in srgb, var(--err) 14%, transparent);
+    color: var(--err);
+    border-radius: 12px;
+    padding: 12px;
+    margin: 12px 0;
+    font-size: 14px;
+}
+.success-box {
+    background: color-mix(in srgb, var(--ok) 14%, transparent);
+    color: var(--ok);
+    border-radius: 12px;
+    padding: 12px;
+    margin: 12px 0;
+    font-size: 14px;
+}
+
+/* ─── orders ────────────────────────────────────────────────────── */
+
+.order-card {
+    background: var(--tg-section-bg);
+    border-radius: 14px;
+    padding: 14px;
+    margin-bottom: 10px;
+    cursor: pointer;
+    border: none;
+    width: 100%;
+    text-align: left;
+    color: var(--tg-text);
+}
+.order-card .top {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+}
+.order-card .name {
+    font-weight: 600;
+    flex: 1;
+}
+.order-card .status {
+    font-size: 12px;
+    margin-left: 8px;
+    white-space: nowrap;
+}
+.order-card .meta {
+    color: var(--tg-hint);
+    font-size: 13px;
+    margin-top: 6px;
+    display: flex;
+    justify-content: space-between;
+}
+
+.pin-row {
+    background: var(--tg-secondary-bg);
+    border-radius: 10px;
+    padding: 10px 12px;
+    margin: 6px 0;
+    font-family: ui-monospace, "SF Mono", "Roboto Mono", monospace;
+    font-size: 14px;
+    word-break: break-all;
+    cursor: pointer;
+    transition: background 0.15s ease;
+}
+.pin-row:active {
+    background: color-mix(in srgb, var(--tg-button) 30%, var(--tg-secondary-bg));
+}
+.pin-copy-hint {
+    color: var(--tg-hint);
+    font-size: 11px;
+    margin-top: 4px;
+}

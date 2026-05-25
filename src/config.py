@@ -232,6 +232,17 @@ class Settings(BaseSettings):
     # чтобы не вызвать r429 burst если зомби накопились пачкой.
     zombie_lot_reaper_max_per_run: int = Field(default=5, ge=1, le=50)
 
+    # ─── Sprint 6: Telegram Mini App ────────────────────────────────────
+    # URL Mini App, который шоп-бот будет открывать через WebAppInfo.
+    # Должен быть HTTPS и доступен из Telegram (cloudflare tunnel / nginx).
+    # Пример: "https://neurodrop.ru/app". Если None — Menu Button не
+    # регистрируется, Mini App не доступен через бота.
+    shop_webapp_url: str | None = None
+    # Список CORS origin'ов для разработки Mini App.
+    # В проде обычно пусто (Mini App обслуживается тем же доменом, что и API).
+    # Локально: ["http://localhost:5173"] для Vite dev server'а.
+    shop_webapp_cors_origins: list[str] | None = None
+
     # ─── Sprint 5: Shop delivery worker ─────────────────────────────────
     # Воркер делает create_order/pay_order/wait_completion для shop_orders
     # в статусе paid/delivering. Inline-runner запустится сразу после

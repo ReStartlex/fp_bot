@@ -70,3 +70,10 @@ secrets/
 # ===== Локальные временные файлы агента =====
 PROJECT_CONTEXT.md
 image.png
+
+# ===== Node.js / Mini App (Sprint 6) =====
+# node_modules не коммитим, dist (build artifacts) src/web/miniapp/ — коммитим
+# чтобы VPS-deploy не требовал Node.js на сервере.
+node_modules/
+src/web/miniapp-src/dist/
+.vite/
