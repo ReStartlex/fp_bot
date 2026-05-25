@@ -453,6 +453,12 @@ async def sync_once(
     # Это НЕ skipped — это «не было нужды трогать», т.е. желаемый
     # стабильный режим. Логируется отдельным полем в "Sync done".
     lots_unchanged = 0
+    # Счётчик «capped»: лотов, у которых NS_stock > effective_cap.
+    # Полезно для UX-диагностики: «99/100» после продажи может выглядеть
+    # как «не синхронизируется», хотя на самом деле работает корректно —
+    # просто cap=100 ограничивает выставленный stock. Высокое значение
+    # capped=N намекает что юзеру стоит увеличить cap или дать per-lot cap.
+    lots_capped = 0
     error: str | None = None
     # Маппинги, которые нужно обновить last_synced_* после успешного цикла
     # (только те, для которых _apply_decision прошёл без исключения).
@@ -584,6 +590,25 @@ async def sync_once(
             action_str = ", ".join(actions) if actions else "no changes"
             label = decision.label or f"lot {decision.funpay_lot_id}"
 
+            # Cap-аннотация: если NS возвращает stock больше нашего cap'а,
+            # дописываем подсказку «capped: NS=N>cap=K» в action_str.
+            # Это полезно при диагностике «висит на 99» — сразу видно
+            # что это работа cap'а, а не баг синхронизации.
+            # Поле в Service называется in_stock (а не stock); запас на
+            # случай миграции схемы — оба варианта.
+            ns_service_for_log = services_index.get(decision.ns_service_id)
+            if ns_service_for_log is not None:
+                raw_ns_stock = int(
+                    getattr(ns_service_for_log, "in_stock", None)
+                    or getattr(ns_service_for_log, "stock", 0)
+                    or 0
+                )
+                if raw_ns_stock > decision.target.stock and decision.target.stock > 0:
+                    lots_capped += 1
+                    action_str = (
+                        f"{action_str} (capped: NS={raw_ns_stock}>cap={decision.target.stock})"
+                    )
+
             if decision.skip_reason:
                 logger.warning(f"  [{label}] SKIP: {decision.skip_reason}")
                 lots_skipped += 1
@@ -707,12 +732,17 @@ async def sync_once(
     # потому что не было «решения»).
     total_mappings = lots_checked + lots_unchanged
 
+    # `capped=N` показываем только если N>0, чтобы не засорять обычные
+    # строки. Конкретные имена capped-лотов не пишем — это видно
+    # построчно через action_str «(capped: NS=N>cap=K)».
+    capped_suffix = f", capped={lots_capped}" if lots_capped > 0 else ""
+
     if total_mappings > 0 or error:
         # На exhausted'ы хотим обращать внимание — повышаем уровень до WARNING.
         line = (
             f"Sync done: checked={lots_checked}, "
             f"unchanged={lots_unchanged}, "
-            f"updated={lots_updated}, skipped={lots_skipped}, {http_str}"
+            f"updated={lots_updated}, skipped={lots_skipped}{capped_suffix}, {http_str}"
         )
         if http_metrics["exhausted"] > 0:
             logger.warning(line + "  (есть исчерпания retry — лоты пропущены!)")
@@ -722,12 +752,13 @@ async def sync_once(
         logger.debug(
             f"Sync done (empty): checked={lots_checked}, "
             f"unchanged={lots_unchanged}, "
-            f"updated={lots_updated}, skipped={lots_skipped}, {http_str}"
+            f"updated={lots_updated}, skipped={lots_skipped}{capped_suffix}, {http_str}"
         )
     return {
         "checked": lots_checked,
         "unchanged": lots_unchanged,
         "updated": lots_updated,
         "skipped": lots_skipped,
+        "capped": lots_capped,
         "http": http_metrics,
     }
