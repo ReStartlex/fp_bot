@@ -363,6 +363,7 @@ class TelegramBot:
         "/clear_target — забыть выбранный целевой лот\n"
         "/calc &lt;funpay_lot_id&gt; — посчитать цены по маппингу\n"
         "/inspect_lot &lt;funpay_lot_id&gt; — заглянуть в LotFields\n"
+        "/lot_status &lt;funpay_lot_id&gt; — read-only диагностика: cache, capped, target\n"
         "\n"
         "<b>Глобальные настройки (без рестарта)</b>\n"
         "/settings — показать активные значения\n"
@@ -483,6 +484,7 @@ class TelegramBot:
             BotCommand(command="setdefault", description="🎚 Глобальные настройки (markup/premium/stock)"),
             BotCommand(command="settings", description="🔧 Показать текущие настройки"),
             BotCommand(command="force_sync", description="🔬 Прогнать один лот с деталями"),
+            BotCommand(command="lot_status", description="🩹 Read-only: cache/capped/target лота"),
             BotCommand(command="funpay_check", description="🩺 Проверить FunPay-сессию"),
             BotCommand(command="funpay_reconnect", description="🔌 FunPay reconnect"),
             BotCommand(command="ping", description="🏓 Проверка связи"),
@@ -688,6 +690,12 @@ class TelegramBot:
             if not self._is_owner(msg):
                 return
             await self._do_inspect_lot(msg)
+
+        @dp.message(Command("lot_status"))
+        async def cmd_lot_status(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_lot_status(msg)
 
         @dp.message(Command("setmarkup"))
         async def cmd_setmarkup(msg: Message) -> None:
@@ -3754,6 +3762,230 @@ class TelegramBot:
             await msg.answer(f"Ошибка: <code>{html.escape(str(exc))}</code>")
             return
         text = _format_inspect(funpay_lot_id, summary)
+        await msg.answer(text, reply_markup=ui.single_close_kb())
+
+    @_guard
+    async def _do_lot_status(self, msg: Message) -> None:
+        """
+        /lot_status <funpay_lot_id>
+
+        Read-only диагностика одного лота. В отличие от /force_sync:
+          * НЕ применяет изменения к FunPay (только show);
+          * НЕ зависит от FunPay-GET (если 429 — всё равно покажет cache state);
+          * показывает diff-cache: TTL fresh/stale, last_synced_*;
+          * показывает capped-indicator: NS_stock vs effective cap;
+          * подсказывает, что произойдёт на следующем sync-цикле.
+
+        Используется в кейсах вроде «лот показывает 99 уже долго»:
+        видно, либо это работа stock_cap (нормально), либо cache никогда
+        не stale'ется (баг).
+        """
+        parts = (msg.text or "").strip().split()
+        if len(parts) < 2:
+            await msg.answer(
+                "Использование: <code>/lot_status &lt;funpay_lot_id&gt;</code>\n\n"
+                "Read-only диагностика лота (без применения изменений).",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        try:
+            lot_id = int(parts[1])
+        except ValueError:
+            await msg.answer("funpay_lot_id должен быть числом")
+            return
+
+        from src.config_runtime import (
+            get_global_markup_percent, get_stock_cap,
+        )
+        from src.mapping.rules import compute_pricing
+        from src.sync.fx import get_rate_breakdown
+        from src.sync.stock_sync import _flatten_services
+
+        # 1. маппинг + group из БД
+        async with session_factory()() as session:
+            mapping = (await session.execute(
+                select(Mapping).where(Mapping.funpay_lot_id == lot_id)
+            )).scalar_one_or_none()
+            group = (
+                await session.get(LotGroup, mapping.group_id)
+                if mapping is not None and mapping.group_id is not None
+                else None
+            )
+
+        if mapping is None:
+            await msg.answer(
+                f"❌ Маппинга для лота <code>{lot_id}</code> нет.\n"
+                f"Используй /lots → 🎯 + /ns_search для создания.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        # 2. NS-сервис (без force, используем cache от get_stock — он
+        # обновляется catalog_sync каждые 90с, для read-only достаточно).
+        try:
+            stock = await self._get_stock(force=False)
+        except Exception as exc:
+            await msg.answer(
+                f"❌ NS get_stock упал: <code>{html.escape(str(exc))[:200]}</code>",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        ns_svc = _flatten_services(stock).get(mapping.ns_service_id)
+
+        # 3. курс + наценка + cap (effective)
+        rate = await get_rate_breakdown(self._settings)
+        eff_markup = await get_global_markup_percent(self._settings)
+        eff_stock_cap = await get_stock_cap(self._settings)
+
+        # 4. target (без FunPay-GET — чисто на основе NS+rate+cap)
+        target = None
+        capped_note = ""
+        if ns_svc is not None:
+            target = compute_pricing(
+                ns_service=ns_svc,
+                mapping=mapping,
+                settings=self._settings,
+                fx_rate_usd_to_target=rate.effective,
+                default_markup=eff_markup,
+                default_stock_cap=eff_stock_cap,
+                group_markup_percent=group.markup_percent if group is not None else None,
+                group_stock_cap=group.stock_cap if group is not None else None,
+            )
+            raw_ns_stock = int(ns_svc.in_stock or 0)
+            if raw_ns_stock > target.stock and target.stock > 0:
+                capped_note = (
+                    f" ⚠ <b>capped</b>: NS={raw_ns_stock} > cap={target.stock}"
+                )
+
+        # 5. Diff-cache state
+        last_at = getattr(mapping, "last_synced_at", None)
+        last_price = getattr(mapping, "last_synced_price", None)
+        last_stock = getattr(mapping, "last_synced_stock", None)
+        last_active = getattr(mapping, "last_synced_active", None)
+        ttl = int(getattr(self._settings, "sync_stock_diff_cache_ttl_seconds", 300))
+
+        cache_status = "<i>never synced</i>"
+        cache_fresh = False
+        minutes_ago: float | None = None
+        if last_at is not None:
+            delta = (datetime.utcnow() - last_at).total_seconds()
+            minutes_ago = delta / 60.0
+            cache_fresh = delta < ttl
+            cache_status = (
+                f"{'🟢 fresh' if cache_fresh else '🟡 stale'} "
+                f"({minutes_ago:.1f} мин назад, TTL={ttl}с)"
+            )
+
+        # 6. Сравнение target vs last_synced (что бы произошло в fast-path)
+        cache_hit_predicted = False
+        if target is not None and cache_fresh and last_price is not None and \
+                last_stock is not None and last_active is not None:
+            target_active = target.stock > 0
+            if (
+                abs(float(last_price) - float(target.round_price())) <= 0.005
+                and int(last_stock) == int(target.stock)
+                and bool(last_active) == bool(target_active)
+            ):
+                cache_hit_predicted = True
+
+        # 7. Текущий FunPay state (опционально — может упасть 429)
+        funpay_line = "<i>FunPay GET не пробовали (read-only)</i>"
+        # Если кэш stale — реальное состояние ВАЖНО показать, иначе
+        # пользователь не поймёт почему cache fast-path skip'ает.
+        if not cache_fresh and self._funpay_client is not None:
+            try:
+                lf = await asyncio.wait_for(
+                    self._funpay_client.get_lot_fields(lot_id),
+                    timeout=FP_TIMEOUT_SECONDS,
+                )
+                fp_price = getattr(lf, "price", "?")
+                fp_amount = getattr(lf, "amount", "?")
+                fp_active = getattr(lf, "active", "?")
+                funpay_line = (
+                    f"<b>FunPay сейчас:</b> price=<code>{fp_price}</code>, "
+                    f"stock=<code>{fp_amount}</code>, "
+                    f"active=<code>{fp_active}</code>"
+                )
+            except Exception as exc:
+                funpay_line = (
+                    f"⚠ FunPay GET упал (читать продолжаем в фоне): "
+                    f"<code>{html.escape(str(exc))[:120]}</code>"
+                )
+
+        # 8. Выносим вердикт
+        if target is None:
+            verdict = "❌ NS-сервис не найден в каталоге"
+        elif cache_hit_predicted:
+            verdict = (
+                "🟢 <b>Cache hit ожидается</b> — fast-path skip, "
+                "FunPay-GET не будет."
+            )
+        elif cache_fresh and target is not None:
+            verdict = (
+                "🟡 <b>Cache fresh, но target != last_synced</b> — "
+                "что-то случилось, но cache не пустим. "
+                "Дождёмся TTL или /force_sync."
+            )
+        else:
+            verdict = (
+                f"🔄 <b>Cache stale</b> — на следующем sync-цикле будет "
+                f"FunPay-GET + потенциальный save_lot."
+            )
+
+        # 9. Сборка ответа
+        ns_line = (
+            f"🛒 <b>NS:</b> {html.escape(ns_svc.service_name[:60])} "
+            f"(${ns_svc.price:.4f}, in_stock={ns_svc.in_stock})"
+            if ns_svc is not None
+            else "🛒 <b>NS:</b> сервис не найден в каталоге!"
+        )
+        markup_origin = (
+            f"mapping {mapping.markup_percent}%"
+            if mapping.markup_percent is not None else f"global {eff_markup}%"
+        )
+        cap_origin = (
+            f"mapping {mapping.stock_cap}"
+            if mapping.stock_cap is not None
+            else (
+                f"group {group.stock_cap}"
+                if group is not None and group.stock_cap is not None
+                else f"global {eff_stock_cap}"
+            )
+        )
+
+        target_block = (
+            (
+                f"<b>Target (что бот хочет на FunPay):</b>\n"
+                f"  price: <b>{target.round_price()} "
+                f"{target.currency.value}</b>\n"
+                f"  stock: <b>{target.stock}</b>{capped_note}\n"
+            )
+            if target is not None else
+            "<b>Target:</b> не вычислен (нет NS-сервиса)\n"
+        )
+
+        cache_block = (
+            f"<b>Diff-cache (last save_lot success):</b>\n"
+            f"  price: <code>{last_price}</code>\n"
+            f"  stock: <code>{last_stock}</code>\n"
+            f"  active: <code>{last_active}</code>\n"
+            f"  status: {cache_status}\n"
+        )
+
+        text = (
+            f"🩹 <b>lot_status #{lot_id}</b>\n"
+            f"<i>{html.escape(mapping.label or '—')[:70]}</i>\n\n"
+            f"📌 ns_service_id=<code>{mapping.ns_service_id}</code>, "
+            f"enabled=<code>{mapping.enabled}</code>\n"
+            f"📈 markup: {markup_origin}\n"
+            f"📦 cap: {cap_origin}\n"
+            f"💱 USD/RUB: <b>{rate.effective:.4f}</b>\n\n"
+            f"{ns_line}\n\n"
+            f"{target_block}\n"
+            f"{cache_block}\n"
+            f"{funpay_line}\n\n"
+            f"{verdict}"
+        )
         await msg.answer(text, reply_markup=ui.single_close_kb())
 
     @_guard
