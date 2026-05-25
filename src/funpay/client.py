@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from dataclasses import dataclass, field
 from typing import Any, Callable, TypeVar
 
 from loguru import logger
@@ -16,6 +17,28 @@ from src.config import Settings, get_settings
 
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class PaidSalesSnapshot:
+    """Результат `get_paid_sales_snapshot`.
+
+    Аудит #7: чтобы `sync_pending_confirmation` мог отличить "точно
+    весь список оплачённых заказов" от "пагинация оборвалась, могут
+    быть пропущены" — иначе под флагом «авто-confirmed» закрываются
+    реально-оплачённые заказы, для которых деньги ещё заморожены.
+    """
+
+    ids: list[str] = field(default_factory=list)
+    is_complete: bool = True
+    truncated_reason: str | None = None
+
+    def __iter__(self):
+        # Обратная совместимость с кодом, который раньше получал list[str].
+        return iter(self.ids)
+
+    def __len__(self) -> int:
+        return len(self.ids)
 
 
 class FunPayClient:
@@ -429,7 +452,7 @@ class FunPayClient:
     # перекрывают любой реалистичный размер списка «Оплачен».
     _PAID_SALES_MAX_PAGES = 50
 
-    async def get_paid_sales_snapshot(self) -> list[str]:
+    async def get_paid_sales_snapshot(self) -> "PaidSalesSnapshot":
         """
         Возвращает funpay_order_id всех заказов в статусе «Оплачен»
         (ожидающих подтверждения покупателя/саппорта).
@@ -447,6 +470,8 @@ class FunPayClient:
         result: list[str] = []
         cursor: str | None = None
         seen_cursors: set[str] = set()
+        is_complete = True
+        truncated_reason: str | None = None
 
         for _ in range(self._PAID_SALES_MAX_PAGES):
 
@@ -479,6 +504,8 @@ class FunPayClient:
                     f"FunPay get_sells вернул повторный курсор "
                     f"{next_cursor_str!r} — прекращаю пагинацию"
                 )
+                is_complete = False
+                truncated_reason = f"повторный курсор {next_cursor_str!r}"
                 break
             seen_cursors.add(next_cursor_str)
             cursor = next_cursor_str
@@ -487,8 +514,16 @@ class FunPayClient:
                 f"FunPay get_sells достиг лимита {self._PAID_SALES_MAX_PAGES} "
                 "страниц пагинации — возможно зацикленный курсор"
             )
+            is_complete = False
+            truncated_reason = (
+                f"достигнут лимит {self._PAID_SALES_MAX_PAGES} страниц"
+            )
 
-        return result
+        return PaidSalesSnapshot(
+            ids=result,
+            is_complete=is_complete,
+            truncated_reason=truncated_reason,
+        )
 
     # ----- Лоты -----
 
@@ -824,23 +859,30 @@ class FunPayClient:
         # Fallback: прямой HTTP POST через admin_http
         try:
             result = await self._admin.send_chat_message(chat_id, text)
-            if result.get("ok"):
-                logger.info(
-                    f"FunPay send_message OK [via admin_http fallback]: "
-                    f"chat={chat_id}, text={text_preview!r}"
-                )
-            else:
-                logger.error(
-                    f"FunPay send_message FAIL даже через fallback: "
-                    f"chat={chat_id}, result={result}"
-                )
-            return result
         except Exception as exc:
             logger.opt(exception=exc).error(
                 f"FunPay send_message: и FunPayAPI, и admin_http упали. "
                 f"chat={chat_id}, text={text_preview!r}, err={exc}"
             )
             raise
+
+        if result.get("ok"):
+            logger.info(
+                f"FunPay send_message OK [via admin_http fallback]: "
+                f"chat={chat_id}, text={text_preview!r}"
+            )
+            return result
+
+        # Аудит #2: admin_http вернул {"ok": False} — сообщение НЕ доставлено.
+        # Бросаем RuntimeError, чтобы вызывающий код (processor, chat handler)
+        # НЕ счёл это успехом и не пометил заказ как delivered.
+        logger.error(
+            f"FunPay send_message FAIL даже через fallback: "
+            f"chat={chat_id}, result={result}"
+        )
+        raise RuntimeError(
+            f"FunPay send_message failed via admin_http fallback: {result}"
+        )
 
     # ----- Диагностика -----
 

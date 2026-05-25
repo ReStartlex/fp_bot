@@ -21,6 +21,51 @@ async def db_factory(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_reconciler_replays_stale_received_orders(db_factory, monkeypatch):
+    """
+    Аудит #5: если crash случился между create_order в БД (status=received)
+    и началом NS-pipeline, заказ висит «навсегда» — старый reconciler
+    его игнорировал. Теперь reconciler должен догнать такие заказы.
+    """
+    async with db_factory() as session:
+        session.add(
+            Order(
+                funpay_order_id="fp-stale-received",
+                funpay_lot_id=100,
+                ns_service_id=20,
+                buyer_username="buyer",
+                chat_id=555,
+                quantity=1,
+                status="received",  # ← застрял на самом первом шаге
+                updated_at=datetime.utcnow() - timedelta(minutes=5),
+            )
+        )
+        await session.commit()
+
+    seen: list[str] = []
+
+    async def fake_process(event, **_kwargs):
+        seen.append(event.funpay_order_id)
+        return {"status": "delivered"}
+
+    monkeypatch.setattr(reconciler, "process_funpay_order", fake_process)
+
+    settings = type("S", (), {
+        "order_reconcile_enabled": True,
+        "order_reconcile_stale_after_seconds": 60,
+        "order_reconcile_max_per_run": 10,
+    })()
+
+    result = await reconciler.reconcile_orders_once(settings=settings)
+
+    assert seen == ["fp-stale-received"], (
+        "reconciler должен подхватить status=received старше "
+        f"stale_after_seconds, но не подхватил: {seen}"
+    )
+    assert result["recovered"] == 1
+
+
+@pytest.mark.asyncio
 async def test_reconciler_replays_stale_pins_ready_orders(db_factory, monkeypatch):
     async with db_factory() as session:
         session.add(

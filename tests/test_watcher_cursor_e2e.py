@@ -343,6 +343,113 @@ async def test_same_help_text_with_different_message_ids_is_not_deduped(db_facto
 
 
 @pytest.mark.asyncio
+async def test_cursor_not_advanced_when_handler_raises(db_factory):
+    """
+    Аудит #4: если message-handler упал на сообщении, курсор НЕ должен
+    продвигаться — иначе сообщение никогда не будет переобработано.
+
+    Контракт: cursor advance происходит ТОЛЬКО после успешного await
+    handler'а. Если handler упал — следующий poll увидит это сообщение
+    снова и попробует обработать.
+    """
+    fp, admin, w = _make_watcher_with_admin()
+    chat_id = 200
+
+    async with db_factory() as session:
+        await upsert_chat_cursor(session, chat_id=chat_id, last_message_id=10000)
+        await session.commit()
+
+    w._baseline_ready.set()
+    w._poll_snapshot[chat_id] = {"preview": "что-то"}
+
+    admin.get_chats_snapshot = AsyncMock(return_value=[
+        {"chat_id": chat_id, "username": "buyer", "preview": "!помощь", "unread": False},
+    ])
+    admin.get_chat_messages = AsyncMock(return_value=[
+        {"message_id": 10001, "author_id": 1, "author_username": "buyer", "text": "!помощь"},
+    ])
+
+    attempts: list = []
+
+    async def _failing_handler(msg):
+        attempts.append(msg)
+        raise RuntimeError("handler exploded")
+
+    w._on_new_message = _failing_handler
+
+    await w._poll_once_async()
+    await asyncio.sleep(0.05)
+
+    assert len(attempts) == 1
+    assert attempts[0].text == "!помощь"
+
+    async with db_factory() as session:
+        cursor = await get_chat_cursor(session, chat_id)
+        # Курсор НЕ должен был продвинуться выше 10000 (предыдущего значения).
+        assert cursor.last_message_id == 10000, (
+            f"Аудит #4: при падении handler'а курсор должен остаться на "
+            f"{10000}, но стал {cursor.last_message_id}. Сообщение 10001 "
+            f"никогда не будет переобработано."
+        )
+
+
+@pytest.mark.asyncio
+async def test_cursor_advances_per_message_when_handler_succeeds(db_factory):
+    """
+    Per-message cursor advance: после успешного handler'а каждого сообщения
+    курсор должен подниматься до его message_id.
+
+    Это покрывает кейс: 3 сообщения, handler упал на 2-м. Курсор должен
+    остаться на id 1-го сообщения, чтобы 2-е и 3-е переобработать в
+    следующем poll.
+    """
+    fp, admin, w = _make_watcher_with_admin()
+    chat_id = 300
+
+    async with db_factory() as session:
+        await upsert_chat_cursor(session, chat_id=chat_id, last_message_id=20000)
+        await session.commit()
+
+    w._baseline_ready.set()
+    w._poll_snapshot[chat_id] = {"preview": "что-то"}
+
+    admin.get_chats_snapshot = AsyncMock(return_value=[
+        {"chat_id": chat_id, "username": "buyer", "preview": "...", "unread": False},
+    ])
+    admin.get_chat_messages = AsyncMock(return_value=[
+        {"message_id": 20001, "author_id": 1, "author_username": "buyer", "text": "msg-1"},
+        {"message_id": 20002, "author_id": 1, "author_username": "buyer", "text": "msg-2"},
+        {"message_id": 20003, "author_id": 1, "author_username": "buyer", "text": "msg-3"},
+    ])
+
+    handled: list = []
+
+    async def _handler_fails_on_second(msg):
+        handled.append(msg.text)
+        if msg.text == "msg-2":
+            raise RuntimeError("oops")
+
+    w._on_new_message = _handler_fails_on_second
+
+    await w._poll_once_async()
+    await asyncio.sleep(0.05)
+
+    # msg-1 успешно обработан, msg-2 упал → msg-3 НЕ должен быть отправлен
+    assert handled == ["msg-1", "msg-2"], (
+        f"После fail msg-2 dispatch последующих msg должен остановиться, "
+        f"получили: {handled}"
+    )
+
+    async with db_factory() as session:
+        cursor = await get_chat_cursor(session, chat_id)
+        assert cursor.last_message_id == 20001, (
+            f"Курсор должен указывать на последний успешно обработанный "
+            f"msg-id (20001), а не на 20002 или 20003. Получено: "
+            f"{cursor.last_message_id}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_new_chat_appears_after_first_run_processes_last_message(db_factory):
     fp, admin, w = _make_watcher_with_admin()
 

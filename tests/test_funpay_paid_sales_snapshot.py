@@ -63,9 +63,10 @@ async def test_get_paid_sales_snapshot_filters_by_state_paid():
     account.get_sells.return_value = (None, [_mk_order("AAA111")])
 
     fp = _make_client_with_account(account)
-    result = await fp.get_paid_sales_snapshot()
+    snapshot = await fp.get_paid_sales_snapshot()
 
-    assert result == ["AAA111"]
+    assert snapshot.ids == ["AAA111"]
+    assert snapshot.is_complete is True
     account.get_sells.assert_called_once()
     _, kwargs = account.get_sells.call_args
     assert kwargs.get("state") == "paid"
@@ -89,9 +90,10 @@ async def test_get_paid_sales_snapshot_paginates():
     ]
 
     fp = _make_client_with_account(account)
-    result = await fp.get_paid_sales_snapshot()
+    snapshot = await fp.get_paid_sales_snapshot()
 
-    assert result == ["A1", "A2", "B1", "B2", "C1"]
+    assert snapshot.ids == ["A1", "A2", "B1", "B2", "C1"]
+    assert snapshot.is_complete is True
     assert account.get_sells.call_count == 3
     call_args_list = account.get_sells.call_args_list
     assert call_args_list[0].kwargs.get("start_from") is None
@@ -111,9 +113,9 @@ async def test_get_paid_sales_snapshot_strips_hash_prefix():
     account.get_sells.return_value = (None, [order_with_hash])
 
     fp = _make_client_with_account(account)
-    result = await fp.get_paid_sales_snapshot()
+    snapshot = await fp.get_paid_sales_snapshot()
 
-    assert result == ["XYZ999"]
+    assert snapshot.ids == ["XYZ999"]
 
 
 @pytest.mark.asyncio
@@ -123,9 +125,10 @@ async def test_get_paid_sales_snapshot_empty_result():
     account.get_sells.return_value = (None, [])
 
     fp = _make_client_with_account(account)
-    result = await fp.get_paid_sales_snapshot()
+    snapshot = await fp.get_paid_sales_snapshot()
 
-    assert result == []
+    assert snapshot.ids == []
+    assert snapshot.is_complete is True
 
 
 @pytest.mark.asyncio
@@ -141,8 +144,29 @@ async def test_get_paid_sales_snapshot_stops_at_pagination_limit():
     account.get_sells.return_value = ("LOOP_CURSOR", [_mk_order("X1")])
 
     fp = _make_client_with_account(account)
-    result = await fp.get_paid_sales_snapshot()
+    snapshot = await fp.get_paid_sales_snapshot()
 
     # Должно завершиться, не уйти в бесконечный цикл
     assert account.get_sells.call_count <= 50
-    assert len(result) <= 50  # один заказ за страницу * лимит страниц
+    assert len(snapshot.ids) <= 50  # один заказ за страницу * лимит страниц
+    # Аудит #7: при обрыве пагинации snapshot ОБЯЗАН быть помечен
+    # как неполный, иначе sync_pending_confirmation ложно подтвердит
+    # оплаченные заказы вне выборки.
+    assert snapshot.is_complete is False
+    assert snapshot.truncated_reason
+
+
+@pytest.mark.asyncio
+async def test_get_paid_sales_snapshot_marks_incomplete_on_repeated_cursor():
+    """Аудит #7: повторный курсор → is_complete=False."""
+    account = MagicMock()
+    account.get_sells.side_effect = [
+        ("REPEAT_CURSOR", [_mk_order("A1")]),
+        ("REPEAT_CURSOR", [_mk_order("A2")]),
+    ]
+
+    fp = _make_client_with_account(account)
+    snapshot = await fp.get_paid_sales_snapshot()
+
+    assert snapshot.is_complete is False
+    assert "повторный курсор" in (snapshot.truncated_reason or "")

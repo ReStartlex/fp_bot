@@ -59,7 +59,16 @@ async def sync_pending_confirmation(
             "marked_confirmed": int,           # сколько только что закрыли
         }
     """
-    paid_ids = await funpay_client.get_paid_sales_snapshot()
+    snapshot = await funpay_client.get_paid_sales_snapshot()
+    # Обратная совместимость: старые тесты могут вернуть list[str].
+    if isinstance(snapshot, list):
+        paid_ids = snapshot
+        is_complete = True
+        truncated_reason: str | None = None
+    else:
+        paid_ids = list(snapshot.ids)
+        is_complete = bool(snapshot.is_complete)
+        truncated_reason = snapshot.truncated_reason
     paid_set = set(paid_ids)
 
     factory = session_factory()
@@ -74,25 +83,40 @@ async def sync_pending_confirmation(
 
         now = datetime.utcnow()
         marked = 0
-        for order in candidates:
-            if order.funpay_order_id in paid_set:
-                # Реально ещё ждёт подтверждения — оставляем.
-                continue
-            order.confirmed_at = now
-            order.confirmed_by = CONFIRMED_BY_ADMIN
-            marked += 1
+        # Аудит #7: если snapshot неполный (пагинация обрезана), помечать
+        # confirmed НЕЛЬЗЯ — paid_set может не содержать реально оплачённых
+        # заказов, и мы их ложно «подтвердим». Лучше пропустить mark и
+        # дождаться следующего полного snapshot'а (или показать оператору).
+        if not is_complete:
+            logger.warning(
+                f"sync_pending_confirmation: snapshot НЕПОЛНЫЙ "
+                f"(reason={truncated_reason!r}); НЕ помечаю заказы "
+                f"confirmed, чтобы не закрыть реально оплачённые. "
+                f"Кандидатов было: {len(candidates)}"
+            )
+        else:
+            for order in candidates:
+                if order.funpay_order_id in paid_set:
+                    # Реально ещё ждёт подтверждения — оставляем.
+                    continue
+                order.confirmed_at = now
+                order.confirmed_by = CONFIRMED_BY_ADMIN
+                marked += 1
 
-        if marked:
-            await session.commit()
+            if marked:
+                await session.commit()
 
     stats = {
         "paid_on_funpay": len(paid_set),
         "delivered_unconfirmed_in_db": len(candidates),
         "marked_confirmed": marked,
+        "snapshot_complete": is_complete,
+        "truncated_reason": truncated_reason,
     }
     logger.info(
         f"sync_pending_confirmation: paid_on_funpay={stats['paid_on_funpay']}, "
         f"delivered_unconfirmed_in_db={stats['delivered_unconfirmed_in_db']}, "
-        f"marked_confirmed={stats['marked_confirmed']}"
+        f"marked_confirmed={stats['marked_confirmed']}, "
+        f"snapshot_complete={is_complete}"
     )
     return stats

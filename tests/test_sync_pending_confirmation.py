@@ -62,9 +62,18 @@ async def _seed_delivered(
         await session.commit()
 
 
-def _make_funpay_client(paid_ids: list[str]) -> MagicMock:
+def _make_funpay_client(
+    paid_ids: list[str], *, is_complete: bool = True
+) -> MagicMock:
+    from src.funpay.client import PaidSalesSnapshot
     fp = MagicMock()
-    fp.get_paid_sales_snapshot = AsyncMock(return_value=paid_ids)
+    fp.get_paid_sales_snapshot = AsyncMock(
+        return_value=PaidSalesSnapshot(
+            ids=list(paid_ids),
+            is_complete=is_complete,
+            truncated_reason=None if is_complete else "лимит страниц",
+        )
+    )
     return fp
 
 
@@ -175,11 +184,10 @@ async def test_empty_db_returns_zero_stats(session_factory_fixture):
         session_factory=lambda: session_factory_fixture,
     )
 
-    assert stats == {
-        "paid_on_funpay": 2,
-        "delivered_unconfirmed_in_db": 0,
-        "marked_confirmed": 0,
-    }
+    assert stats["paid_on_funpay"] == 2
+    assert stats["delivered_unconfirmed_in_db"] == 0
+    assert stats["marked_confirmed"] == 0
+    assert stats["snapshot_complete"] is True
 
 
 @pytest.mark.asyncio
@@ -201,6 +209,42 @@ async def test_paid_id_unknown_to_db_is_ignored(session_factory_fixture):
     assert stats["marked_confirmed"] == 1
     assert stats["paid_on_funpay"] == 1
     assert stats["delivered_unconfirmed_in_db"] == 1
+
+
+@pytest.mark.asyncio
+async def test_does_not_mark_confirmed_when_snapshot_incomplete(
+    session_factory_fixture,
+):
+    """
+    Аудит #7: если FunPay pagination оборвалась (is_complete=False),
+    paid_set может не содержать реально оплачённых заказов. Пометить
+    их confirmed = закрыть реально-оплачённые заказы вместо тех, что
+    закрыл саппорт. Защита: при is_complete=False НЕ помечаем ничего.
+    """
+    await _seed_delivered(session_factory_fixture, "ORDER_A")
+    await _seed_delivered(session_factory_fixture, "ORDER_B")
+    fp = _make_funpay_client(paid_ids=["ORDER_A"], is_complete=False)
+
+    stats = await sync_pending_confirmation(
+        funpay_client=fp,
+        session_factory=lambda: session_factory_fixture,
+    )
+
+    assert stats["snapshot_complete"] is False
+    assert stats["marked_confirmed"] == 0, (
+        "При неполном snapshot НЕЛЬЗЯ помечать confirmed — paid_set "
+        "может не содержать реально оплачённых заказов."
+    )
+
+    async with session_factory_fixture() as session:
+        from sqlalchemy import select
+
+        result = await session.execute(select(Order))
+        for o in result.scalars().all():
+            assert o.confirmed_at is None, (
+                f"Заказ {o.funpay_order_id} не должен был быть помечен "
+                f"confirmed при is_complete=False"
+            )
 
 
 @pytest.mark.asyncio

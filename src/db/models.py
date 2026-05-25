@@ -203,7 +203,14 @@ class Order(Base):
     profit_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     profit_margin_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="received")
-    # Возможные статусы: received, ns_created, ns_paid, delivered, failed, refunded, manual_hold
+    # Возможные статусы:
+    #   received → ns_created → ns_paid → pins_ready → delivering → delivered
+    #   На любом шаге: failed | refunded | manual_hold
+    #
+    # `delivering` — промежуточный статус «send_message в FunPay в процессе».
+    # Аудит #3: если crash между success send_message и commit'ом delivered,
+    # статус останется delivering, и reconciler НЕ повторит отправку
+    # автоматически (риск дубля), а переведёт в manual_hold для оператора.
     pins_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # Описание лота как пришло из FunPay-события. Нужно reconciler'у,

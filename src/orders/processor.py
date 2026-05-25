@@ -55,9 +55,10 @@ from src.ns import NSClient
 from src.ns.exceptions import (
     NSError,
     NSInsufficientFunds,
+    NSNotFoundError,
     NSOrderTimeoutError,
 )
-from src.ns.models import OrderStatus
+from src.ns.models import OrderInfo, OrderStatus
 from src.sync.fx import get_usd_rub_rate
 
 
@@ -307,6 +308,30 @@ def _is_hard_timeout(
     if limit <= 0:
         return False
     return _order_age_seconds(order, now=now) >= limit
+
+
+async def _ns_check_existing_order(
+    ns_client: NSClient,
+    custom_id: str,
+    log,
+) -> OrderInfo | None:
+    """Аудит #1: idempotency-проверка существования NS-заказа.
+
+    Возвращает OrderInfo если заказ уже существует в NS, иначе None.
+    404 — заказа нет (можно безопасно создавать). Любая другая ошибка
+    логируется и трактуется как «не знаем» → None (продолжим create/pay
+    как обычно; deterministic custom_id защитит от UUID-дубля при retry).
+    """
+    try:
+        return await ns_client.order_info(custom_id)
+    except NSNotFoundError:
+        return None
+    except NSError as exc:
+        log.warning(
+            f"NS idempotency check для {custom_id} упал: {exc}; "
+            "продолжаю обычным путём"
+        )
+        return None
 
 
 async def _trigger_manual_hold(
@@ -683,23 +708,48 @@ async def _process_locked(
                 )
                 return {"status": "failed", "reason": error_text}
 
-            try:
-                created = await ns_client.create_order(
-                    service_id=mapping.ns_service_id, fields=ns_fields
-                )
-            except NSError as exc:
-                error_text = f"NS create_order упал: {exc}"
-                log.error(error_text)
-                await _mark_failed(
-                    db_order_id, error_text, telegram, event,
-                    funpay_client=funpay_client,
-                    funpay_lot_id=effective_funpay_lot_id,
-                    log=log,
-                )
-                return {"status": "failed", "reason": error_text}
+            # Аудит #1: idempotency NS create_order.
+            # 1) Deterministic custom_id (`fp-{funpay_order_id}`): при retry
+            #    обращаемся к ТОМУ ЖЕ NS-заказу, никакого UUID-дубля.
+            # 2) Intent marker: сохраняем custom_id в БД ДО вызова NS, чтобы
+            #    при crash до ответа retry уже знал, какой id проверять.
+            # 3) Pre-check `order_info`: если предыдущий attempt успел дойти
+            #    до NS — пропускаем create.
+            if ns_custom_id is None:
+                ns_custom_id = f"fp-{event.funpay_order_id}"
+            async with session_factory()() as session:
+                db_order = await find_order_by_funpay_id(session, event.funpay_order_id)
+                assert db_order is not None
+                if db_order.ns_custom_id != ns_custom_id:
+                    await update_order(session, db_order, ns_custom_id=ns_custom_id)
+                    await session.commit()
 
-            ns_custom_id = created.custom_id
-            ns_price_usd = float(created.total_to_pay)
+            pre_info = await _ns_check_existing_order(ns_client, ns_custom_id, log)
+            if pre_info is not None:
+                log.info(
+                    f"NS idempotency: заказ {ns_custom_id} уже существует "
+                    f"(status={pre_info.status_enum}), create пропускаю"
+                )
+                if pre_info.total_price is not None:
+                    ns_price_usd = float(pre_info.total_price)
+            else:
+                try:
+                    created = await ns_client.create_order(
+                        service_id=mapping.ns_service_id,
+                        fields=ns_fields,
+                        custom_id=ns_custom_id,
+                    )
+                except NSError as exc:
+                    error_text = f"NS create_order упал: {exc}"
+                    log.error(error_text)
+                    await _mark_failed(
+                        db_order_id, error_text, telegram, event,
+                        funpay_client=funpay_client,
+                        funpay_lot_id=effective_funpay_lot_id,
+                        log=log,
+                    )
+                    return {"status": "failed", "reason": error_text}
+                ns_price_usd = float(created.total_to_pay)
             log.info(
                 f"NS create_order: custom_id={ns_custom_id}, "
                 f"к оплате={ns_price_usd:.4f} USD"
@@ -731,10 +781,16 @@ async def _process_locked(
         # ─── 7. NS pay_order (если ещё не оплачен) ───
         pins: list = []
         if order_status == "ns_created":
-            try:
-                pay_resp = await ns_client.pay_order(ns_custom_id)
-            except NSInsufficientFunds as exc:
-                error_text = f"Недостаточно средств на NS: balance={exc.balance}"
+            # Аудит #1: idempotency pay_order. Pre-check `order_info`:
+            # если предыдущий pay уже дошёл до NS (status != CREATED),
+            # повторный pay не нужен — переиспользуем существующий статус.
+            # Это предотвращает потенциальное двойное списание.
+            pre_info = await _ns_check_existing_order(ns_client, ns_custom_id, log)
+            pre_status = pre_info.status_enum if pre_info is not None else None
+
+            if pre_status in (OrderStatus.REFUNDED, OrderStatus.CANCELLED):
+                msg = pre_info.status_message if pre_info else ""
+                error_text = f"NS вернул возврат/отмену (idempotency check): {msg}"
                 log.error(error_text)
                 await _mark_failed(
                     db_order_id, error_text, telegram, event,
@@ -743,18 +799,38 @@ async def _process_locked(
                     log=log,
                 )
                 return {"status": "failed", "reason": error_text}
-            except NSError as exc:
-                error_text = f"NS pay_order упал: {exc}"
-                log.error(error_text)
-                await _mark_failed(
-                    db_order_id, error_text, telegram, event,
-                    funpay_client=funpay_client,
-                    funpay_lot_id=effective_funpay_lot_id,
-                    log=log,
+
+            if pre_status in (OrderStatus.IN_PROGRESS, OrderStatus.COMPLETED):
+                log.info(
+                    f"NS idempotency: pay_order пропускаю — заказ "
+                    f"{ns_custom_id} уже в статусе {pre_status.name}"
                 )
-                return {"status": "failed", "reason": error_text}
-            log.info(f"NS pay_order: status={pay_resp.status}")
-            pins = list(pay_resp.pins or [])
+                pins = list(pre_info.pins or []) if pre_info else []
+            else:
+                try:
+                    pay_resp = await ns_client.pay_order(ns_custom_id)
+                except NSInsufficientFunds as exc:
+                    error_text = f"Недостаточно средств на NS: balance={exc.balance}"
+                    log.error(error_text)
+                    await _mark_failed(
+                        db_order_id, error_text, telegram, event,
+                        funpay_client=funpay_client,
+                        funpay_lot_id=effective_funpay_lot_id,
+                        log=log,
+                    )
+                    return {"status": "failed", "reason": error_text}
+                except NSError as exc:
+                    error_text = f"NS pay_order упал: {exc}"
+                    log.error(error_text)
+                    await _mark_failed(
+                        db_order_id, error_text, telegram, event,
+                        funpay_client=funpay_client,
+                        funpay_lot_id=effective_funpay_lot_id,
+                        log=log,
+                    )
+                    return {"status": "failed", "reason": error_text}
+                log.info(f"NS pay_order: status={pay_resp.status}")
+                pins = list(pay_resp.pins or [])
             async with session_factory()() as session:
                 db_order = await find_order_by_funpay_id(session, event.funpay_order_id)
                 assert db_order is not None
@@ -805,6 +881,22 @@ async def _process_locked(
                 # Это ровно тот сценарий, где нужен оператор: проверить
                 # NS-кабинет/саппорт и решить, выдавать ли вручную.
                 reason = f"NS не выдал коды за тайм-аут: {exc}"
+                log.error(reason)
+                return await _trigger_manual_hold(
+                    funpay_order_id=event.funpay_order_id,
+                    stage="ns_wait_completion",
+                    reason=reason,
+                    funpay_client=funpay_client,
+                    telegram=telegram,
+                    log=log,
+                )
+            except NSError as exc:
+                # Аудит #6: NSAPIError (429 после retry-исчерпания, 5xx,
+                # 4xx и т.п.) ПОСЛЕ pay_order. Деньги уже списаны, pins
+                # не получены — оператор должен решить через Telegram.
+                # До фикса: исключение вылетало наверх, статус оставался
+                # ns_paid, никакого алерта.
+                reason = f"NS вернул ошибку при ожидании pins: {exc}"
                 log.error(reason)
                 return await _trigger_manual_hold(
                     funpay_order_id=event.funpay_order_id,
@@ -1015,10 +1107,28 @@ async def _deliver_pins(
             "reason": "no funpay client or chat_id",
         }
 
+    # Аудит #3: двухфазная доставка. ДО send_message — статус `delivering`.
+    # Это intent-marker «попытка отправки в процессе». Если процесс упадёт
+    # между success send_message и commit'ом delivered, статус останется
+    # delivering, и reconciler НЕ повторит отправку автоматически
+    # (риск двойной выдачи) — переведёт в manual_hold для оператора.
+    async with session_factory()() as session:
+        order = await find_order_by_funpay_id(session, event.funpay_order_id)
+        if order is not None:
+            await update_order(session, order, status="delivering")
+            await session.commit()
+
     try:
         await funpay_client.send_message(event.chat_id, delivery_text)
     except Exception as exc:
-        log.error(f"Доставка в чат FunPay упала: {exc}; статус остаётся pins_ready")
+        # send_message бросил — сообщение НЕ ушло. Безопасно откатить
+        # на pins_ready, чтобы reconciler/Retry могли попробовать ещё раз.
+        log.error(f"Доставка в чат FunPay упала: {exc}; откат на pins_ready")
+        async with session_factory()() as session:
+            order = await find_order_by_funpay_id(session, event.funpay_order_id)
+            if order is not None and order.status == "delivering":
+                await update_order(session, order, status="pins_ready")
+                await session.commit()
         await _emergency_disable_lot(
             db_order.funpay_lot_id,
             funpay_client,
@@ -1162,6 +1272,9 @@ async def _emergency_disable_lot(
             )
         return False
 
+    funpay_disabled = False
+    funpay_error: str | None = None
+
     try:
         lot_fields = await funpay_client.get_lot_fields(funpay_lot_id)
         if hasattr(lot_fields, "active"):
@@ -1171,6 +1284,20 @@ async def _emergency_disable_lot(
         result = await funpay_client.save_lot(lot_fields)
         if isinstance(result, dict) and result.get("ok") is False:
             raise RuntimeError(result)
+        funpay_disabled = True
+    except Exception as exc:
+        funpay_error = str(exc)
+        if log is not None:
+            log.opt(exception=exc).error(
+                f"Не смог аварийно выключить FunPay-лот {funpay_lot_id}: {exc}"
+            )
+
+    # Аудит #8: даже если save_lot на FunPay упал, отключаем mapping в БД.
+    # Иначе sync_stock на следующем цикле увидит mapping.enabled=True и
+    # «починит» лот обратно — проблемный лот продолжит продаваться,
+    # копируя новые failed-заказы.
+    mapping_disabled_in_db = False
+    try:
         async with session_factory()() as session:
             mapping = (
                 await session.execute(
@@ -1180,15 +1307,26 @@ async def _emergency_disable_lot(
             if mapping is not None and mapping.enabled:
                 mapping.enabled = False
                 await session.commit()
+                mapping_disabled_in_db = True
     except Exception as exc:
         if log is not None:
             log.opt(exception=exc).error(
-                f"Не смог аварийно выключить FunPay-лот {funpay_lot_id}: {exc}"
+                f"Не смог отключить mapping в БД для FunPay-лота "
+                f"{funpay_lot_id}: {exc}"
             )
+
+    if not funpay_disabled:
         if telegram is not None:
+            extra = (
+                "Локальный mapping отключён — sync лот обратно не включит, "
+                "но вручную через FunPay UI лот всё ещё активен."
+                if mapping_disabled_in_db
+                else "ВНИМАНИЕ: и mapping в БД отключить не удалось."
+            )
             await telegram.error(
                 f"🚨 Не смог аварийно выключить FunPay-лот "
-                f"<code>{funpay_lot_id}</code>: <code>{str(exc)[:300]}</code>"
+                f"<code>{funpay_lot_id}</code>: "
+                f"<code>{(funpay_error or '?')[:300]}</code>. {extra}"
             )
         return False
 

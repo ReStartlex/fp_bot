@@ -210,11 +210,26 @@ class NSClient:
                 response_body=r.text,
                 path=path,
             )
-            # 5xx ретраим, 4xx — нет
-            if 500 <= r.status_code < 600 and attempt < self._settings.ns_retry_attempts:
-                logger.warning(f"NS {r.status_code}, retry через {self._settings.ns_retry_delay_seconds}с")
+            # Аудит #6: 429 (rate limit) и 5xx — retriable.
+            # 4xx (кроме 429) — нет, это наша ошибка.
+            is_retriable = (
+                r.status_code == 429 or 500 <= r.status_code < 600
+            )
+            if is_retriable and attempt < self._settings.ns_retry_attempts:
+                # Учитываем Retry-After (число секунд) если NS его прислал.
+                retry_after_header = r.headers.get("Retry-After", "")
+                try:
+                    delay = float(retry_after_header) if retry_after_header else 0.0
+                except ValueError:
+                    delay = 0.0
+                if delay <= 0:
+                    delay = float(self._settings.ns_retry_delay_seconds)
+                logger.warning(
+                    f"NS {r.status_code}, retry через {delay:.1f}с "
+                    f"(attempt {attempt}/{self._settings.ns_retry_attempts})"
+                )
                 last_exc = err
-                await asyncio.sleep(self._settings.ns_retry_delay_seconds)
+                await asyncio.sleep(delay)
                 continue
             raise err
         # сюда не доходим, но на всякий

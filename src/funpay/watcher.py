@@ -527,8 +527,22 @@ class FunPayWatcher:
             )
 
             self._poll_snapshot[chat_id] = {"preview": preview}
-            if new_last_id is not None and new_last_id != cursor_last_id:
-                await self._save_cursor(chat_id, new_last_id)
+
+            # Аудит #4: per-message cursor advance.
+            # Раньше курсор сохранялся СРАЗУ на new_last_id, ДО dispatch'а.
+            # Если handler падал — сообщение терялось навсегда (курсор уже
+            # «перепрыгнул»). Теперь:
+            #   - если new_messages пуст (baseline / нет новых) — сохраняем
+            #     cursor на new_last_id, как раньше;
+            #   - если есть new_messages — продвигаем курсор ПО ОДНОМУ
+            #     сообщению, ПОСЛЕ успешного await'a handler'а. Если
+            #     handler упал — выходим из цикла, курсор остаётся на
+            #     последнем УСПЕШНО обработанном id, и следующий poll
+            #     переобработает оставшиеся сообщения.
+            if not new_messages:
+                if new_last_id is not None and new_last_id != cursor_last_id:
+                    await self._save_cursor(chat_id, new_last_id)
+                continue
 
             for m in new_messages:
                 author_id = m.get("author_id")
@@ -544,38 +558,56 @@ class FunPayWatcher:
                 )
                 if not msg.text:
                     continue
+                msg_id = m.get("message_id")
                 keys = self._make_msg_dedup_keys(
-                    chat_id, m.get("message_id"), author_id, msg.text
+                    chat_id, msg_id, author_id, msg.text
                 )
                 if self._seen_or_register(keys):
                     logger.debug(
                         f"FunPay poll: chat={chat_id} msg "
-                        f"id={m.get('message_id')} text={msg.text[:60]!r} — "
+                        f"id={msg_id} text={msg.text[:60]!r} — "
                         f"дубликат, пропускаю"
                     )
                     continue
                 logger.info(
                     f"FunPay poll: новое сообщение в чате {chat_id} от "
-                    f"@{msg.author_username} (id={m.get('message_id')}): "
+                    f"@{msg.author_username} (id={msg_id}): "
                     f"{msg.text[:80]!r}"
                 )
                 total_dispatched += 1
                 if self._on_new_message is not None:
-                    asyncio.create_task(
-                        self._safe_call_message_handler(msg)
-                    )
+                    ok = await self._safe_call_message_handler(msg)
+                    if not ok:
+                        logger.warning(
+                            f"FunPay poll: handler упал на msg id={msg_id} "
+                            f"chat={chat_id}; курсор остаётся, "
+                            f"сообщение будет переобработано в след. poll"
+                        )
+                        # Не продвигаем курсор для этого и последующих
+                        # сообщений в этом чате. Следующий poll увидит
+                        # их снова через cursor_last_id.
+                        break
+                if msg_id is not None:
+                    await self._save_cursor(chat_id, int(msg_id))
         return total_dispatched
 
-    async def _safe_call_message_handler(self, msg: FunPayMessageEvent) -> None:
-        """Обёртка вокруг message-handler с логом исключений."""
+    async def _safe_call_message_handler(self, msg: FunPayMessageEvent) -> bool:
+        """Обёртка вокруг message-handler с логом исключений.
+
+        Returns:
+            True — handler отработал без ошибок (можно продвигать cursor).
+            False — handler бросил исключение (cursor НЕ продвигаем).
+        """
         try:
             if self._on_new_message is not None:
                 await self._on_new_message(msg)
+            return True
         except Exception as exc:
             logger.opt(exception=exc).error(
                 f"ChatHandler упал на сообщении chat={msg.chat_id} "
                 f"text={msg.text[:80]!r}: {exc}"
             )
+            return False
 
     def _select_new_messages(
         self,

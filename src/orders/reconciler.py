@@ -65,6 +65,33 @@ async def reconcile_orders_once(
     )
     for order in orders:
         checked += 1
+        # Аудит #3: статус `delivering` означает «send_message в FunPay
+        # был в процессе и до commit'a delivered не дошло». Повторно
+        # отправить = риск дубля кодов = потеря денег. Поэтому НЕ
+        # запускаем processor, а сразу переводим в manual_hold + alert
+        # «проверь чат вручную и нажми Done/Retry».
+        if order.status == "delivering":
+            logger.warning(
+                f"Reconciler: заказ {order.funpay_order_id} застрял в "
+                f"delivering — отправка кодов могла случиться, повторно "
+                f"не отправляем; перевожу в manual_hold"
+            )
+            await _trigger_manual_hold(
+                funpay_order_id=order.funpay_order_id,
+                stage="reconciler_delivering_unclear",
+                reason=(
+                    "заказ застрял в delivering: send_message в FunPay "
+                    "был запущен, но статус delivered не зафиксирован. "
+                    "Проверьте чат вручную: если коды дошли — нажмите "
+                    "«Выдано вручную», если нет — «Retry»."
+                ),
+                funpay_client=funpay_client,
+                telegram=telegram,
+                log=logger.bind(funpay_order_id=order.funpay_order_id),
+            )
+            skipped += 1
+            continue
+
         # Если заказ старше hard-timeout, бот не должен молча его
         # реанимировать — деньги уплачены давно, покупатель уже либо
         # отказался, либо ждёт оператора. Переводим в manual_hold с

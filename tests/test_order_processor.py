@@ -93,10 +93,12 @@ class FakeNS:
     async def __aenter__(self): return self
     async def __aexit__(self, *a): return None
 
-    async def create_order(self, *, service_id: int, fields: list[dict]):
+    async def create_order(
+        self, *, service_id: int, fields: list[dict], custom_id: str | None = None
+    ):
         self.created_calls += 1
         return CreateOrderResponse(
-            custom_id=self._custom_id, total_to_pay=self._total
+            custom_id=custom_id or self._custom_id, total_to_pay=self._total
         )
 
     async def pay_order(self, custom_id: str):
@@ -106,6 +108,12 @@ class FakeNS:
             status=self._pay_status,  # type: ignore[arg-type]
             pins=self._pay_pins,
         )
+
+    async def order_info(self, custom_id: str):
+        # Аудит #1: дефолт fake — заказа в NS нет, чтобы processor
+        # пошёл по обычному create/pay-пути.
+        from src.ns.exceptions import NSNotFoundError
+        raise NSNotFoundError(404, "not found", path=f"/order_info/{custom_id}")
 
     async def wait_order_completion(
         self, custom_id: str, *, timeout_seconds: float | None = None
@@ -253,7 +261,8 @@ async def test_happy_path_pay_returns_pins_immediately(
     db_order = await _order(db_session_factory, "fp-100")
     assert db_order is not None
     assert db_order.status == "delivered"
-    assert db_order.ns_custom_id == "ns-custom-1"
+    # Аудит #1: ns_custom_id теперь deterministic = f"fp-{funpay_order_id}".
+    assert db_order.ns_custom_id == "fp-fp-100"
     assert db_order.fx_rate_at_sale == 100.0
     assert db_order.profit_rub == pytest.approx(
         db_order.funpay_price_rub * 0.97 - db_order.ns_price_usd * 100.0
@@ -276,9 +285,11 @@ async def test_multi_quantity_propagates_to_ns_and_delivers_all_pins(
     captured_fields: list[list[dict]] = []
 
     class FakeNSCapturing(FakeNS):
-        async def create_order(self, *, service_id: int, fields):
+        async def create_order(self, *, service_id: int, fields, custom_id=None):
             captured_fields.append(list(fields))
-            return await super().create_order(service_id=service_id, fields=fields)
+            return await super().create_order(
+                service_id=service_id, fields=fields, custom_id=custom_id
+            )
 
     ns = FakeNSCapturing(pay_pins=["AAAA-1111", "BBBB-2222"])
     fp = FakeFunPay()

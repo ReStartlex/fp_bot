@@ -94,15 +94,21 @@ class FakeNS:
     async def __aenter__(self): return self
     async def __aexit__(self, *a): return None
 
-    async def create_order(self, *, service_id: int, fields):
+    async def create_order(self, *, service_id: int, fields, custom_id: str | None = None):
         self.created_calls += 1
-        return CreateOrderResponse(custom_id=self._custom_id, total_to_pay=self._total)
+        return CreateOrderResponse(
+            custom_id=custom_id or self._custom_id, total_to_pay=self._total
+        )
 
     async def pay_order(self, custom_id: str):
         self.paid_calls += 1
         return PayOrderResponse(
             custom_id=custom_id, status=self._pay_status, pins=self._pay_pins,
         )
+
+    async def order_info(self, custom_id: str):
+        from src.ns.exceptions import NSNotFoundError
+        raise NSNotFoundError(404, "not found", path=f"/order_info/{custom_id}")
 
     async def wait_order_completion(
         self, custom_id: str, *, timeout_seconds: float | None = None
@@ -309,6 +315,41 @@ async def test_hard_timeout_before_wait_completion_skips_ns_wait(db_factory, set
 
 
 @pytest.mark.asyncio
+async def test_ns_api_error_during_wait_becomes_manual_hold_with_alert(
+    db_factory, settings
+):
+    """Аудит #6: NS 429 / NSAPIError из wait_completion ПОСЛЕ pay.
+
+    Деньги уже списаны, pins не пришли, NS возвращает ошибку (например 429
+    rate limit). До фикса: NSAPIError вылетал из processor, статус
+    оставался ns_paid, Telegram-алерт НЕ уходил — оператор слепой.
+    Теперь должен быть manual_hold + manual_hold_required alert.
+    """
+    from src.ns.exceptions import NSAPIError
+    await _make_mapping(db_factory)
+
+    class NSWith429(FakeNS):
+        async def wait_order_completion(self, custom_id, *, timeout_seconds=None):
+            raise NSAPIError(429, "rate limit", path=f"/order_info/{custom_id}")
+
+    ns = NSWith429(pay_status="in_progress", pay_pins=None)
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    result = await process_funpay_order(
+        _event(order_id="fp-429"),
+        settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+    assert result["status"] == "manual_hold", (
+        f"NSAPIError ПОСЛЕ pay должен переводить в manual_hold, получено: {result}"
+    )
+    assert result.get("stage") == "ns_wait_completion"
+    assert tg.manual_holds, (
+        "После NSError ПОСЛЕ pay должен прилететь manual_hold_required alert"
+    )
+
+
+@pytest.mark.asyncio
 async def test_ns_timeout_during_wait_becomes_manual_hold_not_failed(
     db_factory, settings
 ):
@@ -330,7 +371,8 @@ async def test_ns_timeout_during_wait_becomes_manual_hold_not_failed(
     order = await _get_order(db_factory, "fp-nstimeout")
     assert order is not None
     assert order.status == "manual_hold"
-    assert order.ns_custom_id == "ns-1"  # NS-id сохранён, оператор может найти
+    # Аудит #1: ns_custom_id теперь deterministic = f"fp-{funpay_order_id}".
+    assert order.ns_custom_id == "fp-fp-nstimeout"
 
 
 @pytest.mark.asyncio

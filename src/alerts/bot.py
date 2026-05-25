@@ -1939,11 +1939,23 @@ class TelegramBot:
             )
             return
 
+        snapshot_complete = stats.get("snapshot_complete", True)
+        warning_line = ""
+        if not snapshot_complete:
+            # Аудит #7: при неполном snapshot мы НЕ помечаем confirmed,
+            # чтобы не закрыть реально оплачённые заказы.
+            warning_line = (
+                "\n⚠️ <b>Snapshot FunPay НЕПОЛНЫЙ</b> "
+                f"(<code>{stats.get('truncated_reason', '?')}</code>) — "
+                "автоматическое подтверждение пропущено, чтобы не закрыть "
+                "реально оплачённые заказы. Запусти Sync ещё раз позже."
+            )
         text = (
             "✅ <b>Sync /pending_confirm с FunPay</b>\n"
             f"• Сейчас «Оплачен» на FunPay: <b>{stats['paid_on_funpay']}</b>\n"
             f"• В БД было delivered+NULL: <b>{stats['delivered_unconfirmed_in_db']}</b>\n"
-            f"• Помечено confirmed (закрыты тихо саппортом): <b>{stats['marked_confirmed']}</b>\n\n"
+            f"• Помечено confirmed (закрыты тихо саппортом): <b>{stats['marked_confirmed']}</b>"
+            f"{warning_line}\n\n"
             "Запусти /pending_confirm — список теперь должен соответствовать "
             "тем заказам, которые реально ждут подтверждения."
         )

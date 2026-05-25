@@ -399,7 +399,14 @@ async def list_pending_confirmation(
     return list(result.scalars().all())
 
 
-ACTIVE_ORDER_STATUSES = ("received", "ns_created", "ns_paid", "pins_ready", "manual_hold")
+ACTIVE_ORDER_STATUSES = (
+    "received",
+    "ns_created",
+    "ns_paid",
+    "pins_ready",
+    "delivering",
+    "manual_hold",
+)
 
 
 async def reserved_quantities_by_service(
@@ -428,7 +435,11 @@ async def list_reconcilable_orders(
     cutoff = datetime.utcnow() - timedelta(seconds=stale_after_seconds)
     stmt = (
         select(Order)
-        .where(Order.status.in_(("ns_created", "ns_paid", "pins_ready")))
+        # Аудит #5: добавили `received` — crash после create_order в БД,
+        # но до NS-pipeline. Без этого заказ висел навсегда.
+        .where(Order.status.in_(
+            ("received", "ns_created", "ns_paid", "pins_ready", "delivering")
+        ))
         .where(Order.updated_at <= cutoff)
         .order_by(Order.updated_at, Order.id)
         .limit(limit)
