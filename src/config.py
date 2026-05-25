@@ -231,6 +231,16 @@ class Settings(BaseSettings):
     # Лимит лотов за один прогон — не больше N save_lot вызовов,
     # чтобы не вызвать r429 burst если зомби накопились пачкой.
     zombie_lot_reaper_max_per_run: int = Field(default=5, ge=1, le=50)
+
+    # ─── Sprint 5: Shop delivery worker ─────────────────────────────────
+    # Воркер делает create_order/pay_order/wait_completion для shop_orders
+    # в статусе paid/delivering. Inline-runner запустится сразу после
+    # buy_confirm, но этот worker — safety net на случай если inline
+    # упал, или если заказ в delivering завис (timeout) и нужно retry.
+    shop_delivery_poll_seconds: int = Field(default=60, ge=10, le=3600)
+    # Максимум заказов за один прогон воркера. Безопасный default = 5,
+    # чтобы не молотить NS API большой пачкой при накоплении.
+    shop_delivery_max_per_run: int = Field(default=5, ge=1, le=50)
     order_reconcile_max_per_run: int = Field(default=10, ge=1, le=100)
 
     # Жёсткий лимит на ПОЛНЫЙ цикл received→delivered. По истечении бот:

@@ -19,6 +19,7 @@ silently no-op (можно деплоить код в прод без токен
 from __future__ import annotations
 
 import asyncio
+import json
 import hashlib
 import html
 import time
@@ -61,7 +62,12 @@ from src.shop.keyboards import (
     balance_keyboard,
     cancel_keyboard,
     catalog_groups_keyboard,
+    checkout_confirm_keyboard,
+    checkout_insufficient_balance_keyboard,
+    checkout_processing_text,
     main_menu_keyboard,
+    order_card_keyboard,
+    orders_list_keyboard,
     referrals_keyboard,
     search_results_keyboard,
     service_card_keyboard,
@@ -87,16 +93,20 @@ from src.shop.repo import (
     list_category_groups_for_ui,
     list_services_in_category,
     list_similar_services,
+    list_user_orders,
+    get_shop_order,
     mark_payment_failed,
     parse_referral_payload,
     search_services,
 )
+from src.shop.checkout import CheckoutOutcome, attempt_checkout_via_balance
+from src.shop.delivery import deliver_shop_order_once
 from src.config_runtime import get_shop_referral_percent
 from src.shop.payments.cryptobot import (
     CryptoBotClient,
     CryptoBotError,
 )
-from src.shop.states import SearchState, TopupState
+from src.shop.states import BuyState, SearchState, TopupState
 
 
 # Сколько результатов поиска отдаём максимум (в FSM и inline-query).
@@ -192,6 +202,11 @@ class ShopBot:
         self._search_sessions: PaginationStore = PaginationStore()
         # Rate-limit для FSM-поиска: tg_user_id → timestamp последнего search.
         self._search_last_at: dict[int, float] = {}
+        # Sprint 5: запускалка inline-доставки сразу после buy_confirm.
+        # Если задана — после успешного checkout мы стартуем фоновую таску
+        # deliver_shop_order_once. Иначе delivery подберёт APScheduler-воркер
+        # на следующем тике (с задержкой до интервала).
+        self._delivery_runner: Callable[[int, int], Awaitable[None]] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -383,8 +398,21 @@ class ShopBot:
         dp.callback_query.register(
             self._on_cb_service, F.data.startswith("svc:"),
         )
+        # Sprint 5 — реальный checkout. Триггер «💳 Купить» → confirm screen.
         dp.callback_query.register(
-            self._on_cb_buy_stub, F.data.startswith("buy:"),
+            self._on_cb_buy_request, F.data.startswith("buy:"),
+        )
+        dp.callback_query.register(
+            self._on_cb_buy_confirm, F.data.startswith("buy_ok:"),
+        )
+        dp.callback_query.register(
+            self._on_cb_buy_cancel, F.data == "buy_cancel",
+        )
+        dp.callback_query.register(
+            self._on_cb_orders_page, F.data.startswith("orders:"),
+        )
+        dp.callback_query.register(
+            self._on_cb_order_card, F.data.startswith("ord:"),
         )
         dp.callback_query.register(
             self._on_cb_search_page, F.data.startswith("srh:"),
@@ -601,12 +629,238 @@ class ShopBot:
         )
         await self._safe_edit(cb, text=text, markup=markup)
 
-    async def _on_cb_buy_stub(self, cb: CallbackQuery) -> None:
-        """Покупка появится в Sprint 3 (CryptoBot)."""
-        await cb.answer(
-            "💳 Оплата подключается в ближайшие дни. Скоро откроем!",
-            show_alert=True,
+    async def _on_cb_buy_request(self, cb: CallbackQuery, state: FSMContext) -> None:
+        """
+        `buy:{sid}` — пользователь нажал «💳 Купить» в карточке товара.
+
+        Показываем confirm-экран: цена, текущий баланс, что останется
+        после списания. Реальный debit и delivery начнутся только после
+        нажатия «✅ Подтвердить».
+
+        Если баланса не хватает — экран «Пополни и попробуй снова».
+        """
+        if not cb.data or ":" not in cb.data:
+            await cb.answer()
+            return
+        try:
+            sid = int(cb.data.split(":", 1)[1])
+        except ValueError:
+            await cb.answer("Битая ссылка", show_alert=True)
+            return
+
+        async with session_factory()() as session:
+            user, _ = await get_or_create_user(
+                session,
+                telegram_user_id=cb.from_user.id,
+                telegram_username=cb.from_user.username,
+                first_name=cb.from_user.first_name,
+                language_code=cb.from_user.language_code,
+            )
+            svc = await get_catalog_service(session, ns_service_id=sid)
+            await session.commit()
+
+        if svc is None:
+            await cb.answer("Товар временно недоступен", show_alert=True)
+            return
+        if int(svc.in_stock or 0) <= 0:
+            await cb.answer(
+                "🚫 Только что закончился. Попробуй другой регион/номинал.",
+                show_alert=True,
+            )
+            return
+        price = int(svc.rub_price_kopecks or 0)
+        if user.balance_kopecks < price:
+            text, markup = checkout_insufficient_balance_keyboard(
+                need_kopecks=price,
+                have_kopecks=user.balance_kopecks,
+                deficit_kopecks=price - user.balance_kopecks,
+            )
+            await self._safe_edit(cb, text=text, markup=markup)
+            return
+
+        # Запомним sid в FSM, чтобы при «Подтвердить» взять тот же svc
+        await state.set_state(BuyState.awaiting_confirmation)
+        await state.update_data(buy_sid=sid)
+
+        text, markup = checkout_confirm_keyboard(
+            svc=svc, user_balance_kopecks=user.balance_kopecks,
         )
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    async def _on_cb_buy_confirm(
+        self, cb: CallbackQuery, state: FSMContext,
+    ) -> None:
+        """
+        `buy_ok:{sid}` — пользователь подтвердил покупку.
+
+        ★ Здесь происходит реальный debit:
+          1. attempt_checkout_via_balance → atomic create_order + debit
+          2. Сообщение «обработка»
+          3. Запускаем delivery как фоновую таску (или inline)
+          4. Если delivery успешна — отправим pins; ошибка — refund
+             уже сделан, шлём «не выполнено».
+        """
+        if not cb.data or ":" not in cb.data:
+            await cb.answer()
+            return
+        try:
+            sid = int(cb.data.split(":", 1)[1])
+        except ValueError:
+            await cb.answer("Битая ссылка", show_alert=True)
+            return
+
+        # State используем только для гигиены — никаких критических данных
+        # из FSM мы не берём (sid из callback_data — единственный источник
+        # правды).
+        await state.clear()
+
+        # Atomic checkout
+        async with session_factory()() as session:
+            user, _ = await get_or_create_user(
+                session,
+                telegram_user_id=cb.from_user.id,
+                telegram_username=cb.from_user.username,
+                first_name=cb.from_user.first_name,
+                language_code=cb.from_user.language_code,
+            )
+            result = await attempt_checkout_via_balance(
+                session, user_id=user.id, ns_service_id=sid,
+            )
+            if result.outcome != CheckoutOutcome.OK:
+                await session.rollback()
+            else:
+                await session.commit()
+
+        if result.outcome == CheckoutOutcome.INSUFFICIENT_BALANCE:
+            text, markup = checkout_insufficient_balance_keyboard(
+                need_kopecks=result.need_kopecks,
+                have_kopecks=result.have_kopecks,
+                deficit_kopecks=result.deficit_kopecks,
+            )
+            await self._safe_edit(cb, text=text, markup=markup)
+            return
+        if result.outcome == CheckoutOutcome.OUT_OF_STOCK:
+            await cb.answer(
+                "🚫 Только что закончился. Попробуй другой регион/номинал.",
+                show_alert=True,
+            )
+            return
+        if result.outcome == CheckoutOutcome.USER_BLOCKED:
+            await cb.answer(
+                "Доступ к покупкам временно ограничен. Напиши в 🆘 Поддержку.",
+                show_alert=True,
+            )
+            return
+        if result.outcome == CheckoutOutcome.REQUIRES_FIELDS:
+            await cb.answer(
+                "Для этого товара нужны дополнительные данные. "
+                "Эта функция появится позже — обратись в 🆘 Поддержку.",
+                show_alert=True,
+            )
+            return
+        if result.outcome != CheckoutOutcome.OK:
+            await cb.answer(
+                "❌ Не удалось оформить заказ. Попробуй ещё раз или "
+                "напиши в 🆘 Поддержку.",
+                show_alert=True,
+            )
+            return
+
+        # Успешный checkout — деньги списаны, заказ в статусе paid
+        order = result.order
+        # Отображаем «обработка»
+        await self._safe_edit(
+            cb,
+            text=checkout_processing_text(),
+            markup=InlineKeyboardMarkup(inline_keyboard=[]),
+        )
+        await cb.answer("✅ Платёж принят, доставляем...")
+
+        # Запускаем доставку как фоновую таску — не блокируем UI.
+        # Доставка займёт 10-60 секунд, юзер увидит pins отдельным сообщением.
+        if self._delivery_runner is not None:
+            asyncio.create_task(self._delivery_runner(order.id, cb.from_user.id))
+        else:
+            # В тестах / при отсутствии runner'а — просто ничего не делаем.
+            # Воркер APScheduler подберёт заказ.
+            logger.debug(
+                f"shop buy: order {order.id} оплачен, ждём delivery воркера"
+            )
+
+    async def _on_cb_buy_cancel(
+        self, cb: CallbackQuery, state: FSMContext,
+    ) -> None:
+        """Отмена с confirm-экрана: возвращаемся к карточке товара."""
+        await state.clear()
+        data = await state.get_data() if state else {}
+        sid = data.get("buy_sid")
+        if sid:
+            # Восстановим карточку
+            async with session_factory()() as session:
+                svc = await get_catalog_service(session, ns_service_id=sid)
+            if svc is not None:
+                text, markup = service_card_keyboard(
+                    svc=svc, group_slug=getattr(svc, "group_slug", None),
+                )
+                await self._safe_edit(cb, text=text, markup=markup)
+                await cb.answer("Отменено")
+                return
+        await cb.answer("Отменено")
+        try:
+            if cb.message is not None:
+                await cb.message.delete()
+        except Exception:
+            pass
+
+    async def _on_cb_orders_page(self, cb: CallbackQuery) -> None:
+        """`orders:N` — пагинация в истории заказов."""
+        try:
+            page = int((cb.data or "orders:0").split(":")[1])
+        except (ValueError, IndexError):
+            page = 0
+        async with session_factory()() as session:
+            user, _ = await get_or_create_user(
+                session,
+                telegram_user_id=cb.from_user.id,
+                telegram_username=cb.from_user.username,
+            )
+            orders, total = await list_user_orders(
+                session, user_id=user.id, limit=8, offset=page * 8,
+            )
+            await session.commit()
+        text, markup = orders_list_keyboard(
+            orders=orders, page=page, total=total,
+        )
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    async def _on_cb_order_card(self, cb: CallbackQuery) -> None:
+        """`ord:{id}` — карточка одного заказа из истории."""
+        try:
+            oid = int((cb.data or "ord:0").split(":")[1])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        async with session_factory()() as session:
+            user, _ = await get_or_create_user(
+                session,
+                telegram_user_id=cb.from_user.id,
+                telegram_username=cb.from_user.username,
+            )
+            order = await get_shop_order(session, oid)
+            await session.commit()
+        if order is None or order.user_id != user.id:
+            # Защита: чужой заказ — отказ
+            await cb.answer("Заказ не найден", show_alert=True)
+            return
+        # Парсим pins из JSON
+        pins = None
+        if order.pins_json:
+            try:
+                pins = json.loads(order.pins_json)
+            except json.JSONDecodeError:
+                pins = None
+        text, markup = order_card_keyboard(order=order, pins=pins)
+        await self._safe_edit(cb, text=text, markup=markup)
 
     async def _on_cb_close(self, cb: CallbackQuery) -> None:
         try:
@@ -1344,12 +1598,24 @@ class ShopBot:
 
     async def _on_orders_cmd(self, message: Message, state: FSMContext) -> None:
         await state.clear()
-        await message.answer(
-            "📦 <b>Мои заказы</b>\n\n"
-            "Когда оформишь первую покупку — увидишь её здесь: статус, "
-            "пины, дату. Сейчас раздел пуст.",
-            reply_markup=main_menu_keyboard(),
+        async with session_factory()() as session:
+            user, _ = await get_or_create_user(
+                session,
+                telegram_user_id=message.from_user.id,
+                telegram_username=message.from_user.username,
+                first_name=message.from_user.first_name,
+                language_code=message.from_user.language_code,
+            )
+            orders, total = await list_user_orders(
+                session, user_id=user.id, limit=8, offset=0,
+            )
+            await session.commit()
+        text, markup = orders_list_keyboard(
+            orders=orders, page=0, total=total,
         )
+        await message.answer(text, reply_markup=markup)
+        # Восстанавливаем reply-меню
+        await message.answer("⬇", reply_markup=main_menu_keyboard())
 
     async def _on_support_cmd(self, message: Message, state: FSMContext) -> None:
         await state.clear()

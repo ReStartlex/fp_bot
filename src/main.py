@@ -35,6 +35,10 @@ from src.orders.reconciler import reconcile_orders_once
 from src.orders.processor import FunPayOrderEvent, process_funpay_order
 from src.shop.bot import ShopBot
 from src.shop.catalog_sync import sync_catalog_once
+from src.shop.delivery import (
+    deliver_shop_order_once,
+    poll_shop_deliveries_once,
+)
 from src.shop.payments.poller import poll_cryptobot_once
 from src.sync.stock_sync import sync_once
 from src.sync.zombie_reaper import reap_zombie_lots_once
@@ -142,6 +146,9 @@ class App:
                 self.settings,
                 owner_notify=self._notify_owner_safe,
             )
+            # Sprint 5: inline-доставка сразу после buy_confirm. Если падает —
+            # APScheduler-воркер всё равно подберёт заказ на следующем тике.
+            self.shop_bot._delivery_runner = self._shop_inline_deliver
             await self.shop_bot.start()
         except Exception as exc:
             logger.exception(f"Shop-бот не стартовал: {exc}")
@@ -244,6 +251,25 @@ class App:
                 max_instances=1,
                 coalesce=True,
             )
+        # Sprint 5: Shop delivery worker — обрабатывает paid/delivering shop_orders.
+        # Это полный аналог NS-пайплайна orders/processor.py, но для shop-заказов
+        # (покупки покупателей через NeuroDrop, оплаченные с внутреннего баланса).
+        # Воркер:
+        #   * Берёт N paid/delivering заказов
+        #   * Для каждого вызывает NS create_order + pay_order + wait_completion
+        #   * Помечает delivered с pins, шлёт юзеру; или failed → refund
+        #   * Cashback инвайтеру при успешной доставке (1% по умолчанию)
+        if self.shop_bot is not None and self.settings.shop_enabled:
+            self.scheduler.add_job(
+                self._safe_shop_delivery_poll,
+                "interval",
+                seconds=self.settings.shop_delivery_poll_seconds,
+                id="shop_delivery_poll",
+                next_run_time=datetime.now() + timedelta(seconds=60),
+                max_instances=1,
+                coalesce=True,
+            )
+
         # Zombie-lot reaper: устраняет half-disabled state после failed-заказов.
         # Сценарий: _emergency_disable_lot отключил mapping, но save_lot на
         # FunPay упал — лот продолжает продаваться со старым stock'ом.
@@ -634,6 +660,101 @@ class App:
             ):
                 await self.tg.info("✅ Zombie reaper восстановился")
             self._zombie_reaper_consecutive_failures = 0
+
+    async def _safe_shop_delivery_poll(self) -> None:
+        """
+        Sprint 5: периодический воркер доставки shop-заказов.
+
+        Никогда не падает наружу. Берёт до N paid/delivering заказов
+        и пытается завершить каждый через NS-пайплайн.
+
+        Inline-runner (`_shop_inline_deliver`) обрабатывает заказы СРАЗУ
+        после buy_confirm — этот воркер на 60s интервале служит safety net
+        для:
+          * Случая когда inline-таска упала / была отменена;
+          * Заказов которые остались в DELIVERING после timeout
+            (wait_completion вернул NSOrderTimeoutError, retry на след тике);
+          * Восстановления после рестарта процесса (paid orders в БД
+            остаются неоплаченными в NS).
+        """
+        if self.ns is None or self.shop_bot is None:
+            return
+        try:
+            metrics = await poll_shop_deliveries_once(
+                ns=self.ns,
+                settings=self.settings,
+                notify_buyer=self._shop_notify_buyer,
+                notify_owner=self._notify_owner_safe,
+                max_per_run=self.settings.shop_delivery_max_per_run,
+            )
+        except Exception as exc:
+            logger.exception(f"shop delivery poll упал: {exc}")
+            return
+        if metrics["checked"] > 0:
+            logger.info(
+                f"shop delivery poll: "
+                f"checked={metrics['checked']} "
+                f"delivered={metrics['delivered']} "
+                f"failed={metrics['failed']} "
+                f"pending={metrics['pending']}"
+            )
+
+    async def _shop_inline_deliver(
+        self, order_id: int, tg_user_id: int,
+    ) -> None:
+        """
+        Inline-runner: вызывается ShopBot'ом сразу после успешного
+        attempt_checkout_via_balance, чтобы юзер не ждал 60s до следующего
+        тика воркера.
+
+        Изоляция от UI:
+          * Никогда не бросает наружу — все ошибки логируются и (если
+            нужно) превратятся в notify_buyer/refund внутри
+            deliver_shop_order_once.
+          * Получает order_id, а не сам ShopOrder — на момент вызова
+            заказ может быть в любом состоянии, deliver_once сам решит.
+        """
+        if self.ns is None:
+            logger.warning("inline deliver: NS не подключён")
+            return
+        try:
+            await deliver_shop_order_once(
+                order_id,
+                ns=self.ns,
+                settings=self.settings,
+                notify_buyer=self._shop_notify_buyer,
+                notify_owner=self._notify_owner_safe,
+            )
+        except Exception as exc:
+            logger.exception(
+                f"inline deliver order {order_id} упал (worker подберёт): {exc}"
+            )
+
+    async def _shop_notify_buyer(self, user_id: int, text: str) -> None:
+        """
+        Отправляет покупателю сообщение через shop-бота, ID = shop_users.id
+        (НЕ Telegram user_id!). Маппинг shop_users.id → telegram_user_id
+        выполняется здесь.
+        """
+        if self.shop_bot is None:
+            return
+        # Локальные импорты — session_factory / ShopUser нужны только здесь,
+        # глобально не таскаем чтобы не утяжелять header модуля.
+        from sqlalchemy import select
+        from src.db.session import session_factory
+        from src.db.models import ShopUser
+        try:
+            async with session_factory()() as session:
+                row = await session.execute(
+                    select(ShopUser).where(ShopUser.id == user_id)
+                )
+                user = row.scalar_one_or_none()
+            if user is None:
+                logger.warning(f"shop notify buyer: user {user_id} not found")
+                return
+            await self.shop_bot.send_message_to_user(user.telegram_user_id, text)
+        except Exception as exc:
+            logger.warning(f"shop notify buyer {user_id}: {exc}")
 
     async def _notify_buyer_cryptobot_paid(self, tg_user_id: int, text: str) -> None:
         """

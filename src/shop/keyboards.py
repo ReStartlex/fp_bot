@@ -913,6 +913,242 @@ def topup_invoice_keyboard(
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# ─── checkout: confirm screen ──────────────────────────────────────
+
+
+def checkout_confirm_keyboard(
+    *,
+    svc,
+    user_balance_kopecks: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Экран подтверждения покупки. Юзер уже видел карточку, нажал «💳 Купить»,
+    мы показываем финальную страницу с балансом ДО и ПОСЛЕ.
+
+    Текст:
+      💳 <b>Подтверди покупку</b>
+      🍎 🇹🇷 Apple TR 10 TRY
+      💰 Цена: 205,30 ₽
+      ─────────────
+      💵 Баланс сейчас:    410,00 ₽
+      💸 Спишется:        −205,30 ₽
+      💚 Останется:        204,70 ₽
+      ─────────────
+      🚀 Доставка займёт 30–60 секунд после подтверждения. Коды придут
+      в этот чат.
+
+    Кнопки:
+      [ ✅ Подтвердить ]
+      [ ❌ Отмена ]
+    """
+    price = int(svc.rub_price_kopecks or 0)
+    base = getattr(svc, "base_name", None) or svc.category_name or ""
+    brand = brand_emoji(base)
+    flag = region_flag(svc.category_name or "")
+    flag_part = f"{flag} " if flag else ""
+
+    after = max(0, user_balance_kopecks - price)
+    text = (
+        "💳 <b>Подтверди покупку</b>\n\n"
+        f"{brand} {flag_part}<b>{html.escape(svc.service_name)}</b>\n"
+        f"💰 Цена: <b>{_format_rub_full(price)}</b>\n"
+        "─────────────\n"
+        f"💵 Баланс сейчас:    <b>{_format_rub_full(user_balance_kopecks)}</b>\n"
+        f"💸 Спишется:        <b>−{_format_rub_full(price)}</b>\n"
+        f"💚 Останется:        <b>{_format_rub_full(after)}</b>\n"
+        "─────────────\n\n"
+        "🚀 <i>Доставка займёт 30–60 секунд после подтверждения. "
+        "Коды придут в этот чат.</i>\n\n"
+        "🛡 <i>Если NS-провайдер откажет — деньги вернутся на твой "
+        "баланс автоматически.</i>"
+    )
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            text=f"✅ Подтвердить · {_format_rub_compact(price)}",
+            callback_data=f"buy_ok:{svc.ns_service_id}",
+        )],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="buy_cancel")],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def checkout_insufficient_balance_keyboard(
+    *,
+    need_kopecks: int,
+    have_kopecks: int,
+    deficit_kopecks: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Экран «не хватает средств» — открывается ВМЕСТО confirm-screen'а,
+    если у юзера не хватает баланса.
+
+    Дружелюбно сообщаем сколько не хватает и предлагаем быстро пополнить
+    (большая кнопка → переход в топ-ап через CryptoBot).
+    """
+    text = (
+        "💸 <b>Недостаточно баланса</b>\n\n"
+        f"🛒 Нужно:      <b>{_format_rub_full(need_kopecks)}</b>\n"
+        f"💵 Сейчас:     <b>{_format_rub_full(have_kopecks)}</b>\n"
+        f"📉 Не хватает: <b>{_format_rub_full(deficit_kopecks)}</b>\n\n"
+        "<i>Пополни баланс одним из способов — деньги придут "
+        "за 30–60 секунд (CryptoBot работает в реальном времени).</i>"
+    )
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            text="🪙 Пополнить через CryptoBot",
+            callback_data="topup:crypto",
+        )],
+        [InlineKeyboardButton(text="💰 К балансу", callback_data="bal")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="buy_cancel")],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def checkout_processing_text() -> str:
+    """Текст «обработка заказа» — показывается между confirm и delivery."""
+    return (
+        "⏳ <b>Обрабатываем заказ...</b>\n\n"
+        "🔄 Связываемся с поставщиком — обычно занимает 30-60 секунд.\n"
+        "<i>Коды придут отдельным сообщением.</i>"
+    )
+
+
+# ─── orders history ────────────────────────────────────────────────
+
+
+def orders_list_keyboard(
+    *,
+    orders: Sequence,
+    page: int,
+    total: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Страница «📦 Мои заказы».
+
+    Item format:
+      [ #42 · ✅ 25.05 · Apple US $5 — 397 ₽ ]
+      [ #41 · ⏳ 25.05 · Steam $5 — 410 ₽ ]
+      [ #40 · ❌ 24.05 · Roblox 100 — 238 ₽ ]
+
+    Статус-emoji:
+      ✅ delivered
+      ⏳ paid/delivering
+      🔄 refunded
+      ❌ failed
+      📝 draft (не должны быть видны юзеру, но на всякий)
+    """
+    if not orders:
+        text = (
+            "📦 <b>Мои заказы</b>\n\n"
+            "У тебя пока нет покупок. Загляни в 🛍 Каталог — там есть много "
+            "интересных карт, подписок и игровых валют!"
+        )
+        return text, InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛍 Открыть каталог", callback_data="cats:0")],
+        ])
+
+    page_size = 8
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    text_lines = [
+        "📦 <b>Мои заказы</b>",
+        f"<i>всего {total} · стр. {page + 1}/{total_pages}</i>",
+        "",
+    ]
+    rows: list[list[InlineKeyboardButton]] = []
+    for o in orders:
+        emoji = _order_status_emoji(o.status)
+        date = o.created_at.strftime("%d.%m") if getattr(o, "created_at", None) else "—"
+        price = _format_rub_compact(o.total_rub_kopecks)
+        # Имя товара ужмём
+        name = (o.ns_service_name or "—")[:30]
+        label = f"#{o.id} · {emoji} {date} · {name} — {price}"
+        rows.append([InlineKeyboardButton(
+            text=_truncate(label),
+            callback_data=f"ord:{o.id}",
+        )])
+    nav = _nav_row(page=page, total_pages=total_pages, prefix="orders")
+    if nav:
+        rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(text="🛍 Каталог", callback_data="cats:0"),
+    ])
+    return "\n".join(text_lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _order_status_emoji(status: str) -> str:
+    """Эмодзи для статуса заказа в списке."""
+    return {
+        "delivered": "✅",
+        "paid": "⏳",
+        "delivering": "⏳",
+        "refunded": "🔄",
+        "failed": "❌",
+        "draft": "📝",
+    }.get(status, "❔")
+
+
+def order_card_keyboard(
+    *,
+    order,
+    pins: list | None = None,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Карточка одного заказа из истории. Показывает pins для delivered,
+    error для failed, статус-таймлайн.
+    """
+    emoji = _order_status_emoji(order.status)
+    status_human = {
+        "delivered": "✅ Доставлен",
+        "paid": "⏳ Оплачен, ждём поставщика",
+        "delivering": "⏳ Доставляется",
+        "refunded": "🔄 Возврат сделан",
+        "failed": "❌ Не выполнен",
+        "draft": "📝 Черновик",
+    }.get(order.status, order.status)
+
+    date = order.created_at.strftime("%d.%m.%Y %H:%M") if getattr(order, "created_at", None) else "—"
+
+    lines = [
+        f"🧾 <b>Заказ #{order.id}</b>",
+        f"<i>{date}</i>",
+        "",
+        f"🛒 <b>{html.escape(order.ns_service_name or '—')}</b>",
+        f"💰 Цена: <b>{_format_rub_full(order.total_rub_kopecks)}</b>",
+        f"📍 Статус: <b>{status_human}</b>",
+    ]
+    if pins:
+        lines.append("")
+        lines.append("🔑 <b>Коды активации:</b>")
+        for i, p in enumerate(pins, start=1):
+            if isinstance(p, dict):
+                code = p.get("pin") or p.get("code") or p.get("content") or "?"
+                serial = p.get("serial")
+                if serial:
+                    lines.append(
+                        f"  {i}. <code>{code}</code> · serial: <code>{serial}</code>"
+                    )
+                else:
+                    lines.append(f"  {i}. <code>{code}</code>")
+            else:
+                lines.append(f"  {i}. <code>{p}</code>")
+    if order.status == "failed" and getattr(order, "error", None):
+        lines.append("")
+        lines.append(f"<i>Причина: {html.escape(order.error[:200])}</i>")
+
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(
+            text="« К заказам", callback_data="orders:0",
+        )],
+    ]
+    # Кнопка «Купить ещё» если delivered/failed → быстрый re-order
+    if order.status in ("delivered", "failed", "refunded"):
+        rows.insert(0, [InlineKeyboardButton(
+            text="🛒 Купить ещё",
+            callback_data=f"svc:{order.ns_service_id}",
+        )])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def topup_custom_amount_prompt(*, min_rub: int, max_rub: int) -> str:
     """Текст промпта для FSM 'своя сумма'. Отдельная функция для теста."""
     return (

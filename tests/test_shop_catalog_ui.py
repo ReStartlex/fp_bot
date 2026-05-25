@@ -61,7 +61,9 @@ def _fake_cb(data: str):
     cb = SimpleNamespace()
     cb.data = data
     cb.message = msg
-    cb.from_user = SimpleNamespace(id=1)
+    cb.from_user = SimpleNamespace(
+        id=1, username=None, first_name=None, language_code=None,
+    )
     cb.answer = AsyncMock()
     return cb
 
@@ -343,14 +345,15 @@ async def test_service_card_returns_none_for_missing(db_setup):
     assert cb.answer.call_args.kwargs.get("show_alert") is True
 
 
-async def test_buy_stub_shows_alert(db_setup):
+async def test_buy_request_for_missing_service_shows_alert(db_setup):
+    """Sprint 5: при клике «Купить» по несуществующему svc — alert."""
     bot = ShopBot(_settings())
-    cb = _fake_cb("buy:1")
-    await bot._on_cb_buy_stub(cb)
+    cb = _fake_cb("buy:99999")
+    await bot._on_cb_buy_request(cb, _fake_state())
     cb.answer.assert_called_once()
     text = cb.answer.call_args.args[0] if cb.answer.call_args.args else \
         cb.answer.call_args.kwargs.get("text", "")
-    assert "оплат" in text.lower() or "опла" in text.lower()
+    assert "недоступ" in text.lower() or "битая" in text.lower()
 
 
 async def test_back_to_cats_callback(db_setup):

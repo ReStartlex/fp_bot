@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models import (
     ShopBalanceLedger,
     ShopCatalogCache,
+    ShopOrder,
     ShopPayment,
     ShopReferral,
     ShopUser,
@@ -910,6 +911,383 @@ async def mark_payment_failed(
     payment.error = reason
     await session.flush()
     return payment
+
+
+# ════════════════════════════════════════════════════════════════════════
+#               Sprint 5: shop checkout — заказы и cashback
+# ════════════════════════════════════════════════════════════════════════
+# Жизненный цикл ShopOrder:
+#   draft → paid → delivering → delivered
+#                          │
+#                          └─→ failed → refunded
+#
+# Идемпотентность критична:
+#   * Заказ paid → balance уже списан (apply_balance_change с reason="order_payment");
+#   * Заказ delivered → cashback начислен инвайтеру ИЛИ зафиксирована попытка;
+#   * Заказ failed → balance возвращён покупателю (reason="refund") ОДИН раз.
+# Любая повторная попытка тех же шагов = no-op.
+#
+# Гарантии:
+#   1. credit_referral_cashback — проверяет наличие ledger-записи
+#      (user_id, related_order_id, reason="referral_cashback") и не дублирует.
+#   2. refund_failed_order — проверяет наличие ledger-записи
+#      (user_id, related_order_id, reason="refund") и не дублирует.
+#   3. mark_order_* — переходы по статусам однонаправленные; обратное
+#      движение требует явных функций (например refund после delivered).
+
+
+# Финальные статусы — заказ больше не движется по обычному пайплайну.
+# Любые операции (cashback, refund) ДОЛЖНЫ быть выполнены ровно один раз.
+SHOP_ORDER_STATUS_DRAFT = "draft"
+SHOP_ORDER_STATUS_PAID = "paid"
+SHOP_ORDER_STATUS_DELIVERING = "delivering"
+SHOP_ORDER_STATUS_DELIVERED = "delivered"
+SHOP_ORDER_STATUS_FAILED = "failed"
+SHOP_ORDER_STATUS_REFUNDED = "refunded"
+
+# Reason-константы для ledger — используются как идентификаторы операций
+# (см. UNIQUE-логику в credit_referral_cashback / refund_failed_order).
+LEDGER_REASON_ORDER_PAYMENT = "order_payment"
+LEDGER_REASON_REFERRAL_CASHBACK = "referral_cashback"
+LEDGER_REASON_REFUND = "refund"
+
+
+async def _ledger_has_entry(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    related_order_id: int,
+    reason: str,
+) -> bool:
+    """
+    True, если в ledger есть хотя бы одна запись по этому (user, order, reason).
+
+    Используется для guard'ов идемпотентности: «начислять cashback ТОЛЬКО
+    если ещё не начислили». Поскольку ledger — append-only, наличие записи
+    означает «операция уже выполнена».
+    """
+    res = await session.execute(
+        select(ShopBalanceLedger.id)
+        .where(
+            ShopBalanceLedger.user_id == user_id,
+            ShopBalanceLedger.related_order_id == related_order_id,
+            ShopBalanceLedger.reason == reason,
+        )
+        .limit(1)
+    )
+    return res.scalar_one_or_none() is not None
+
+
+async def create_shop_order(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    ns_service_id: int,
+    ns_service_name: str,
+    fields_json: str = "[]",
+    quantity: int = 1,
+    total_rub_kopecks: int,
+    ns_price_usd: float | None = None,
+    fx_rate_at_sale: float | None = None,
+    markup_percent_at_sale: float | None = None,
+    payment_method: str = "balance_only",
+) -> ShopOrder:
+    """
+    Создаёт ShopOrder в статусе DRAFT. Деньги ещё не списаны.
+
+    `payment_method`:
+      * "balance_only" — оплата полностью с внутреннего баланса (Sprint 5);
+      * "cryptobot" / "stars" — частичная/полная оплата извне (Sprint 5.2+).
+
+    Возвращает ShopOrder с заполненным id (после flush).
+    """
+    order = ShopOrder(
+        user_id=user_id,
+        ns_service_id=ns_service_id,
+        ns_service_name=ns_service_name,
+        fields_json=fields_json,
+        quantity=quantity,
+        total_rub_kopecks=total_rub_kopecks,
+        ns_price_usd=ns_price_usd,
+        fx_rate_at_sale=fx_rate_at_sale,
+        markup_percent_at_sale=markup_percent_at_sale,
+        payment_method=payment_method,
+        status=SHOP_ORDER_STATUS_DRAFT,
+    )
+    session.add(order)
+    await session.flush()
+    return order
+
+
+async def get_shop_order(
+    session: AsyncSession, order_id: int
+) -> ShopOrder | None:
+    """Read-only выборка одного заказа по id."""
+    res = await session.execute(
+        select(ShopOrder).where(ShopOrder.id == order_id)
+    )
+    return res.scalar_one_or_none()
+
+
+async def mark_order_paid(
+    session: AsyncSession,
+    *,
+    order_id: int,
+    balance_used_kopecks: int,
+    external_paid_kopecks: int = 0,
+) -> ShopOrder:
+    """
+    DRAFT → PAID. Записывает фактически использованную часть с баланса
+    и с внешней оплаты. paid_at = now.
+
+    NB: предполагается, что balance уже дебитован вызывающим (через
+    apply_balance_change). Эта функция не трогает ledger.
+    """
+    order = await get_shop_order(session, order_id)
+    if order is None:
+        raise ValueError(f"order {order_id} not found")
+    order.status = SHOP_ORDER_STATUS_PAID
+    order.balance_used_kopecks = balance_used_kopecks
+    order.external_paid_kopecks = external_paid_kopecks
+    order.paid_at = datetime.utcnow()
+    await session.flush()
+    return order
+
+
+async def mark_order_delivering(
+    session: AsyncSession,
+    *,
+    order_id: int,
+    ns_custom_id: str,
+    ns_order_id: str | None = None,
+) -> ShopOrder:
+    """PAID → DELIVERING. Перешли в фазу NS-выдачи."""
+    order = await get_shop_order(session, order_id)
+    if order is None:
+        raise ValueError(f"order {order_id} not found")
+    order.status = SHOP_ORDER_STATUS_DELIVERING
+    order.ns_custom_id = ns_custom_id
+    if ns_order_id is not None:
+        order.ns_order_id = ns_order_id
+    await session.flush()
+    return order
+
+
+async def mark_order_delivered(
+    session: AsyncSession,
+    *,
+    order_id: int,
+    pins_json: str,
+) -> ShopOrder:
+    """DELIVERING → DELIVERED. Сохраняем pins/contents, отмечаем delivered_at."""
+    order = await get_shop_order(session, order_id)
+    if order is None:
+        raise ValueError(f"order {order_id} not found")
+    order.status = SHOP_ORDER_STATUS_DELIVERED
+    order.pins_json = pins_json
+    order.delivered_at = datetime.utcnow()
+    await session.flush()
+    return order
+
+
+async def mark_order_failed(
+    session: AsyncSession,
+    *,
+    order_id: int,
+    error: str,
+) -> ShopOrder:
+    """
+    Любой статус → FAILED. Записывает текст ошибки.
+
+    NB: вызов НЕ возвращает деньги — это отдельная операция
+    refund_failed_order, чтобы было видно «упало → ещё не возвращено».
+    """
+    order = await get_shop_order(session, order_id)
+    if order is None:
+        raise ValueError(f"order {order_id} not found")
+    order.status = SHOP_ORDER_STATUS_FAILED
+    order.error = (error or "")[:1000]
+    await session.flush()
+    return order
+
+
+async def refund_failed_order(
+    session: AsyncSession,
+    *,
+    order_id: int,
+) -> ShopUser | None:
+    """
+    FAILED → REFUNDED. Возвращает balance_used_kopecks покупателю.
+
+    Идемпотентно: если refund уже сделан (есть ledger entry с
+    reason="refund" и related_order_id=order_id), возвращает None без
+    изменения баланса.
+
+    Это нужно для случая когда delivery worker дважды попытался обработать
+    тот же failed-заказ — баланс вернётся ровно один раз.
+    """
+    order = await get_shop_order(session, order_id)
+    if order is None:
+        raise ValueError(f"order {order_id} not found")
+    if order.status not in (SHOP_ORDER_STATUS_FAILED, SHOP_ORDER_STATUS_DELIVERING):
+        # REFUNDED / DELIVERED — ничего не делаем; иначе попасть сюда
+        # из обычного flow невозможно.
+        return None
+    if order.balance_used_kopecks <= 0:
+        # Заказ оплачен полностью извне (e.g. CryptoBot) — refund'ы
+        # внешних провайдеров обрабатываются по их API, не нашему ledger.
+        order.status = SHOP_ORDER_STATUS_REFUNDED
+        await session.flush()
+        return None
+
+    # Guard идемпотентности
+    already_refunded = await _ledger_has_entry(
+        session,
+        user_id=order.user_id,
+        related_order_id=order_id,
+        reason=LEDGER_REASON_REFUND,
+    )
+    if already_refunded:
+        # Помечаем статус как REFUNDED (если ещё нет) — не двигаем баланс.
+        order.status = SHOP_ORDER_STATUS_REFUNDED
+        await session.flush()
+        return None
+
+    user = await apply_balance_change(
+        session,
+        user_id=order.user_id,
+        change_kopecks=order.balance_used_kopecks,
+        reason=LEDGER_REASON_REFUND,
+        related_order_id=order_id,
+        note=f"Refund for failed order #{order_id}",
+    )
+    order.status = SHOP_ORDER_STATUS_REFUNDED
+    await session.flush()
+    return user
+
+
+async def credit_referral_cashback(
+    session: AsyncSession,
+    *,
+    order_id: int,
+    cashback_percent: float,
+) -> int:
+    """
+    Начисляет cashback инвайтеру покупателя за заказ ORDER_ID.
+
+    Алгоритм:
+      1. Берём заказ — должен быть DELIVERED;
+      2. Находим покупателя → его referred_by_user_id (= inviter);
+      3. Если нет inviter'а — пропускаем (return 0);
+      4. Считаем cashback = floor(order.total * cashback_percent / 100);
+      5. Если cashback ≤ 0 — пропускаем (return 0);
+      6. **Idempotency guard**: ищем существующую ledger запись с
+         (inviter_id, related_order_id=order_id, reason="referral_cashback").
+         Если есть — пропускаем (return 0 — уже начислено).
+      7. apply_balance_change(+cashback, reason="referral_cashback",
+         related_order_id=order_id).
+
+    Возвращает реально начисленную сумму (kopecks). 0 = ничего не
+    сделали (нет inviter'а, либо уже начисляли, либо cashback < 1 коп).
+
+    Безопасно вызывать многократно: повторные вызовы возвращают 0.
+    """
+    if cashback_percent <= 0:
+        return 0
+    order = await get_shop_order(session, order_id)
+    if order is None:
+        raise ValueError(f"order {order_id} not found")
+    if order.status != SHOP_ORDER_STATUS_DELIVERED:
+        # Защита от случая «cashback начислили до того как заказ был
+        # delivered». Это бы дало юзеру деньги до того как поставщик
+        # подтвердил выдачу.
+        return 0
+
+    buyer = await _get_user_strict(session, order.user_id)
+    inviter_id = buyer.referred_by_user_id
+    if inviter_id is None or inviter_id == buyer.id:
+        return 0
+
+    # Cashback в копейках. floor — чтобы не давать дробных, ledger
+    # хранит целые копейки.
+    cashback_kopecks = int(order.total_rub_kopecks * cashback_percent / 100.0)
+    if cashback_kopecks <= 0:
+        return 0
+
+    # Idempotency
+    already_credited = await _ledger_has_entry(
+        session,
+        user_id=inviter_id,
+        related_order_id=order_id,
+        reason=LEDGER_REASON_REFERRAL_CASHBACK,
+    )
+    if already_credited:
+        return 0
+
+    # Проверяем что inviter существует (могли удалить или это битый id)
+    inviter_row = await session.execute(
+        select(ShopUser).where(ShopUser.id == inviter_id)
+    )
+    if inviter_row.scalar_one_or_none() is None:
+        return 0
+
+    await apply_balance_change(
+        session,
+        user_id=inviter_id,
+        change_kopecks=cashback_kopecks,
+        reason=LEDGER_REASON_REFERRAL_CASHBACK,
+        related_order_id=order_id,
+        note=f"Cashback {cashback_percent}% for order #{order_id}",
+    )
+    return cashback_kopecks
+
+
+async def list_user_orders(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    limit: int = 10,
+    offset: int = 0,
+) -> tuple[list[ShopOrder], int]:
+    """
+    Список заказов покупателя для UI «📦 Мои заказы». Newest first.
+
+    Возвращает (rows, total_count) — total нужен для пагинации.
+    """
+    where = ShopOrder.user_id == user_id
+    total = (await session.execute(
+        select(func.count(ShopOrder.id)).where(where)
+    )).scalar_one()
+    rows = (await session.execute(
+        select(ShopOrder)
+        .where(where)
+        .order_by(ShopOrder.id.desc())
+        .limit(limit).offset(offset)
+    )).scalars().all()
+    return list(rows), total
+
+
+async def list_orders_awaiting_delivery(
+    session: AsyncSession,
+    *,
+    limit: int = 10,
+) -> list[ShopOrder]:
+    """
+    PAID + DELIVERING заказы — кандидаты для delivery worker'а.
+
+    Сортировка: по id ASC (FIFO — раньше оплаченные сначала). Limit
+    защищает от «возьмём все 1000 заказов разом и упадём».
+    """
+    res = await session.execute(
+        select(ShopOrder)
+        .where(ShopOrder.status.in_([
+            SHOP_ORDER_STATUS_PAID,
+            SHOP_ORDER_STATUS_DELIVERING,
+        ]))
+        .order_by(ShopOrder.id.asc())
+        .limit(limit)
+    )
+    return list(res.scalars().all())
 
 
 def parse_referral_payload(payload: str | None) -> int | None:
