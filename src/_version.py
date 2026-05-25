@@ -4,6 +4,6 @@ deploy/stamp_version.py перед каждым push'ем.
 
 ВАЖНО: НЕ редактируй вручную — твои изменения будут перезаписаны.
 """
-SHA = "4ab038e122fb66d52696484c109e2b3bae561a3f"
-DATE = "2026-05-25T17:26:45+03:00"
-SUBJECT = "feat(shop): Phase 1 Sprint 1 вЂ” TG-shop skeleton + DB models"
+SHA = "08393700ad4183d6d7273042a212ae80cf044931"
+DATE = "2026-05-25T18:19:34+03:00"
+SUBJECT = "feat(shop): Phase 1 Sprint 2 вЂ” РєР°С‚Р°Р»РѕРі РёР· NS + markup 8% + UI РЅР°РІРёРіР°С†РёСЏ"
