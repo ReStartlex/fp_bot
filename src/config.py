@@ -131,6 +131,24 @@ class Settings(BaseSettings):
     # после первого захода, и нагрузка на NS API ничтожна (1 запрос в 90с).
     shop_catalog_refresh_seconds: int = Field(default=90, ge=30, le=3600)
 
+    # ─── Sprint 3: CryptoBot (Crypto Pay API) ──────────────────────────
+    # Включает интеграцию с @CryptoBot для пополнения внутреннего баланса.
+    # Если токен не задан — кнопка «🪙 CryptoBot» в боте остаётся stub-ом.
+    # Токен получить: @CryptoBot → /pay → «Create App» → «API Token».
+    cryptobot_api_token: SecretStr | None = None
+    # Testnet (@CryptoTestnetBot) — для отладки без реальных платежей.
+    cryptobot_testnet: bool = False
+    # Лимиты для пополнения (защита от случайных огромных сумм).
+    cryptobot_min_topup_rub: int = Field(default=100, ge=10, le=100000)
+    cryptobot_max_topup_rub: int = Field(default=100000, ge=100, le=1000000)
+    # Как часто polling-воркер опрашивает getInvoices(status="paid").
+    # Polling — fallback на случай если webhook недоступен (без nginx/SSL).
+    # При наличии webhook'а можно увеличить до 600с для экономии лимитов.
+    cryptobot_polling_seconds: int = Field(default=30, ge=10, le=3600)
+    # TTL invoice'а в секундах (1 час по умолчанию). Дольше — выше шанс
+    # дубль-оплаты; короче — юзер может не успеть оплатить.
+    cryptobot_invoice_ttl_seconds: int = Field(default=3600, ge=300, le=86400)
+
     web_api_enabled: bool = False
     web_api_host: str = "127.0.0.1"
     web_api_port: int = Field(default=8080, ge=1, le=65535)

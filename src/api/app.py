@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from src.api.auth import require_api_auth
+from src.api.cryptobot_webhook import router as cryptobot_router
 from src.config import Settings, get_settings
 from src.db.session import close_db, init_db
 from src.logging_setup import setup_logging
@@ -91,6 +92,9 @@ def create_app() -> FastAPI:
     @app.post("/api/reconcile", dependencies=[Depends(require_api_auth)], tags=["ops"])
     async def run_reconcile(settings: Settings = Depends(get_settings)) -> dict:
         return await reconcile_orders_once(settings=settings)
+
+    # CryptoBot webhook — без require_api_auth (защищён HMAC-подписью).
+    app.include_router(cryptobot_router)
 
     return app
 

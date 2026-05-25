@@ -163,6 +163,62 @@ def _migrate_sqlite_schema(sync_conn) -> None:
                     f"init_db: backfill base_name/group_slug для {len(rows)} услуг"
                 )
 
+    # Sprint 3: для shop_payments
+    #   - order_id стал nullable (top-up не привязан к заказу);
+    #     ALTER COLUMN ... DROP NOT NULL в SQLite не поддерживается,
+    #     поэтому делаем это через rebuild table (SQLite-way) ТОЛЬКО если
+    #     колонка реально NOT NULL — иначе no-op.
+    #   - добавлена колонка `error` (текст ошибки если failed).
+    if "shop_payments" in tables:
+        cols_info = inspector.get_columns("shop_payments")
+        col_names = {c["name"] for c in cols_info}
+        if "error" not in col_names:
+            sync_conn.execute(text("ALTER TABLE shop_payments ADD COLUMN error VARCHAR(255)"))
+            logger.info("init_db: добавлена колонка shop_payments.error")
+        # order_id: проверяем, NOT NULL ли он сейчас. Если да — rebuild.
+        order_id_col = next((c for c in cols_info if c["name"] == "order_id"), None)
+        if order_id_col is not None and order_id_col.get("nullable") is False:
+            # SQLite rebuild: создаём новую таблицу с правильной схемой,
+            # копируем данные, удаляем старую, переименовываем новую.
+            # Все имена индексов/constraint-ов сохраняем.
+            logger.info(
+                "init_db: rebuild shop_payments для order_id → NULLABLE "
+                "(SQLite не поддерживает ALTER COLUMN)"
+            )
+            sync_conn.execute(text("""
+                CREATE TABLE shop_payments_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER,
+                    provider VARCHAR(16) NOT NULL,
+                    provider_invoice_id VARCHAR(128) NOT NULL,
+                    amount_kopecks INTEGER NOT NULL,
+                    currency VARCHAR(8) NOT NULL DEFAULT 'RUB',
+                    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+                    raw_payload_json TEXT,
+                    error VARCHAR(255),
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    paid_at DATETIME,
+                    CONSTRAINT uq_shop_payments_provider_invoice
+                        UNIQUE (provider, provider_invoice_id)
+                )
+            """))
+            sync_conn.execute(text("""
+                INSERT INTO shop_payments_new
+                    (id, order_id, provider, provider_invoice_id,
+                     amount_kopecks, currency, status, raw_payload_json,
+                     error, created_at, paid_at)
+                SELECT
+                    id, order_id, provider, provider_invoice_id,
+                    amount_kopecks, currency, status, raw_payload_json,
+                    NULL, created_at, paid_at
+                FROM shop_payments
+            """))
+            sync_conn.execute(text("DROP TABLE shop_payments"))
+            sync_conn.execute(text(
+                "ALTER TABLE shop_payments_new RENAME TO shop_payments"
+            ))
+            logger.info("init_db: shop_payments rebuild завершён")
+
 
 async def close_db() -> None:
     global _engine, _session_factory

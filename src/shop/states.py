@@ -25,3 +25,15 @@ class SearchState(StatesGroup):
         выводит результаты и сам очищает state.
     """
     waiting_for_query = State()
+
+
+class TopupState(StatesGroup):
+    """
+    Юзер тапнул «🪙 CryptoBot» → бот показал кнопки 100/300/500/1000/3000
+    + «Своя сумма». Если выбрал «Своя сумма» — переходим в
+    waiting_for_custom_amount и ждём число от юзера.
+
+    Любой не-числовой ответ → подсказка + остаёмся в state.
+    /cancel или «❌ Отмена» → state.clear().
+    """
+    waiting_for_custom_amount = State()

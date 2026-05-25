@@ -66,25 +66,36 @@ from src.shop.keyboards import (
     search_results_keyboard,
     service_card_keyboard,
     services_page_keyboard,
+    topup_amount_keyboard,
+    topup_custom_amount_prompt,
+    topup_invoice_keyboard,
     variants_grid_keyboard,
 )
 from src.shop.repo import (
     apply_balance_change,
+    apply_paid_invoice,
     attach_referral,
     count_categories_in_group,
+    create_topup_payment,
     get_balance_stats,
     get_catalog_service,
     get_or_create_user,
+    get_payment,
     get_referral_stats,
     list_balance_history,
     list_categories_in_group,
     list_category_groups_for_ui,
     list_services_in_category,
+    mark_payment_failed,
     parse_referral_payload,
     search_services,
 )
 from src.config_runtime import get_shop_referral_percent
-from src.shop.states import SearchState
+from src.shop.payments.cryptobot import (
+    CryptoBotClient,
+    CryptoBotError,
+)
+from src.shop.states import SearchState, TopupState
 
 
 # Сколько результатов поиска отдаём максимум (в FSM и inline-query).
@@ -100,6 +111,10 @@ OwnerNotify = Callable[[str], Awaitable[None]]
 
 BRAND = "NeuroDrop"
 SITE_URL = "neurodrop.ru"
+
+
+class _TopupError(Exception):
+    """User-facing error в top-up flow: текст сразу отдаём в чат."""
 
 
 HELP_TEXT = (
@@ -269,6 +284,20 @@ class ShopBot:
             BotCommand(command="help", description="Справка"),
         ])
 
+    async def send_message_to_user(self, telegram_user_id: int, text: str) -> None:
+        """
+        Отправляет сообщение покупателю (используется polling-воркером
+        CryptoBot для нотификации «✅ Оплата получена»).
+
+        Если бот не запущен — silently no-op (через _bot is None).
+        Исключения наружу не выбрасываем: caller всегда оборачивает.
+        """
+        if self._bot is None:
+            return
+        await self._bot.send_message(
+            chat_id=telegram_user_id, text=text, parse_mode="HTML",
+        )
+
     # ─────────────── handler registration ────
 
     def _register_handlers(self) -> None:
@@ -322,6 +351,21 @@ class ShopBot:
         )
         dp.callback_query.register(
             self._on_cb_topup_card, F.data == "topup:card",
+        )
+        # Sprint 3: CryptoBot top-up flow
+        dp.callback_query.register(
+            self._on_cb_topup_amount, F.data.startswith("tp_amt:"),
+        )
+        dp.callback_query.register(
+            self._on_cb_topup_check, F.data.startswith("tp_check:"),
+        )
+        dp.callback_query.register(
+            self._on_cb_topup_cancel, F.data.startswith("tp_cancel:"),
+        )
+        # Ввод «своей суммы» в FSM
+        dp.message.register(
+            self._on_topup_custom_amount,
+            StateFilter(TopupState.waiting_for_custom_amount),
         )
         dp.callback_query.register(
             self._on_cb_balance_history, F.data.startswith("bal_hist:"),
@@ -913,12 +957,313 @@ class ShopBot:
             "admin_adjust": "🛠 корректировка",
         }.get(reason, reason)
 
+    # ─────────────── top-up CryptoBot ───────────────
+
+    def _cryptobot_client(self) -> CryptoBotClient | None:
+        """Lazy-конструктор. None если токен не задан в настройках."""
+        token = self._settings.cryptobot_api_token
+        if not token:
+            return None
+        return CryptoBotClient(
+            api_token=token.get_secret_value(),
+            testnet=self._settings.cryptobot_testnet,
+        )
+
     async def _on_cb_topup_crypto(self, cb: CallbackQuery) -> None:
+        """Тап «🪙 CryptoBot» на странице баланса → меню выбора суммы."""
+        if cb.message is None:
+            await cb.answer()
+            return
+        if not self._settings.cryptobot_api_token:
+            await cb.answer(
+                "🪙 CryptoBot пока не настроен у владельца.\n"
+                "Скоро будет — следи за анонсами.",
+                show_alert=True,
+            )
+            return
+        text, kb = topup_amount_keyboard(
+            min_rub=self._settings.cryptobot_min_topup_rub,
+            max_rub=self._settings.cryptobot_max_topup_rub,
+        )
+        await self._safe_edit(cb, text=text, markup=kb)
+        await cb.answer()
+
+    async def _on_cb_topup_amount(
+        self, cb: CallbackQuery, state: FSMContext,
+    ) -> None:
+        """Юзер выбрал сумму: tp_amt:<kopecks> или tp_amt:custom."""
+        if cb.message is None or cb.data is None or cb.from_user is None:
+            await cb.answer()
+            return
+        suffix = cb.data.split(":", 1)[1]
+        if suffix == "custom":
+            await state.set_state(TopupState.waiting_for_custom_amount)
+            prompt = topup_custom_amount_prompt(
+                min_rub=self._settings.cryptobot_min_topup_rub,
+                max_rub=self._settings.cryptobot_max_topup_rub,
+            )
+            try:
+                await cb.message.edit_text(prompt, reply_markup=None)
+            except TelegramBadRequest:
+                await cb.message.answer(prompt)
+            await cb.answer("Введи сумму числом")
+            return
+        try:
+            amount_kopecks = int(suffix)
+        except ValueError:
+            await cb.answer("Неверная сумма")
+            return
+        await self._create_and_show_invoice(
+            cb=cb, amount_kopecks=amount_kopecks, state=state,
+        )
+
+    async def _on_topup_custom_amount(
+        self, message: Message, state: FSMContext,
+    ) -> None:
+        """FSM: ждём число от юзера → создаём invoice."""
+        if message.text is None or message.from_user is None:
+            return
+        if message.text.strip().lower() in ("/cancel", "отмена", "cancel"):
+            await state.clear()
+            await message.answer("Окей, отменил.", reply_markup=main_menu_keyboard())
+            return
+        # Парсим число. Поддерживаем «250», «250.50», «250,50».
+        raw = message.text.strip().replace(",", ".").replace(" ", "")
+        try:
+            rub = float(raw)
+        except ValueError:
+            await message.answer(
+                "🤔 Не понял сумму. Введи число, например <code>250</code> "
+                "или <code>250.50</code>.\n\n"
+                "Отменить — /cancel."
+            )
+            return
+        if rub < self._settings.cryptobot_min_topup_rub:
+            await message.answer(
+                f"⚠ Минимум для пополнения — "
+                f"<b>{self._settings.cryptobot_min_topup_rub} ₽</b>.\n"
+                "Введи другую сумму или /cancel."
+            )
+            return
+        if rub > self._settings.cryptobot_max_topup_rub:
+            await message.answer(
+                f"⚠ Максимум для пополнения — "
+                f"<b>{self._settings.cryptobot_max_topup_rub:,} ₽</b>. "
+                "За большие суммы напиши в /support.\n"
+                "Введи другую сумму или /cancel.".replace(",", " ")
+            )
+            return
+        kopecks = int(round(rub * 100))
+        await state.clear()
+        await self._create_and_show_invoice_for_message(
+            message=message, amount_kopecks=kopecks,
+        )
+
+    async def _create_and_show_invoice(
+        self,
+        *,
+        cb: CallbackQuery,
+        amount_kopecks: int,
+        state: FSMContext,
+    ) -> None:
+        """Создать invoice CryptoBot + отрисовать карточку (редактируя message)."""
+        await state.clear()
+        if cb.from_user is None or cb.message is None:
+            return
+        await cb.answer("Создаю счёт…")
+        try:
+            text, kb = await self._build_invoice_card(
+                telegram_user_id=cb.from_user.id,
+                amount_kopecks=amount_kopecks,
+            )
+        except _TopupError as exc:
+            await cb.message.answer(f"⚠ {exc}\nПопробуй ещё раз через /balance.")
+            return
+        await self._safe_edit(cb, text=text, markup=kb)
+
+    async def _create_and_show_invoice_for_message(
+        self, *, message: Message, amount_kopecks: int,
+    ) -> None:
+        if message.from_user is None:
+            return
+        notice = await message.answer("Создаю счёт…")
+        try:
+            text, kb = await self._build_invoice_card(
+                telegram_user_id=message.from_user.id,
+                amount_kopecks=amount_kopecks,
+            )
+        except _TopupError as exc:
+            try:
+                await notice.edit_text(
+                    f"⚠ {exc}\nПопробуй ещё раз через /balance."
+                )
+            except TelegramBadRequest:
+                await message.answer(f"⚠ {exc}")
+            return
+        try:
+            await notice.edit_text(text, reply_markup=kb)
+        except TelegramBadRequest:
+            await message.answer(text, reply_markup=kb)
+
+    async def _build_invoice_card(
+        self, *, telegram_user_id: int, amount_kopecks: int,
+    ) -> tuple[str, InlineKeyboardMarkup]:
+        """
+        Создаёт CryptoBot invoice + ShopPayment(pending) и возвращает
+        отрендеренную карточку. Поднимает _TopupError на любую проблему
+        (нет токена, API упал, БД не доступна) — caller покажет юзеру
+        дружелюбный текст.
+        """
+        cli = self._cryptobot_client()
+        if cli is None:
+            raise _TopupError("CryptoBot временно недоступен (нет токена)")
+        # 1) Создать invoice у CryptoBot
+        from decimal import Decimal
+        amount_rub = Decimal(amount_kopecks) / Decimal(100)
+        ttl = self._settings.cryptobot_invoice_ttl_seconds
+        # Payload временный — заменим на payment_id после INSERT
+        try:
+            invoice = await cli.create_invoice(
+                amount_rub=amount_rub,
+                description=f"Пополнение баланса {BRAND} ({amount_rub} ₽)",
+                payload=f"tg:{telegram_user_id}",
+                expires_in=ttl,
+            )
+        except (CryptoBotError, Exception) as exc:  # noqa: BLE001
+            logger.warning(f"CryptoBot createInvoice failed: {exc}")
+            raise _TopupError(
+                "Не удалось создать счёт у CryptoBot. Попробуй позже."
+            ) from exc
+
+        # 2) Сохранить в БД как pending
+        async with session_factory()() as session:
+            user, _ = await get_or_create_user(
+                session, telegram_user_id=telegram_user_id,
+            )
+            await create_topup_payment(
+                session,
+                user_id=user.id,
+                provider="cryptobot",
+                provider_invoice_id=str(invoice.invoice_id),
+                amount_kopecks=amount_kopecks,
+                notify_telegram_id=telegram_user_id,
+            )
+            await session.commit()
+
+        # 3) Отрендерить карточку
+        text, kb = topup_invoice_keyboard(
+            amount_kopecks=amount_kopecks,
+            pay_url=invoice.pay_url,
+            invoice_id=invoice.invoice_id,
+            expires_in_minutes=max(1, ttl // 60),
+        )
+        logger.info(
+            f"topup created: tg_user={telegram_user_id} "
+            f"amount={amount_kopecks}kop invoice_id={invoice.invoice_id}"
+        )
+        return text, kb
+
+    async def _on_cb_topup_check(self, cb: CallbackQuery) -> None:
+        """Юзер форсирует проверку статуса invoice'а."""
+        if cb.data is None or cb.from_user is None:
+            await cb.answer()
+            return
+        try:
+            invoice_id = int(cb.data.split(":", 1)[1])
+        except ValueError:
+            await cb.answer()
+            return
+        cli = self._cryptobot_client()
+        if cli is None:
+            await cb.answer("CryptoBot не настроен", show_alert=True)
+            return
+        await cb.answer("Проверяю у CryptoBot…")
+        try:
+            fresh = await cli.get_invoice(invoice_id)
+        except (CryptoBotError, Exception) as exc:  # noqa: BLE001
+            logger.warning(f"CryptoBot getInvoice failed: {exc}")
+            await cb.answer(
+                "Не удалось проверить. Попробуй ещё раз через минуту.",
+                show_alert=True,
+            )
+            return
+        if fresh is None:
+            await cb.answer(
+                "Счёт не найден (возможно, истёк). Создай новый через /balance.",
+                show_alert=True,
+            )
+            return
+        if fresh.status == "paid":
+            # Применяем идемпотентно (polling мог не успеть)
+            from decimal import Decimal as _D
+            kopecks = int((fresh.amount * _D(100)).to_integral_value())
+            async with session_factory()() as session:
+                _, applied = await apply_paid_invoice(
+                    session,
+                    provider="cryptobot",
+                    provider_invoice_id=str(fresh.invoice_id),
+                    paid_amount_kopecks=kopecks,
+                )
+                await session.commit()
+            await cb.message.answer(
+                "✅ <b>Оплата получена</b>\n\n"
+                f"На баланс зачислено <b>{kopecks / 100:.0f} ₽</b>. Спасибо!"
+                if applied else
+                "✅ Этот счёт уже оплачен — баланс пополнен ранее."
+            )
+            await self._refresh_balance_for(cb)
+            return
+        if fresh.status in ("expired", "failed"):
+            async with session_factory()() as session:
+                await mark_payment_failed(
+                    session,
+                    provider="cryptobot",
+                    provider_invoice_id=str(fresh.invoice_id),
+                    reason=fresh.status,
+                )
+                await session.commit()
+            await cb.answer(
+                f"Счёт {fresh.status}. Создай новый через /balance.",
+                show_alert=True,
+            )
+            return
         await cb.answer(
-            "🪙 CryptoBot подключается в ближайшие дни.\n"
-            "Уже можно платить картой/Stars (тоже скоро).",
+            f"Пока ожидаем оплату ({fresh.status}). Если уже заплатил — "
+            "обычно зачисляется за 10-30 сек.",
             show_alert=True,
         )
+
+    async def _on_cb_topup_cancel(self, cb: CallbackQuery) -> None:
+        """Юзер передумал — отмечаем платёж failed и возвращаем на баланс."""
+        if cb.data is None:
+            await cb.answer()
+            return
+        try:
+            invoice_id = cb.data.split(":", 1)[1]
+        except IndexError:
+            await cb.answer()
+            return
+        async with session_factory()() as session:
+            await mark_payment_failed(
+                session,
+                provider="cryptobot",
+                provider_invoice_id=invoice_id,
+                reason="cancelled_by_user",
+            )
+            await session.commit()
+        await cb.answer("Счёт отменён")
+        await self._refresh_balance_for(cb)
+
+    async def _refresh_balance_for(self, cb: CallbackQuery) -> None:
+        """После любого top-up-действия возвращаем юзера на свежий /balance."""
+        if cb.from_user is None or cb.message is None:
+            return
+        text, markup = await self._render_balance(
+            telegram_user_id=cb.from_user.id,
+            telegram_username=cb.from_user.username,
+            first_name=cb.from_user.first_name,
+        )
+        await self._safe_edit(cb, text=text, markup=markup)
 
     async def _on_cb_topup_stars(self, cb: CallbackQuery) -> None:
         await cb.answer(

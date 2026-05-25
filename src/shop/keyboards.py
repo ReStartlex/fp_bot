@@ -645,3 +645,120 @@ def search_results_keyboard(
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="🏪 К каталогу", callback_data="cats:0")])
     return header, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ─── top-up (CryptoBot) ─────────────────────────────────────────────
+
+
+# Предустановленные суммы пополнения — наиболее частые номиналы.
+# Подобраны эмпирически: 100 ₽ — минимум для микропокупки, 500 — самый
+# популярный, 3000 — топ-сегмент. Если нужно больше — «Своя сумма».
+TOPUP_PRESET_AMOUNTS_RUB = (100, 300, 500, 1000, 3000)
+
+
+def topup_amount_keyboard(
+    *, min_rub: int, max_rub: int,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Меню выбора суммы пополнения через CryptoBot.
+
+    Юзер видит:
+      [ 100 ₽ ] [ 300 ₽ ] [ 500 ₽ ]
+      [ 1000 ₽ ] [ 3000 ₽ ]
+      [ ✏ Своя сумма ]
+      [ « К балансу ]
+
+    callback_data:
+      tp_amt:{kopecks}   — выбрана предустановленная сумма
+      tp_amt:custom      — переход в FSM ввода своей суммы
+    """
+    text = (
+        "🪙 <b>Пополнение через CryptoBot</b>\n\n"
+        "Платишь криптой (USDT, TON, BTC, ETH и др.) — мы зачисляем "
+        "<b>рубли</b> на твой внутренний баланс. Комиссия CryptoBot ≈ <b>3%</b>, "
+        "никаких скрытых сборов.\n\n"
+        f"💡 Можно от <b>{min_rub} ₽</b> до <b>{max_rub:,} ₽</b>.\n"
+        "Выбери сумму:"
+    ).replace(",", " ")  # тонкий неразрывный — выглядит чище: 100 000 ₽
+
+    rows: list[list[InlineKeyboardButton]] = []
+    # Раскладываем по 3 кнопки в ряд для первых 3, потом по 2.
+    presets = [a for a in TOPUP_PRESET_AMOUNTS_RUB if min_rub <= a <= max_rub]
+    if presets:
+        row: list[InlineKeyboardButton] = []
+        for i, amount in enumerate(presets):
+            row.append(InlineKeyboardButton(
+                text=f"{amount} ₽",
+                callback_data=f"tp_amt:{amount * 100}",  # копейки
+            ))
+            # 3-2 раскладка: первые 3 → одна строка, остальные → по 2
+            if (i == 2) or (i > 2 and len(row) == 2):
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+    rows.append([InlineKeyboardButton(
+        text="✏ Своя сумма", callback_data="tp_amt:custom",
+    )])
+    rows.append([InlineKeyboardButton(text="« К балансу", callback_data="bal")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def topup_invoice_keyboard(
+    *,
+    amount_kopecks: int,
+    pay_url: str,
+    invoice_id: int,
+    expires_in_minutes: int = 60,
+) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Карточка созданного invoice'а.
+
+    Юзер видит:
+      [ 🚀 Оплатить (открыть CryptoBot) ]   (url=pay_url)
+      [ 🔄 Проверить статус ]                (callback_data=tp_check:{iid})
+      [ ❌ Отменить ]                        (callback_data=tp_cancel:{iid})
+
+    На странице — сумма, инструкция и срок действия. После оплаты бот
+    сам пришлёт «✅ Зачислено» (polling каждые 30с), но юзер может
+    форсировать проверку кнопкой.
+    """
+    text = (
+        "🧾 <b>Счёт CryptoBot создан</b>\n\n"
+        f"💰 Сумма: <b>{_format_rub_full(amount_kopecks)}</b>\n"
+        f"⏱ Действителен: <b>{expires_in_minutes} мин</b>\n"
+        f"🆔 Invoice: <code>#{invoice_id}</code>\n\n"
+        "<b>Как оплатить:</b>\n"
+        "1. Нажми «🚀 Оплатить» — откроется CryptoBot\n"
+        "2. Выбери криптовалюту и подтверди платёж\n"
+        "3. Вернись сюда — баланс зачислится автоматически\n\n"
+        "<i>Зачисление обычно за 10-30 секунд. Если что-то пошло "
+        "не так — нажми «🔄 Проверить статус».</i>"
+    )
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="🚀 Оплатить", url=pay_url)],
+        [InlineKeyboardButton(
+            text="🔄 Проверить статус",
+            callback_data=f"tp_check:{invoice_id}",
+        )],
+        [
+            InlineKeyboardButton(
+                text="« К балансу", callback_data="bal",
+            ),
+            InlineKeyboardButton(
+                text="❌ Отменить",
+                callback_data=f"tp_cancel:{invoice_id}",
+            ),
+        ],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def topup_custom_amount_prompt(*, min_rub: int, max_rub: int) -> str:
+    """Текст промпта для FSM 'своя сумма'. Отдельная функция для теста."""
+    return (
+        "✏ <b>Введи сумму пополнения</b>\n\n"
+        f"От <b>{min_rub} ₽</b> до <b>{max_rub:,} ₽</b>. "
+        "Можно дробное число, например <code>250.50</code>.\n\n"
+        "<i>Отмена — /cancel или кнопка ниже.</i>"
+    ).replace(",", " ")

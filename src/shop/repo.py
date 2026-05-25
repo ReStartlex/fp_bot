@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models import (
     ShopBalanceLedger,
     ShopCatalogCache,
+    ShopPayment,
     ShopReferral,
     ShopUser,
 )
@@ -650,6 +651,218 @@ async def get_catalog_service(
         )
     )
     return res.scalar_one_or_none()
+
+
+# ════════════════════════════════════════════════════════════════════════
+#                    Phase 1: payments (CryptoBot и далее)
+# ════════════════════════════════════════════════════════════════════════
+# ShopPayment — независимый объект, отслеживающий жизненный цикл одной
+# попытки оплаты. Связан с user_id (для top-up) или order_id (для checkout
+# заказа, появится в следующем спринте).
+#
+# Контракт идемпотентности:
+#   - (provider, provider_invoice_id) — UNIQUE в БД (см. модель);
+#   - apply_paid_invoice() безопасен для повторного вызова — повторное
+#     событие "paid" по тому же invoice = no-op (без двойного начисления).
+#   - Любая мутация баланса проходит через apply_balance_change(), которая
+#     сохраняет invariant `sum(ledger.change for user) == user.balance`.
+
+
+async def create_topup_payment(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    provider: str,
+    provider_invoice_id: str,
+    amount_kopecks: int,
+    currency: str = "RUB",
+    raw_payload_json: str | None = None,
+    notify_telegram_id: int | None = None,
+) -> ShopPayment:
+    """
+    Создаёт запись ShopPayment в статусе 'pending' для пополнения баланса.
+
+    Если payment с такой парой (provider, provider_invoice_id) уже есть —
+    возвращает существующую (idempotent insert). Это нужно, чтобы при
+    повторной попытке (юзер дабл-кликнул кнопку) не создавать дубликаты.
+    """
+    res = await session.execute(
+        select(ShopPayment).where(
+            ShopPayment.provider == provider,
+            ShopPayment.provider_invoice_id == provider_invoice_id,
+        )
+    )
+    existing = res.scalar_one_or_none()
+    if existing is not None:
+        return existing
+    p = ShopPayment(
+        order_id=None,
+        provider=provider,
+        provider_invoice_id=provider_invoice_id,
+        amount_kopecks=amount_kopecks,
+        currency=currency,
+        status="pending",
+        raw_payload_json=raw_payload_json,
+    )
+    # user_id ShopPayment в модели нет напрямую (там order_id для checkout),
+    # поэтому для top-up без заказа храним user_id в raw_payload_json под
+    # ключом topup_user_id. Это позволит apply_paid_invoice найти юзера.
+    # Альтернатива — добавить колонку user_id; ALTER потом, в Sprint 3.5,
+    # когда схема стабилизируется.
+    import json as _json
+    payload_dict: dict = _json.loads(raw_payload_json or "{}") if raw_payload_json else {}
+    payload_dict["topup_user_id"] = user_id
+    if notify_telegram_id is not None:
+        payload_dict["notify_telegram_id"] = notify_telegram_id
+    p.raw_payload_json = _json.dumps(payload_dict, ensure_ascii=False)
+    session.add(p)
+    await session.flush()
+    return p
+
+
+async def get_payment(
+    session: AsyncSession, *, provider: str, provider_invoice_id: str,
+) -> ShopPayment | None:
+    res = await session.execute(
+        select(ShopPayment).where(
+            ShopPayment.provider == provider,
+            ShopPayment.provider_invoice_id == provider_invoice_id,
+        )
+    )
+    return res.scalar_one_or_none()
+
+
+async def list_pending_payments_for_user(
+    session: AsyncSession, *, user_id: int, provider: str | None = None,
+) -> list[ShopPayment]:
+    """
+    Pending-платежи юзера (для UI «🔄 Проверить статус»). Берём из
+    raw_payload_json по ключу topup_user_id.
+
+    Не fancy — в SQLite нет JSON-индексов, делаем LIKE по строке.
+    На горизонте 1000 платежей юзеру это всё ещё <10мс, не проблема.
+    """
+    pattern = f'%"topup_user_id": {user_id}%'
+    stmt = (
+        select(ShopPayment)
+        .where(
+            ShopPayment.status == "pending",
+            ShopPayment.raw_payload_json.like(pattern),
+        )
+        .order_by(ShopPayment.created_at.desc())
+        .limit(20)
+    )
+    if provider is not None:
+        stmt = stmt.where(ShopPayment.provider == provider)
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def apply_paid_invoice(
+    session: AsyncSession,
+    *,
+    provider: str,
+    provider_invoice_id: str,
+    paid_amount_kopecks: int,
+    paid_at: datetime | None = None,
+    raw_payload_json: str | None = None,
+) -> tuple[ShopPayment, bool]:
+    """
+    Идемпотентно отметить платёж как оплаченный и начислить юзеру баланс.
+
+    Возвращает (payment, was_just_applied):
+      - was_just_applied=True  — это первое 'paid'-событие, баланс начислен;
+      - was_just_applied=False — payment уже был 'paid' / 'failed', no-op.
+
+    Безопасно вызывать многократно: повторное событие webhook / polling
+    об одном и том же invoice'е не приведёт к двойному начислению.
+
+    Платёж должен существовать в БД (создан через create_topup_payment).
+    Если не найден — возвращает (None, False).
+    """
+    res = await session.execute(
+        select(ShopPayment).where(
+            ShopPayment.provider == provider,
+            ShopPayment.provider_invoice_id == provider_invoice_id,
+        )
+    )
+    payment = res.scalar_one_or_none()
+    if payment is None:
+        logger.warning(
+            f"apply_paid_invoice: unknown payment {provider}:{provider_invoice_id}"
+        )
+        return None, False  # type: ignore[return-value]
+    if payment.status == "paid":
+        return payment, False  # already applied
+    if payment.status not in ("pending",):
+        # 'failed' или иной финальный статус — не пере-открываем
+        return payment, False
+
+    # Достаём user_id из raw_payload_json (для top-up'ов).
+    import json as _json
+    user_id: int | None = None
+    if payment.raw_payload_json:
+        try:
+            user_id = int(_json.loads(payment.raw_payload_json).get("topup_user_id"))
+        except (ValueError, TypeError, KeyError):
+            user_id = None
+
+    payment.status = "paid"
+    payment.paid_at = paid_at or datetime.utcnow()
+    if raw_payload_json is not None:
+        # Дополнить raw — оставляем topup_user_id, добавляем paid-данные
+        try:
+            old = _json.loads(payment.raw_payload_json or "{}")
+        except ValueError:
+            old = {}
+        try:
+            new = _json.loads(raw_payload_json)
+        except ValueError:
+            new = {"raw": raw_payload_json}
+        old.update({"paid_payload": new})
+        payment.raw_payload_json = _json.dumps(old, ensure_ascii=False)
+
+    if user_id is not None and paid_amount_kopecks > 0:
+        await apply_balance_change(
+            session,
+            user_id=user_id,
+            change_kopecks=paid_amount_kopecks,
+            reason="manual_topup",
+            note=f"{provider}:{provider_invoice_id}",
+        )
+        logger.info(
+            f"apply_paid_invoice: +{paid_amount_kopecks} kop user={user_id} "
+            f"({provider}:{provider_invoice_id})"
+        )
+    else:
+        logger.warning(
+            f"apply_paid_invoice: payment {payment.id} paid but no user_id "
+            f"or zero amount; balance not credited"
+        )
+    await session.flush()
+    return payment, True
+
+
+async def mark_payment_failed(
+    session: AsyncSession,
+    *,
+    provider: str,
+    provider_invoice_id: str,
+    reason: str,
+) -> ShopPayment | None:
+    """Финальный 'failed' статус (истёкший invoice). Идемпотентен."""
+    res = await session.execute(
+        select(ShopPayment).where(
+            ShopPayment.provider == provider,
+            ShopPayment.provider_invoice_id == provider_invoice_id,
+        )
+    )
+    payment = res.scalar_one_or_none()
+    if payment is None or payment.status != "pending":
+        return payment
+    payment.status = "failed"
+    payment.error = reason
+    await session.flush()
+    return payment
 
 
 def parse_referral_payload(payload: str | None) -> int | None:

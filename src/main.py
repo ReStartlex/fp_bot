@@ -35,6 +35,7 @@ from src.orders.reconciler import reconcile_orders_once
 from src.orders.processor import FunPayOrderEvent, process_funpay_order
 from src.shop.bot import ShopBot
 from src.shop.catalog_sync import sync_catalog_once
+from src.shop.payments.poller import poll_cryptobot_once
 from src.sync.stock_sync import sync_once
 
 
@@ -61,6 +62,10 @@ class App:
         # Счётчик последовательных падений shop catalog sync — алертим
         # только при 2+ подряд, чтобы один сетевой блип не флудил оператора.
         self._shop_catalog_consecutive_failures = 0
+        # Аналогичный счётчик для CryptoBot polling. Порог 3 (а не 2),
+        # потому что getInvoices иногда тротлится — лучше дать ему
+        # один лишний retry перед алертом.
+        self._cryptobot_poll_consecutive_failures = 0
 
     # ---------- Lifecycle ----------
 
@@ -209,6 +214,25 @@ class App:
                 # Чуть позже старта, чтобы дать NS прогреться и
                 # bridge-sync_once отработал свой первый цикл первым.
                 next_run_time=datetime.now() + timedelta(seconds=20),
+                max_instances=1,
+                coalesce=True,
+            )
+        # Sprint 3: CryptoBot polling — паылем getInvoices(status=paid) и
+        # идемпотентно начисляем юзерам пополнения. Только если токен задан;
+        # иначе функционал «🪙 CryptoBot» остаётся stub-ом.
+        if (
+            self.shop_bot is not None
+            and self.settings.shop_enabled
+            and self.settings.cryptobot_api_token is not None
+        ):
+            self.scheduler.add_job(
+                self._safe_cryptobot_poll,
+                "interval",
+                seconds=self.settings.cryptobot_polling_seconds,
+                id="cryptobot_poll",
+                # Чуть позже catalog_sync, чтобы первый прогон не толкался
+                # с прогревом БД при холодном старте.
+                next_run_time=datetime.now() + timedelta(seconds=25),
                 max_instances=1,
                 coalesce=True,
             )
@@ -490,6 +514,57 @@ class App:
             self._shop_catalog_consecutive_failures = 0
         elif result.get("status") == "failed":
             self._shop_catalog_consecutive_failures += 1
+
+    async def _safe_cryptobot_poll(self) -> None:
+        """
+        Идемпотентный прогон CryptoBot polling-воркера.
+
+        Никогда не падает наружу. На устойчивые сбои (3+ подряд) — алертим
+        владельцу: значит токен невалиден или API лежит, новые пополнения
+        не зачисляются.
+        """
+        try:
+            result = await poll_cryptobot_once(
+                settings=self.settings,
+                notifier=self._notify_buyer_cryptobot_paid,
+            )
+        except Exception as exc:
+            logger.exception(f"cryptobot poll упал: {exc}")
+            self._cryptobot_poll_consecutive_failures += 1
+            if (
+                self._cryptobot_poll_consecutive_failures == 3
+                and self.tg is not None
+            ):
+                short = f"{type(exc).__name__}: {str(exc)[:160]}"
+                await self.tg.error(
+                    f"🪙 CryptoBot poll падает: <code>{short}</code>. "
+                    "Новые пополнения не зачисляются."
+                )
+            return
+        if result.errors > 0:
+            self._cryptobot_poll_consecutive_failures += 1
+        else:
+            if (
+                self._cryptobot_poll_consecutive_failures >= 3
+                and self.tg is not None
+            ):
+                await self.tg.info("✅ CryptoBot poll восстановился")
+            self._cryptobot_poll_consecutive_failures = 0
+
+    async def _notify_buyer_cryptobot_paid(self, tg_user_id: int, text: str) -> None:
+        """
+        Шлём покупателю «✅ Оплата получена» через shop-бота. Если бот
+        отключён или Telegram недоступен — молча игнорируем (баланс юзер
+        увидит сам, когда откроет /balance).
+        """
+        if self.shop_bot is None:
+            return
+        try:
+            await self.shop_bot.send_message_to_user(tg_user_id, text)
+        except Exception as exc:
+            logger.warning(
+                f"shop notify buyer {tg_user_id} cryptobot paid: {exc}"
+            )
 
     async def _notify_owner_safe(self, text: str) -> None:
         """

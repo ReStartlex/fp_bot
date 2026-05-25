@@ -190,6 +190,123 @@ FSM-поиском, inline-mode и пагинацией категорий. По
 - Бот для прода: `@neirodropi_bot` (`SHOP_TELEGRAM_BOT_TOKEN` уже настроен).
 Деплой: стандартный `update.sh`, миграций нет — только код.
 
+**Sprint 3 — CryptoBot (Crypto Pay API) интеграция (2026-05-25):**
+
+Что добавилось:
+- Кнопка «🪙 CryptoBot» на странице `/balance` теперь работает.
+- Полный flow пополнения: выбор суммы (100/300/500/1000/3000 ₽ +
+  кастом через FSM) → invoice у CryptoBot → ссылка «🚀 Оплатить» +
+  «🔄 Проверить статус» → автоматическое зачисление на баланс.
+- Polling-воркер каждые 30с дёргает `getInvoices(status="paid")` и
+  идемпотентно начисляет. Полностью покрывает функционал даже без
+  webhook'а — это **основной** механизм.
+- Webhook endpoint `POST /api/cryptobot/webhook` тоже работает,
+  опционально (для мгновенного зачисления; см. §0.6).
+- Уведомления покупателю: «✅ Оплата получена» сразу после applied.
+- Идемпотентность: `UNIQUE(provider, provider_invoice_id)` в БД +
+  `apply_paid_invoice()` возвращает `was_just_applied=False` на повтор.
+
+Миграция (автоматически в `init_db`):
+- `shop_payments.order_id` → NULLABLE (top-up не привязан к заказу,
+  user_id хранится в `raw_payload_json.topup_user_id`).
+- `shop_payments.error` — новая колонка (VARCHAR 255).
+- SQLite-rebuild делается через CREATE TABLE _new + INSERT SELECT +
+  DROP + RENAME. Лог: `init_db: rebuild shop_payments для order_id → NULLABLE`.
+
+### 0.5 Получение CryptoBot API-токена
+
+1. В Telegram: открыть `@CryptoBot` → `/start` → меню «Crypto Pay» (или ссылка
+   https://t.me/CryptoBot?start=pay).
+2. «Create App» → ввести название (любое, для себя; например `NeuroDrop`).
+3. После создания — копируем `API Token` (длинная строка вида
+   `12345:AAEF...`). **Хранить как секрет.**
+4. На VPS отредактировать `.env`:
+
+   ```bash
+   sudo nano /opt/funpay-ns-bot/.env
+   ```
+
+   Добавить (или раскомментировать):
+
+   ```ini
+   CRYPTOBOT_API_TOKEN=12345:AAEF......
+   # Опционально (defaults в порядке):
+   # CRYPTOBOT_TESTNET=false
+   # CRYPTOBOT_MIN_TOPUP_RUB=100
+   # CRYPTOBOT_MAX_TOPUP_RUB=100000
+   # CRYPTOBOT_POLLING_SECONDS=30
+   # CRYPTOBOT_INVOICE_TTL_SECONDS=3600
+   ```
+
+5. Рестарт сервиса:
+
+   ```bash
+   sudo systemctl restart funpay-ns-bot
+   sudo journalctl -u funpay-ns-bot -f --since "1 min ago"
+   ```
+
+   В логе должна появиться строка вида:
+
+   ```
+   INFO src.shop.bot | Shop-бот @neirodropi_bot стартовал
+   INFO __main__ | Планировщик запущен: ... cryptobot_poll каждые 30с
+   ```
+
+   Если `cryptobot_poll` отсутствует — токен не подхватился (опечатка в
+   `.env` или пробелы вокруг `=`).
+
+6. Проверить токен (быстрый smoke test):
+
+   ```bash
+   curl -X POST https://pay.crypt.bot/api/getMe \
+     -H "Crypto-Pay-API-Token: $CRYPTOBOT_API_TOKEN"
+   ```
+
+   Должен вернуть `{"ok":true,"result":{"app_id":..,"name":"NeuroDrop",...}}`.
+
+### 0.6 Webhook (опционально, для мгновенного зачисления)
+
+**По умолчанию НЕ нужен** — polling каждые 30с покрывает 99% случаев.
+Если хочется зачисление за 1с (для UX), и есть nginx с SSL:
+
+1. На VPS — настроить reverse-proxy:
+
+   ```nginx
+   location /api/cryptobot/webhook {
+       proxy_pass http://127.0.0.1:8080;
+       proxy_set_header Host $host;
+       proxy_set_header X-Forwarded-For $remote_addr;
+       client_max_body_size 1m;
+   }
+   ```
+
+2. В `@CryptoBot` → «My Apps» → выбрать наше → «Webhook» → указать:
+
+   ```
+   https://<your-domain>/api/cryptobot/webhook
+   ```
+
+3. Подпись HMAC-SHA256 проверяется автоматически (`crypto-pay-api-signature`
+   header). Без правильной подписи — 401.
+
+4. Логи webhook'а в `journalctl -u funpay-ns-api` (запросы летят в
+   FastAPI-сервис, не в бота):
+
+   ```
+   INFO src.api.cryptobot_webhook | cryptobot webhook: invoice_paid id=12345 amount=50000kop applied=True
+   ```
+
+### 0.7 Что делать если CryptoBot API упал
+
+Polling-воркер падает с retry-логикой:
+- Один сбой → `errors=1` в логе, через 30с повторим.
+- 3+ сбоя подряд → owner-бот пришлёт алерт «🪙 CryptoBot poll падает».
+- При восстановлении (`errors=0` снова) → «✅ CryptoBot poll восстановился».
+
+Пользователи в это время видят созданные invoice'ы, ссылка на оплату
+остаётся живой — CryptoBot сам её обработает; мы зачислим, как только
+получим getInvoices снова.
+
 ---
 
 ## 1. Главные инсайты (2026-05-24 / 2026-05-25)
