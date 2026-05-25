@@ -6,6 +6,53 @@
 
 ---
 
+## ⚡ TL;DR — стандартный релиз (90% случаев)
+
+> **Открыл новый чат, надо задеплоить свежий коммит?** Сначала прочитай
+> этот блок и грабли в §0.1. Команды ниже — проверены на Timeweb VPS
+> 2026-05-25.
+
+```bash
+APP=/opt/funpay-ns-bot
+SHA=<полный_40-символьный_SHA_нового_коммита>
+
+# 1) Pin на нужный коммит (полный SHA, не короткий — надёжнее)
+echo "$SHA" | sudo tee "$APP/.deploy_pin"
+sudo chown bot:bot "$APP/.deploy_pin"
+
+# 2) Обновление БЕЗ ENV-ПЕРЕМЕННЫХ. update.sh по умолчанию
+#    fetch'ит через gh-proxy.com (URL-prefix), который с Timeweb
+#    VPS работает напрямую — см. §1.1.
+sudo bash "$APP/deploy/update.sh"
+
+# 3) Проверка
+cat "$APP/BUILD_INFO"
+sudo systemctl status funpay-ns-bot --no-pager | head -20
+```
+
+`update.sh` сделает: бэкап `.env` + БД → fetch в staging → verify
+(compileall, наличие `src/main.py`) → stop сервиса → rsync staging →
+pip install → start. **Если fetch упал — бот продолжит работать
+на старой версии** (staging-pattern).
+
+---
+
+## 0.1 Грабли, которые я (ассистент) повторяю чаще всего
+
+Если ты читаешь это в новом чате — **не повторяй эти ошибки**:
+
+| Грабля | Почему ломается | Правильно |
+|---|---|---|
+| `git -c http.proxy=https://gh-proxy.com fetch ...` | gh-proxy.com — **НЕ HTTP-прокси**, а URL-префикс зеркалирования GitHub. Git пытается сделать `CONNECT gh-proxy.com:443` через HTTP-прокси-протокол → виснет на 120-180с до timeout. | НЕ задавать прокси совсем. `fetch_code.sh` сам подставит `https://gh-proxy.com/https://github.com/...` как URL-prefix. |
+| `GIT_HTTP_PROXY='socks5h://...@166.88.218.111:62947' bash update.sh` | Прокси с Timeweb VPS недоступен на TCP-уровне (egress-блок к этому IP). Висит → timeout. | Запускать `update.sh` **без env-переменных**. Default path через gh-proxy работает. |
+| `git fetch --prune` руками | На VPS лишний шаг, ничего не даёт — `update.sh` всё делает сам в staging. | Только `sudo bash $APP/deploy/update.sh`. |
+| Pin коротким SHA `3c3be85` | Иногда не резолвится в `git fetch <sha>` если объект ещё не подкачан. | Всегда полный 40-символьный SHA. `git rev-parse HEAD` локально. |
+| Запускать команды на VPS из `sudo -u bot` для shell-операций с `>` | Перенаправление `>` выполняется shell'ом до `sudo`, файл создаётся от root. | `echo SHA \| sudo tee $APP/.deploy_pin` + `sudo chown bot:bot`. |
+
+**Если повторил какую-то из этих ошибок — это сигнал перечитать `DEPLOY_TROUBLESHOOTING.md` ПЕРЕД тем как давать команды**, а не давать их по памяти.
+
+---
+
 ## 0. Контекст в одном экране
 
 - Прод: `/opt/funpay-ns-bot` на Timeweb VPS (Ubuntu 24.04). Пользователь `bot`.
@@ -547,6 +594,38 @@ systemctl stop funpay-ns-bot funpay-ns-api
 - **Фикс**: если direct API доступен с VPS (а он доступен — aiogram-бот
   работает), убрать `TELEGRAM_PROXY_*` из `.env` **полностью**, чтобы
   notifier пошёл напрямую. Перезапустить сервис.
+
+### 2026-05-25 — ассистент дал кривые команды деплоя, консоль зависла
+
+- **Симптом**: пользователь скопировал блок команд из чата, в веб-консоли
+  Timeweb команды зависли (висели больше 10 часов до возврата).
+- **Корень**: ассистент НЕ перечитал `DEPLOY_TROUBLESHOOTING.md` перед
+  тем как давать команды, и **по памяти** написал:
+  ```bash
+  sudo -u bot git -c http.proxy=https://gh-proxy.com fetch --prune
+  ```
+  Это две ошибки сразу:
+  1. `gh-proxy.com` — это **URL-префикс зеркала**, а не HTTP-прокси.
+     Git трактует `http.proxy` как proxy-сервер, шлёт ему `CONNECT
+     github.com:443 HTTP/1.1` → gh-proxy не понимает → timeout 120с+.
+  2. Команда `git fetch --prune` руками вообще лишняя — `update.sh`
+     сам делает fetch в staging-папку.
+- **Правильная команда** (из §1.1 этого документа, существует с 2026-05-25):
+  ```bash
+  APP=/opt/funpay-ns-bot
+  echo "<полный_SHA>" | sudo tee "$APP/.deploy_pin"
+  sudo chown bot:bot "$APP/.deploy_pin"
+  sudo bash "$APP/deploy/update.sh"
+  ```
+  Без env-переменных. Default path в `fetch_code.sh` использует
+  `gh-proxy.com` как URL-префикс корректно.
+- **Что добавлено в документ**: новый блок «⚡ TL;DR» в самом верху +
+  таблица «Грабли, которые я повторяю чаще всего» (§0.1). Теперь
+  любой следующий чат сначала упрётся в эти блоки и не повторит
+  ошибку.
+- **Мета-урок для ассистента**: в начале каждой новой сессии **первая
+  файловая операция** должна быть `Read DEPLOY_TROUBLESHOOTING.md` —
+  до того как давать ЛЮБЫЕ команды для VPS.
 
 ### <добавь сюда следующую попытку>
 
