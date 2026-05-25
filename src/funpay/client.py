@@ -422,6 +422,74 @@ class FunPayClient:
 
         return await self._to_thread(_call)
 
+    # ----- Продажи (sales) -----
+
+    # Защита от потенциально-бесконечной пагинации FunPay (если сервер
+    # вернёт зацикленный курсор). 50 страниц * ~30 заказов = 1500 запасом
+    # перекрывают любой реалистичный размер списка «Оплачен».
+    _PAID_SALES_MAX_PAGES = 50
+
+    async def get_paid_sales_snapshot(self) -> list[str]:
+        """
+        Возвращает funpay_order_id всех заказов в статусе «Оплачен»
+        (ожидающих подтверждения покупателя/саппорта).
+
+        Использует FunPayAPI.Account.get_sells(state="paid") с пагинацией
+        через курсор `continue`. Возвращаемые id — без префикса `#`,
+        чтобы матчить значения в `Order.funpay_order_id`.
+
+        Главный потребитель — sync_pending_confirmation: всё, что у нас
+        в БД помечено `delivered, confirmed_at=NULL`, но в этом списке
+        ОТСУТСТВУЕТ — значит FunPay/саппорт уже подтвердил такие заказы
+        тихо (без системного сообщения в чат) и можно проставить
+        confirmed_at автоматически.
+        """
+        result: list[str] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+
+        for _ in range(self._PAID_SALES_MAX_PAGES):
+
+            def _call(start_from: str | None = cursor) -> tuple[Any, list[Any]]:
+                return self.account.get_sells(
+                    state="paid",
+                    include_paid=True,
+                    include_closed=False,
+                    include_refunded=False,
+                    start_from=start_from,
+                )
+
+            next_cursor, orders = await self._to_thread(_call)
+            for order in orders or []:
+                order_id = getattr(order, "id", None)
+                if order_id is None:
+                    continue
+                order_id = str(order_id).lstrip("#")
+                if order_id:
+                    result.append(order_id)
+
+            if not next_cursor:
+                break
+            next_cursor_str = str(next_cursor)
+            if next_cursor_str in seen_cursors:
+                # FunPay вернул тот же курсор второй раз — это либо баг
+                # на их стороне, либо мы уже видим финальный «эхо»-ответ;
+                # прерываем во избежание бесконечного цикла.
+                logger.warning(
+                    f"FunPay get_sells вернул повторный курсор "
+                    f"{next_cursor_str!r} — прекращаю пагинацию"
+                )
+                break
+            seen_cursors.add(next_cursor_str)
+            cursor = next_cursor_str
+        else:
+            logger.warning(
+                f"FunPay get_sells достиг лимита {self._PAID_SALES_MAX_PAGES} "
+                "страниц пагинации — возможно зацикленный курсор"
+            )
+
+        return result
+
     # ----- Лоты -----
 
     async def get_my_lots(self) -> list[Any]:

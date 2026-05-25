@@ -175,6 +175,27 @@ def single_close_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[_back_to_menu_btn(), _close_btn()]])
 
 
+def pending_confirm_kb() -> InlineKeyboardMarkup:
+    """
+    Клавиатура под последним сообщением /pending_confirm.
+
+    Добавляет верхнюю кнопку «🔄 Sync с FunPay» — она запускает
+    `sync_pending_confirmation` (см. src/orders/sync_paid.py),
+    чтобы вычистить из БД фантомные заказы, которые саппорт
+    FunPay уже подтвердил тихо. Кнопка нужна именно здесь:
+    пользователь видит мусорный список → жмёт sync → видит чистый.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔄 Sync с FunPay (чистка фантомов)",
+                callback_data="sync_pending_confirm",
+            )],
+            [_back_to_menu_btn(), _close_btn()],
+        ]
+    )
+
+
 # ─────────────── обрезка названий ───────────────
 
 # Эмодзи и спецсимволы из FunPay-названий: убираем для кнопок

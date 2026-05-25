@@ -46,6 +46,7 @@ from src.db.repo import (
 )
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
+from src.orders.sync_paid import sync_pending_confirmation
 from src.mapping.rules import compute_pricing, estimate_profit_rub
 from src.mapping.safety import mapping_risk_warnings
 from src.ns import NSClient
@@ -344,6 +345,7 @@ class TelegramBot:
         "/balance — баланс NS и FunPay\n"
         "/orders — последние 10 заказов\n"
         "/pending_confirm [часы] — заказы старше Nч без подтверждения (для саппорта)\n"
+        "/sync_pending_confirm — синхронизировать /pending_confirm с FunPay (закрыть тихо подтверждённые)\n"
         "/sync — запустить синхронизацию\n"
         "/funpay_reconnect — переподключить FunPay\n"
         "\n"
@@ -473,6 +475,7 @@ class TelegramBot:
             BotCommand(command="sync", description="🔄 Синхронизация"),
             BotCommand(command="orders", description="📦 Последние заказы"),
             BotCommand(command="pending_confirm", description="⏳ Заказы без подтв. (список для саппорта FunPay)"),
+            BotCommand(command="sync_pending_confirm", description="🔄 Sync /pending_confirm с FunPay (чистит фантомы)"),
             BotCommand(command="setmarkup", description="✏ Наценка одного маппинга"),
             BotCommand(command="reset_markups", description="♻ Сбросить наценку у всех маппингов"),
             BotCommand(command="setdefault", description="🎚 Глобальные настройки (markup/premium/stock)"),
@@ -605,6 +608,12 @@ class TelegramBot:
             if not self._is_owner(msg):
                 return
             await self._do_pending_confirm(msg)
+
+        @dp.message(Command("sync_pending_confirm"))
+        async def cmd_sync_pending_confirm(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_sync_pending_confirm(msg)
 
         @dp.message(Command("stats"))
         async def cmd_stats(msg: Message) -> None:
@@ -745,6 +754,18 @@ class TelegramBot:
                 with suppress_telegram():
                     await cq.message.delete()
             await cq.answer()
+
+        @dp.callback_query(F.data == "sync_pending_confirm")
+        async def cb_sync_pending_confirm(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await cq.answer("Синхронизирую с FunPay...", show_alert=False)
+            # Создаём искусственный «msg»-контекст: _do_sync_pending_confirm
+            # читает только chat.id, поэтому достаточно cq.message.
+            if cq.message is None:
+                return
+            await self._do_sync_pending_confirm(cq.message)
 
         @dp.callback_query(F.data == "target:clear")
         async def cb_target_clear(cq: CallbackQuery) -> None:
@@ -1826,6 +1847,9 @@ class TelegramBot:
             f"📋 Заказы старше {hours}ч без подтверждения "
             f"({len(orders)} шт.)\n"
             f"Готовый список для саппорта FunPay ниже.\n"
+            f"⚠ Если в списке есть заказы, которые саппорт FunPay уже "
+            f"подтвердил (тихо, без системки в чат) — нажми «🔄 Sync с "
+            f"FunPay» под последним сообщением. Это вычистит фантомы.\n"
         )
         now = datetime.utcnow()
         item_lines = [
@@ -1866,7 +1890,7 @@ class TelegramBot:
                 chat_id,
                 f"{label}\n{ids_text}",
                 reply_markup=(
-                    ui.single_close_kb()
+                    ui.pending_confirm_kb()
                     if idx == len(copy_chunks) - 1
                     else None
                 ),
@@ -1877,6 +1901,53 @@ class TelegramBot:
             return await list_pending_confirmation(
                 session, older_than_hours=hours, limit=500
             )
+
+    @_guard
+    async def _do_sync_pending_confirm(self, msg: Message) -> None:
+        """
+        /sync_pending_confirm — синхронизировать БД с реальным «Оплачен»
+        на FunPay. FunPay-саппорт подтверждает заказы по нашему запросу
+        тихо, без системного сообщения в чат, поэтому в БД они остаются
+        delivered+NULL. Эта команда чистит фантомы.
+        """
+        chat_id = msg.chat.id
+        if self._funpay_client is None:
+            await self._send_view(
+                chat_id,
+                "⚠ FunPay-клиент сейчас не подключён. Сначала "
+                "/funpay_reconnect, потом повтори команду.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        await self._send_view(
+            chat_id, "🔄 Синхронизирую с FunPay...", reply_markup=None
+        )
+        try:
+            stats = await sync_pending_confirmation(
+                funpay_client=self._funpay_client,
+                session_factory=session_factory,
+            )
+        except Exception as exc:
+            logger.opt(exception=exc).warning(
+                f"sync_pending_confirmation упал: {type(exc).__name__}: {exc}"
+            )
+            await self._send_view(
+                chat_id,
+                f"❌ Sync упал: <code>{type(exc).__name__}: {exc}</code>\n"
+                "Подробности в логах сервиса.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        text = (
+            "✅ <b>Sync /pending_confirm с FunPay</b>\n"
+            f"• Сейчас «Оплачен» на FunPay: <b>{stats['paid_on_funpay']}</b>\n"
+            f"• В БД было delivered+NULL: <b>{stats['delivered_unconfirmed_in_db']}</b>\n"
+            f"• Помечено confirmed (закрыты тихо саппортом): <b>{stats['marked_confirmed']}</b>\n\n"
+            "Запусти /pending_confirm — список теперь должен соответствовать "
+            "тем заказам, которые реально ждут подтверждения."
+        )
+        await self._send_view(chat_id, text, reply_markup=ui.single_close_kb())
 
     @_guard
     async def _do_stats(self, msg: Message) -> None:
