@@ -133,6 +133,28 @@ def test_lot_status_computes_capped_indicator():
     assert "target.stock" in body
 
 
+def test_lot_status_warns_on_disabled_mapping():
+    """КРИТИЧНО: disabled mapping — главная причина «99 застряло».
+    Вердикт должен явно бросаться в глаза, чтобы оператор сразу понял.
+    
+    Контекст: при failed-заказе _emergency_disable_lot отключает mapping,
+    но save_lot на FunPay может упасть из-за 429 → half-disabled state:
+    sync игнорирует, FunPay продолжает продавать с устаревшим stock.
+    """
+    src = _bot_source()
+
+    start = src.find("async def _do_lot_status")
+    end = src.find("\n    @_guard\n", start + 1)
+    if end < 0:
+        end = len(src)
+    body = src[start:end]
+
+    # Проверка ветки в verdict
+    assert "MAPPING DISABLED" in body or "mapping.enabled" in body
+    # И что упоминается _emergency_disable_lot как вероятная причина
+    assert "_emergency_disable_lot" in body or "failed" in body.lower()
+
+
 def test_lot_status_reports_cache_freshness():
     """Должна показывать TTL fresh/stale на основе last_synced_at."""
     src = _bot_source()

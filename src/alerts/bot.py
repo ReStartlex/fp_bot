@@ -3913,7 +3913,22 @@ class TelegramBot:
                 )
 
         # 8. Выносим вердикт
-        if target is None:
+        # КРИТИЧНО: disabled mapping имеет приоритет над всем остальным.
+        # Симптом «99 застряло» в 95% случаев — это disabled mapping
+        # (sync игнорирует лот, FunPay сам считает stock после продаж).
+        # Обычно отключается через _emergency_disable_lot при failed заказе:
+        # см. src/orders/processor.py:1328 «Аудит #8». Если save_lot на
+        # FunPay тоже упал — получается half-disabled state: mapping
+        # отключён, но лот на FunPay активен и продаётся.
+        if not mapping.enabled:
+            verdict = (
+                "🚨 <b>MAPPING DISABLED</b> — sync_stock игнорирует этот "
+                "лот, обновления stock/цены не идут.\n"
+                "Скорее всего отключился автоматически после failed-заказа "
+                "(см. /pending_confirm и логи <code>_emergency_disable_lot</code>).\n"
+                "Включить можно через /mappings → 🟢 для этого лота."
+            )
+        elif target is None:
             verdict = "❌ NS-сервис не найден в каталоге"
         elif cache_hit_predicted:
             verdict = (
@@ -3972,11 +3987,19 @@ class TelegramBot:
             f"  status: {cache_status}\n"
         )
 
+        # При disabled mapping выводим disabled-маркер в шапке (а не
+        # как чисто read-only поле) — чтобы оператор сразу видел диагноз.
+        enabled_line = (
+            f"⏸ <b>enabled=False</b>"
+            if not mapping.enabled
+            else f"enabled=<code>True</code>"
+        )
+
         text = (
             f"🩹 <b>lot_status #{lot_id}</b>\n"
             f"<i>{html.escape(mapping.label or '—')[:70]}</i>\n\n"
             f"📌 ns_service_id=<code>{mapping.ns_service_id}</code>, "
-            f"enabled=<code>{mapping.enabled}</code>\n"
+            f"{enabled_line}\n"
             f"📈 markup: {markup_origin}\n"
             f"📦 cap: {cap_origin}\n"
             f"💱 USD/RUB: <b>{rate.effective:.4f}</b>\n\n"
