@@ -362,6 +362,172 @@ async def list_category_groups_for_ui(
     ]
 
 
+# ════════════════════════════════════════════════════════════════════════
+#                       Phase 1: balance & referral stats
+# ════════════════════════════════════════════════════════════════════════
+# Используются на страницах «💰 Баланс» и «👥 Рефералы» в shop-боте.
+# Все запросы дешёвые (по индексам user_id) и переживут масштаб 100k юзеров.
+
+
+@dataclass(frozen=True)
+class BalanceStats:
+    """Сводка для UI страницы баланса."""
+    current_kopecks: int
+    total_earned_kopecks: int   # сумма всех положительных движений ledger
+    total_spent_kopecks: int    # сумма абсолютных значений отрицательных
+    operations_count: int       # сколько строк в ledger вообще
+
+
+@dataclass(frozen=True)
+class LedgerRow:
+    """Одна строка истории операций для UI."""
+    created_at: datetime
+    change_kopecks: int
+    reason: str
+    note: str | None
+    related_order_id: int | None
+
+
+@dataclass(frozen=True)
+class ReferralStats:
+    """Сводка для UI страницы рефералов."""
+    invited_count: int          # сколько юзеров пришло по моей ссылке
+    total_earned_kopecks: int   # сколько кэшбэка я уже получил
+    active_referrals_count: int # из приглашённых: сколько было активно (last_seen ≤30д)
+
+
+async def get_balance_stats(
+    session: AsyncSession, *, user_id: int
+) -> BalanceStats:
+    """Агрегаты по ledger'у одного пользователя."""
+    # Текущий баланс — из user (быстро).
+    user = (
+        await session.execute(
+            select(ShopUser).where(ShopUser.id == user_id)
+        )
+    ).scalar_one_or_none()
+    if user is None:
+        return BalanceStats(0, 0, 0, 0)
+
+    # Суммируем earned/spent через CASE-выражение, одним запросом.
+    from sqlalchemy import case
+    earned_expr = func.coalesce(func.sum(
+        case((ShopBalanceLedger.change_kopecks > 0,
+              ShopBalanceLedger.change_kopecks), else_=0)
+    ), 0)
+    spent_expr = func.coalesce(func.sum(
+        case((ShopBalanceLedger.change_kopecks < 0,
+              -ShopBalanceLedger.change_kopecks), else_=0)
+    ), 0)
+    count_expr = func.count(ShopBalanceLedger.id)
+    row = (
+        await session.execute(
+            select(earned_expr, spent_expr, count_expr)
+            .where(ShopBalanceLedger.user_id == user_id)
+        )
+    ).one()
+    earned, spent, cnt = int(row[0] or 0), int(row[1] or 0), int(row[2] or 0)
+    return BalanceStats(
+        current_kopecks=user.balance_kopecks,
+        total_earned_kopecks=earned,
+        total_spent_kopecks=spent,
+        operations_count=cnt,
+    )
+
+
+async def list_balance_history(
+    session: AsyncSession, *, user_id: int, limit: int = 10, offset: int = 0,
+) -> tuple[list[LedgerRow], int]:
+    """История операций по балансу, новые сверху. Возвращает (rows, total)."""
+    base_q = (
+        select(ShopBalanceLedger)
+        .where(ShopBalanceLedger.user_id == user_id)
+        .order_by(ShopBalanceLedger.created_at.desc(),
+                  ShopBalanceLedger.id.desc())
+    )
+    total = int((await session.execute(
+        select(func.count(ShopBalanceLedger.id))
+        .where(ShopBalanceLedger.user_id == user_id)
+    )).scalar() or 0)
+    rows = list((
+        await session.execute(base_q.limit(limit).offset(offset))
+    ).scalars().all())
+    return (
+        [
+            LedgerRow(
+                created_at=r.created_at,
+                change_kopecks=r.change_kopecks,
+                reason=r.reason,
+                note=r.note,
+                related_order_id=r.related_order_id,
+            )
+            for r in rows
+        ],
+        total,
+    )
+
+
+async def get_referral_stats(
+    session: AsyncSession, *, user_id: int,
+) -> ReferralStats:
+    """
+    Сводка по рефералам пользователя:
+      - invited_count: всего записей в shop_referrals, где referrer = user_id;
+      - total_earned: сумма всех ledger.change_kopecks с reason='referral_cashback';
+      - active_referrals: рефералы, активные за последние 30 дней
+        (last_seen_at >= now - 30d).
+    """
+    invited = int((await session.execute(
+        select(func.count(ShopReferral.id))
+        .where(ShopReferral.referrer_user_id == user_id)
+    )).scalar() or 0)
+
+    earned = int((await session.execute(
+        select(func.coalesce(func.sum(ShopBalanceLedger.change_kopecks), 0))
+        .where(
+            ShopBalanceLedger.user_id == user_id,
+            ShopBalanceLedger.reason == "referral_cashback",
+            ShopBalanceLedger.change_kopecks > 0,
+        )
+    )).scalar() or 0)
+
+    from datetime import timedelta
+    cutoff = datetime.utcnow() - timedelta(days=30)
+    active = int((await session.execute(
+        select(func.count(ShopUser.id))
+        .where(
+            ShopUser.referred_by_user_id == user_id,
+            ShopUser.last_seen_at >= cutoff,
+        )
+    )).scalar() or 0)
+
+    return ReferralStats(
+        invited_count=invited,
+        total_earned_kopecks=earned,
+        active_referrals_count=active,
+    )
+
+
+async def count_categories_in_group(
+    session: AsyncSession, *, group_slug: str
+) -> int:
+    """
+    Быстрый COUNT по distinct category_id в группе. Используется, чтобы
+    решить: показывать кнопку «« Назад к группе» или «« К каталогу»
+    в карточке услуги (для singleton-групп drill-down не имеет смысла —
+    он просто возвращает на тот же экран).
+    """
+    stmt = (
+        select(func.count(func.distinct(ShopCatalogCache.category_id)))
+        .where(
+            ShopCatalogCache.enabled.is_(True),
+            ShopCatalogCache.in_stock > 0,
+            ShopCatalogCache.group_slug == group_slug,
+        )
+    )
+    return int((await session.execute(stmt)).scalar() or 0)
+
+
 async def list_categories_in_group(
     session: AsyncSession, *, group_slug: str
 ) -> list[CategoryInGroup]:

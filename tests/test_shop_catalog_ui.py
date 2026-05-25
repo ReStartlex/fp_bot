@@ -216,6 +216,55 @@ async def test_group_drill_down_single_variant_skips_to_services(db_setup):
     assert len(svc_buttons) == 3
 
 
+async def test_singleton_group_back_button_goes_to_catalog_not_self(db_setup):
+    """
+    БАГ-РЕГРЕССИЯ: если в группе только 1 категория, кнопка «назад»
+    должна вести в каталог, а не на ту же группу (где drill-down вернёт
+    тот же экран — Telegram игнорит, юзер думает что бот сломан).
+    """
+    await _seed_catalog(db_setup)  # Apple — singleton (1 category_id)
+    bot = ShopBot(_settings())
+    # Эмулируем переход «cat:10:0» (категория Apple — единственная в группе)
+    cb = _fake_cb("cat:10:0")
+    await bot._on_cb_category(cb)
+    markup = cb.message.edit_text.call_args.kwargs["reply_markup"]
+    back_btns = [
+        b for row in markup.inline_keyboard for b in row
+        if b.callback_data and (
+            b.callback_data.startswith("grp:") or b.callback_data.startswith("cats")
+        )
+    ]
+    # Не должно быть кнопок grp:{slug}:0 — все обратные ссылки → cats:0
+    assert all("cats" in (b.callback_data or "") for b in back_btns), \
+        f"Singleton-группа дала grp-back, а должна cats: {[b.callback_data for b in back_btns]}"
+
+
+async def test_multivariant_group_back_button_returns_to_variants(db_setup):
+    """Для группы с >1 категории — back ведёт на группу (region picker)."""
+    apple_slug = make_group_slug("Apple Gift Card")
+    async with db_setup() as s:
+        for sid, region, price in [(1, "US", 40000), (2, "EU", 44000)]:
+            await upsert_catalog_service(
+                s, ns_service_id=sid, category_id=10 + sid,
+                category_name=f"Apple Gift Card | {region}",
+                service_name=f"Apple {region}",
+                base_name="Apple Gift Card", group_slug=apple_slug,
+                ns_price_usd=5.0, rub_price_kopecks=price,
+                in_stock=10, fields_json=None,
+            )
+        await s.commit()
+
+    bot = ShopBot(_settings())
+    cb = _fake_cb("cat:11:0")  # US
+    await bot._on_cb_category(cb)
+    markup = cb.message.edit_text.call_args.kwargs["reply_markup"]
+    back_btns = [
+        b for row in markup.inline_keyboard for b in row
+        if b.callback_data and b.callback_data.startswith("grp:")
+    ]
+    assert back_btns, "Multi-variant группа должна давать кнопку grp:..."
+
+
 # ─── callback cat:{id}:0 ────────────────────────────────────────────
 
 

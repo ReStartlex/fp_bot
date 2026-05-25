@@ -12,9 +12,11 @@ import pytest
 from src.shop.keyboards import (
     CATALOG_GROUPS_PAGE_SIZE,
     VARIANTS_GRID_COLS,
+    balance_keyboard,
     cancel_keyboard,
     catalog_groups_keyboard,
     main_menu_keyboard,
+    referrals_keyboard,
     search_results_keyboard,
     service_card_keyboard,
     services_page_keyboard,
@@ -298,3 +300,94 @@ def test_search_results_no_pagination_when_one_page():
         if b.callback_data and b.callback_data.startswith("srh:abcd1234:")
     ]
     assert nav == []
+
+
+# ─── balance_keyboard ───────────────────────────────────────────────
+
+
+def test_balance_keyboard_shows_all_stats():
+    text, kb = balance_keyboard(
+        current_kopecks=12345, earned_kopecks=20000,
+        spent_kopecks=7655, operations_count=5, invited_count=2,
+    )
+    assert "123,45" in text  # current
+    assert "200" in text     # earned
+    assert "76,55" in text   # spent
+    assert "5" in text       # operations
+
+
+def test_balance_keyboard_has_topup_buttons():
+    _, kb = balance_keyboard(
+        current_kopecks=0, earned_kopecks=0, spent_kopecks=0,
+        operations_count=0, invited_count=0,
+    )
+    callbacks = [b.callback_data for row in kb.inline_keyboard for b in row]
+    assert "topup:crypto" in callbacks
+    assert "topup:stars" in callbacks
+    assert "topup:card" in callbacks
+    assert "bal_hist:0" in callbacks
+    assert "ref" in callbacks
+
+
+def test_balance_keyboard_zero_state_shows_invite_hint():
+    text, _ = balance_keyboard(
+        current_kopecks=0, earned_kopecks=0, spent_kopecks=0,
+        operations_count=0, invited_count=0,
+    )
+    assert "пригласи" in text.lower() or "рефералов" in text.lower()
+
+
+def test_balance_keyboard_invited_state_shows_thanks():
+    text, _ = balance_keyboard(
+        current_kopecks=5000, earned_kopecks=5000, spent_kopecks=0,
+        operations_count=1, invited_count=3,
+    )
+    assert "3" in text
+    assert "neurodrop" in text.lower() or "NeuroDrop" in text
+
+
+# ─── referrals_keyboard ─────────────────────────────────────────────
+
+
+def test_referrals_keyboard_has_share_and_copy():
+    text, kb = referrals_keyboard(
+        ref_link="https://t.me/neirodropi_bot?start=ref_1",
+        invited_count=0, earned_kopecks=0, active_referrals_count=0,
+        bonus_percent=1.0,
+    )
+    share_btn = next(
+        (b for row in kb.inline_keyboard for b in row if b.url),
+        None,
+    )
+    assert share_btn is not None
+    assert "t.me/share" in (share_btn.url or "")
+
+    copy_btn = next(
+        (b for row in kb.inline_keyboard for b in row
+         if b.switch_inline_query is not None),
+        None,
+    )
+    assert copy_btn is not None
+    assert "neirodropi_bot" in (copy_btn.switch_inline_query or "")
+
+
+def test_referrals_keyboard_shows_stats():
+    text, _ = referrals_keyboard(
+        ref_link="https://t.me/neirodropi_bot?start=ref_1",
+        invited_count=311, earned_kopecks=1943500,
+        active_referrals_count=287, bonus_percent=1.0,
+    )
+    assert "311" in text
+    assert "287" in text
+    # 1943500 кп = 19 435 ₽
+    assert "19" in text and "435" in text
+    assert "1%" in text  # бонус
+
+
+def test_referrals_keyboard_link_in_text():
+    text, _ = referrals_keyboard(
+        ref_link="https://t.me/neirodropi_bot?start=ref_77",
+        invited_count=0, earned_kopecks=0, active_referrals_count=0,
+        bonus_percent=1.0,
+    )
+    assert "https://t.me/neirodropi_bot?start=ref_77" in text

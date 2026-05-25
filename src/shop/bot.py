@@ -57,9 +57,12 @@ from src.shop.keyboards import (
     BTN_SUPPORT,
     CATALOG_GROUPS_PAGE_SIZE,
     SERVICES_PAGE_SIZE,
+    balance_history_keyboard,
+    balance_keyboard,
     cancel_keyboard,
     catalog_groups_keyboard,
     main_menu_keyboard,
+    referrals_keyboard,
     search_results_keyboard,
     service_card_keyboard,
     services_page_keyboard,
@@ -68,14 +71,19 @@ from src.shop.keyboards import (
 from src.shop.repo import (
     apply_balance_change,
     attach_referral,
+    count_categories_in_group,
+    get_balance_stats,
     get_catalog_service,
     get_or_create_user,
+    get_referral_stats,
+    list_balance_history,
     list_categories_in_group,
     list_category_groups_for_ui,
     list_services_in_category,
     parse_referral_payload,
     search_services,
 )
+from src.config_runtime import get_shop_referral_percent
 from src.shop.states import SearchState
 
 
@@ -90,8 +98,12 @@ SEARCH_RATE_LIMIT_SECONDS = 1.0
 OwnerNotify = Callable[[str], Awaitable[None]]
 
 
+BRAND = "NeuroDrop"
+SITE_URL = "neurodrop.ru"
+
+
 HELP_TEXT = (
-    "🛒 <b>Магазин подарочных карт</b>\n\n"
+    f"🛒 <b>{BRAND}</b> — магазин подарочных карт и подписок\n\n"
     "Внизу — постоянное меню с разделами:\n"
     "• 🛍 <b>Каталог</b> — все товары по категориям\n"
     "• 🔍 <b>Поиск</b> — найти товар по названию\n"
@@ -104,9 +116,9 @@ HELP_TEXT = (
     "/catalog — каталог\n"
     "/search <i>&lt;слово&gt;</i> — быстрый поиск\n"
     "/help — эта справка\n\n"
-    "💎 <b>Inline-поиск:</b> в любом чате набери "
-    "<code>@USERNAME слово</code> — увидишь подсказки прямо в Telegram "
-    "(где <code>USERNAME</code> — имя этого бота).\n\n"
+    "💎 <b>Inline-поиск:</b> в любом чате Telegram набери "
+    "<code>@neirodropi_bot слово</code> — увидишь подсказки прямо во встроенном UI.\n\n"
+    f"🌐 Сайт: <code>{SITE_URL}</code> (скоро откроется)\n\n"
     "💡 <i>Магазин в режиме раннего доступа: оплата подключается в ближайшие дни.</i>"
 )
 
@@ -300,6 +312,20 @@ class ShopBot:
         dp.callback_query.register(
             self._on_cb_search_prompt, F.data == "search_prompt",
         )
+        dp.callback_query.register(self._on_cb_balance, F.data == "bal")
+        dp.callback_query.register(self._on_cb_referrals, F.data == "ref")
+        dp.callback_query.register(
+            self._on_cb_topup_crypto, F.data == "topup:crypto",
+        )
+        dp.callback_query.register(
+            self._on_cb_topup_stars, F.data == "topup:stars",
+        )
+        dp.callback_query.register(
+            self._on_cb_topup_card, F.data == "topup:card",
+        )
+        dp.callback_query.register(
+            self._on_cb_balance_history, F.data.startswith("bal_hist:"),
+        )
         dp.callback_query.register(
             self._on_cb_cats, F.data.startswith("cats:"),
         )
@@ -370,8 +396,8 @@ class ShopBot:
         greeting_lines = [
             f"👋 Привет, <b>{html.escape(from_user.first_name or 'друг')}</b>!",
             "",
-            "🛒 <b>Магазин подарочных карт</b>",
-            "Apple, Steam, Google Play, EA, Nintendo и ещё сотни товаров.",
+            f"🛒 <b>{BRAND}</b> — магазин подарочных карт и цифровых подписок",
+            "Apple, Steam, Google Play, EA, Nintendo, Spotify и сотни других.",
         ]
         if ref_attached:
             greeting_lines.append(
@@ -380,13 +406,15 @@ class ShopBot:
             )
         greeting_lines.extend([
             "",
-            "✨ <b>Что нового:</b>",
-            "• Удобный каталог с поиском",
-            "• Прозрачные цены и копейки",
-            "• Реферальная программа и кэшбэк",
-            "• Поддержка 24/7",
+            "✨ <b>Почему мы</b>",
+            "• Удобный каталог с поиском и inline-режимом",
+            "• Прозрачные цены до копейки",
+            "• Реферальная программа: 1% кэшбэк с покупок друзей",
+            "• Поддержка 24/7 — отвечаем быстро",
             "",
-            "👇 <i>Используй меню внизу, чтобы навигировать.</i>",
+            f"🌐 Сайт скоро откроется: <code>{SITE_URL}</code>",
+            "",
+            "👇 <i>Жми кнопки в меню внизу — это быстрее команд.</i>",
         ])
         await message.answer(
             "\n".join(greeting_lines),
@@ -427,9 +455,11 @@ class ShopBot:
             await cb.answer("Группа пуста или временно недоступна", show_alert=True)
             return
         if len(variants) == 1:
+            # Singleton-группа: drill-down вернул бы тот же экран. Поэтому
+            # group_slug=None — кнопка «назад» поведёт сразу в каталог.
             await self._show_services_for_cb(
                 cb, category_id=variants[0].category_id, page=0,
-                group_slug=slug,
+                group_slug=None,
             )
             return
         # base_name берём из репозитория категории (parse_category_name).
@@ -450,16 +480,23 @@ class ShopBot:
         except ValueError:
             await cb.answer("Битая ссылка")
             return
-        # Выясняем group_slug этой категории для кнопки «назад к группе».
+        # Узнаём group_slug этой категории и сколько в группе всего категорий.
+        # Если в группе только эта одна — кнопка «назад» должна вести
+        # на каталог (drill-down смысла не имеет, вернул бы тот же экран).
         async with session_factory()() as session:
             services_for_meta, _ = await list_services_in_category(
                 session, category_id=cid, limit=1, offset=0,
             )
-        group_slug = (
-            services_for_meta[0].group_slug if services_for_meta else None
-        )
+            slug = (
+                services_for_meta[0].group_slug if services_for_meta else None
+            )
+            back_group_slug: str | None = None
+            if slug is not None:
+                cnt = await count_categories_in_group(session, group_slug=slug)
+                if cnt > 1:
+                    back_group_slug = slug  # multi-variant — назад к списку регионов
         await self._show_services_for_cb(
-            cb, category_id=cid, page=page, group_slug=group_slug,
+            cb, category_id=cid, page=page, group_slug=back_group_slug,
         )
 
     async def _show_services_for_cb(
@@ -498,11 +535,17 @@ class ShopBot:
             return
         async with session_factory()() as session:
             svc = await get_catalog_service(session, ns_service_id=sid)
-        if svc is None:
-            await cb.answer("Товар временно недоступен", show_alert=True)
-            return
-        group_slug = getattr(svc, "group_slug", None)
-        text, markup = service_card_keyboard(svc=svc, group_slug=group_slug)
+            if svc is None:
+                await cb.answer("Товар временно недоступен", show_alert=True)
+                return
+            # Singleton-группа → нет смысла в кнопке «назад к группе».
+            slug = getattr(svc, "group_slug", None)
+            back_slug: str | None = None
+            if slug is not None:
+                cnt = await count_categories_in_group(session, group_slug=slug)
+                if cnt > 1:
+                    back_slug = slug
+        text, markup = service_card_keyboard(svc=svc, group_slug=back_slug)
         await self._safe_edit(cb, text=text, markup=markup)
 
     async def _on_cb_buy_stub(self, cb: CallbackQuery) -> None:
@@ -740,7 +783,7 @@ class ShopBot:
                 message_text=(
                     f"🛒 <b>{html.escape(svc.service_name)}</b>\n"
                     f"💰 {price}\n\n"
-                    f"Купить в боте: https://t.me/{self._username}"
+                    f"Купить в {BRAND}: https://t.me/{self._username}"
                 ),
                 parse_mode=ParseMode.HTML,
             )
@@ -765,26 +808,134 @@ class ShopBot:
     # ─────────────── balance / ref / orders / support ───────────────
 
     async def _on_balance_cmd(self, message: Message, state: FSMContext) -> None:
+        """Команда /balance или reply-кнопка 💰 Баланс — открывает страницу баланса."""
         await state.clear()
         from_user = message.from_user
         if from_user is None:
             return
+        text, markup = await self._render_balance(
+            telegram_user_id=from_user.id,
+            telegram_username=from_user.username,
+            first_name=from_user.first_name,
+        )
+        await message.answer(text, reply_markup=markup)
+
+    async def _on_cb_balance(self, cb: CallbackQuery) -> None:
+        """Callback `bal` — обновить экран баланса (например, после пополнения)."""
+        if cb.from_user is None:
+            await cb.answer()
+            return
+        text, markup = await self._render_balance(
+            telegram_user_id=cb.from_user.id,
+            telegram_username=cb.from_user.username,
+            first_name=cb.from_user.first_name,
+        )
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    async def _render_balance(
+        self, *,
+        telegram_user_id: int,
+        telegram_username: str | None,
+        first_name: str | None,
+    ) -> tuple[str, InlineKeyboardMarkup]:
         async with session_factory()() as session:
             user, _ = await get_or_create_user(
                 session,
-                telegram_user_id=from_user.id,
-                telegram_username=from_user.username,
-                first_name=from_user.first_name,
+                telegram_user_id=telegram_user_id,
+                telegram_username=telegram_username,
+                first_name=first_name,
+            )
+            stats = await get_balance_stats(session, user_id=user.id)
+            ref = await get_referral_stats(session, user_id=user.id)
+            await session.commit()
+        return balance_keyboard(
+            current_kopecks=stats.current_kopecks,
+            earned_kopecks=stats.total_earned_kopecks,
+            spent_kopecks=stats.total_spent_kopecks,
+            operations_count=stats.operations_count,
+            invited_count=ref.invited_count,
+        )
+
+    # ─────────────── balance: history & top-up stubs ───────────────
+
+    async def _on_cb_balance_history(self, cb: CallbackQuery) -> None:
+        """bal_hist:{page} — история операций по балансу."""
+        if cb.from_user is None:
+            await cb.answer()
+            return
+        page = self._parse_int_or(cb.data, idx=1, default=0)
+        async with session_factory()() as session:
+            user, _ = await get_or_create_user(
+                session, telegram_user_id=cb.from_user.id,
+                telegram_username=cb.from_user.username,
+                first_name=cb.from_user.first_name,
+            )
+            rows, total = await list_balance_history(
+                session, user_id=user.id,
+                limit=10, offset=max(0, page) * 10,
             )
             await session.commit()
-        text = (
-            f"💰 <b>Твой баланс:</b> {format_rub(user.balance_kopecks)}\n\n"
-            "<i>Баланс пополняется на 1% от покупок твоих рефералов и "
-            "может использоваться для оплаты заказов в этом боте.</i>"
+
+        if total == 0:
+            text = (
+                "📊 <b>История операций</b>\n\n"
+                "Пока пусто — здесь появятся начисления от рефералов "
+                "и списания с оплат, как только начнёшь покупать."
+            )
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="« К балансу", callback_data="bal"),
+            ]])
+            await self._safe_edit(cb, text=text, markup=markup)
+            return
+
+        total_pages = max(1, (total + 9) // 10)
+        lines = ["📊 <b>История операций</b>",
+                 f"<i>стр. {page + 1} из {total_pages} · всего {total}</i>", ""]
+        for r in rows:
+            sign = "+" if r.change_kopecks > 0 else "−"
+            amount = format_rub(abs(r.change_kopecks))
+            reason_human = self._humanize_ledger_reason(r.reason)
+            when = r.created_at.strftime("%d.%m %H:%M")
+            lines.append(f"<code>{when}</code> · {sign}{amount} · {reason_human}")
+        text = "\n".join(lines)
+        _, markup = balance_history_keyboard(
+            rows_text=text, page=page, total_pages=total_pages,
         )
-        await message.answer(text, reply_markup=main_menu_keyboard())
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    @staticmethod
+    def _humanize_ledger_reason(reason: str) -> str:
+        return {
+            "referral_cashback": "🎁 кэшбэк от реферала",
+            "order_payment": "🛒 оплата заказа",
+            "manual_topup": "💎 пополнение",
+            "refund": "↩ возврат",
+            "admin_adjust": "🛠 корректировка",
+        }.get(reason, reason)
+
+    async def _on_cb_topup_crypto(self, cb: CallbackQuery) -> None:
+        await cb.answer(
+            "🪙 CryptoBot подключается в ближайшие дни.\n"
+            "Уже можно платить картой/Stars (тоже скоро).",
+            show_alert=True,
+        )
+
+    async def _on_cb_topup_stars(self, cb: CallbackQuery) -> None:
+        await cb.answer(
+            "⭐ Telegram Stars подключаются в ближайшие дни.",
+            show_alert=True,
+        )
+
+    async def _on_cb_topup_card(self, cb: CallbackQuery) -> None:
+        await cb.answer(
+            "💳 Оплата картой / СБП будет позже — после CryptoBot и Stars.",
+            show_alert=True,
+        )
+
+    # ─────────────── referrals ───────────────
 
     async def _on_ref_cmd(self, message: Message, state: FSMContext) -> None:
+        """Команда /ref или reply-кнопка 👥 Рефералы."""
         await state.clear()
         from_user = message.from_user
         if from_user is None:
@@ -794,34 +945,47 @@ class ShopBot:
                 "⏳ Ещё не готов — бот только запустился. Попробуй через минуту."
             )
             return
+        text, markup = await self._render_referrals(
+            telegram_user_id=from_user.id,
+            telegram_username=from_user.username,
+            first_name=from_user.first_name,
+        )
+        await message.answer(text, reply_markup=markup)
+
+    async def _on_cb_referrals(self, cb: CallbackQuery) -> None:
+        """Callback `ref` — открыть страницу рефералов из inline-кнопки."""
+        if cb.from_user is None or self._username is None:
+            await cb.answer()
+            return
+        text, markup = await self._render_referrals(
+            telegram_user_id=cb.from_user.id,
+            telegram_username=cb.from_user.username,
+            first_name=cb.from_user.first_name,
+        )
+        await self._safe_edit(cb, text=text, markup=markup)
+
+    async def _render_referrals(
+        self, *,
+        telegram_user_id: int,
+        telegram_username: str | None,
+        first_name: str | None,
+    ) -> tuple[str, InlineKeyboardMarkup]:
         async with session_factory()() as session:
             user, _ = await get_or_create_user(
-                session,
-                telegram_user_id=from_user.id,
-                telegram_username=from_user.username,
-                first_name=from_user.first_name,
+                session, telegram_user_id=telegram_user_id,
+                telegram_username=telegram_username,
+                first_name=first_name,
             )
+            stats = await get_referral_stats(session, user_id=user.id)
             await session.commit()
         ref_link = f"https://t.me/{self._username}?start=ref_{user.id}"
-        text = (
-            "👥 <b>Реферальная программа</b>\n\n"
-            "Делись ссылкой — получай <b>1%</b> с каждой покупки приглашённого "
-            "друга на свой внутренний баланс. Балансом можно оплачивать заказы.\n\n"
-            f"🔗 <b>Твоя ссылка:</b>\n<code>{ref_link}</code>"
-        )
-        share_url = (
-            f"https://t.me/share/url?url={ref_link}"
-            f"&text=%F0%9F%9B%92%20%D0%9C%D0%B0%D0%B3%D0%B0%D0%B7%D0%B8%D0%BD"
-            "%20%D0%BF%D0%BE%D0%B4%D0%B0%D1%80%D0%BE%D1%87%D0%BD%D1%8B%D1%85"
-            "%20%D0%BA%D0%B0%D1%80%D1%82"
-        )
-        markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📤 Поделиться", url=share_url)],
-        ])
-        await message.answer(text, reply_markup=markup)
-        await message.answer(
-            "<i>Готово — лови приглашённых через 💰 Баланс.</i>",
-            reply_markup=main_menu_keyboard(),
+        bonus = await get_shop_referral_percent(self._settings)
+        return referrals_keyboard(
+            ref_link=ref_link,
+            invited_count=stats.invited_count,
+            earned_kopecks=stats.total_earned_kopecks,
+            active_referrals_count=stats.active_referrals_count,
+            bonus_percent=bonus,
         )
 
     async def _on_orders_cmd(self, message: Message, state: FSMContext) -> None:
@@ -836,15 +1000,19 @@ class ShopBot:
     async def _on_support_cmd(self, message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer(
-            "🆘 <b>Поддержка</b>\n\n"
+            f"🆘 <b>Поддержка {BRAND}</b>\n\n"
             "Опиши проблему в этот чат — оператор увидит сообщение и ответит "
             "лично. В период бета-доступа отвечаем в течение нескольких часов.\n\n"
-            "<b>Часто спрашивают</b>\n"
-            "• <i>Когда откроется оплата?</i> — в ближайшие дни (CryptoBot и "
-            "Telegram Stars).\n"
-            "• <i>Безопасно ли?</i> — да: оплата через официальные шлюзы "
-            "Telegram, доставка моментальная.\n"
-            "• <i>Что с кэшбэком?</i> — 1% от покупок друзей идёт на твой баланс.",
+            "<b>Частые вопросы</b>\n"
+            "• <i>Когда откроется оплата?</i> — на днях. Подключаем "
+            "CryptoBot (комиссия ~3%), Telegram Stars и оплату картой/СБП.\n"
+            "• <i>Безопасно ли?</i> — да: оплата только через официальные шлюзы. "
+            "Доставка ключей моментальная после оплаты.\n"
+            "• <i>Откуда товары?</i> — у проверенного поставщика (NS.gifts), "
+            "тот же, что у топовых FunPay-продавцов.\n"
+            "• <i>Что с кэшбэком?</i> — 1% от покупок друзей идёт на твой "
+            "внутренний баланс, балансом можно оплачивать заказы.\n\n"
+            f"🌐 Сайт: <code>{SITE_URL}</code>",
             reply_markup=main_menu_keyboard(),
         )
 
