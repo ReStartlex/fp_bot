@@ -37,6 +37,7 @@ from src.shop.bot import ShopBot
 from src.shop.catalog_sync import sync_catalog_once
 from src.shop.payments.poller import poll_cryptobot_once
 from src.sync.stock_sync import sync_once
+from src.sync.zombie_reaper import reap_zombie_lots_once
 
 
 HEARTBEAT_HOURS = 6
@@ -66,6 +67,9 @@ class App:
         # потому что getInvoices иногда тротлится — лучше дать ему
         # один лишний retry перед алертом.
         self._cryptobot_poll_consecutive_failures = 0
+        # Счётчик подряд-падений zombie reaper'а. При 3+ подряд (~30 мин)
+        # — алертим: значит FunPay недоступен или маппинги БД сломаны.
+        self._zombie_reaper_consecutive_failures = 0
 
     # ---------- Lifecycle ----------
 
@@ -237,6 +241,25 @@ class App:
                 # WAL и так покрывает конкуренцию, но «гигиена» не
                 # лишняя — меньше шансов на busy_timeout retry.
                 next_run_time=datetime.now() + timedelta(seconds=45),
+                max_instances=1,
+                coalesce=True,
+            )
+        # Zombie-lot reaper: устраняет half-disabled state после failed-заказов.
+        # Сценарий: _emergency_disable_lot отключил mapping, но save_lot на
+        # FunPay упал — лот продолжает продаваться со старым stock'ом.
+        # Reaper находит такие лоты и пытается deactivate их снова.
+        if self.settings.zombie_lot_reaper_enabled:
+            self.scheduler.add_job(
+                self._safe_zombie_reap,
+                "interval",
+                seconds=self.settings.zombie_lot_reaper_interval_seconds,
+                id="zombie_reaper",
+                # Phase shift: +90с после старта. Reaper не должен пересекаться
+                # с большими циклами sync_once (когда TTL diff-cache у всех
+                # истекает одновременно и r429 spike). Дольше — потому что
+                # этот job не критичен по latency, лот в half-disabled state
+                # может подождать ещё 10 минут без катастрофы.
+                next_run_time=datetime.now() + timedelta(seconds=90),
                 max_instances=1,
                 coalesce=True,
             )
@@ -560,6 +583,57 @@ class App:
             ):
                 await self.tg.info("✅ CryptoBot poll восстановился")
             self._cryptobot_poll_consecutive_failures = 0
+
+    async def _safe_zombie_reap(self) -> None:
+        """
+        Безопасный прогон zombie-reaper'а. Никогда не падает наружу.
+
+        На устойчивые сбои (3+ подряд = ~30 минут с дефолтным интервалом)
+        — алертим владельцу. Чаще всего это значит, что FunPay-сессия
+        невалидна, и тогда вообще ничего не работает.
+        """
+        if self.fp is None:
+            logger.debug("zombie reaper: FunPay-клиент не подключён, skip")
+            return
+
+        try:
+            result = await reap_zombie_lots_once(
+                funpay_client=self.fp,
+                settings=self.settings,
+                notify_owner=self._notify_owner_safe,
+            )
+        except Exception as exc:
+            logger.exception(f"zombie reaper упал: {exc}")
+            self._zombie_reaper_consecutive_failures += 1
+            if (
+                self._zombie_reaper_consecutive_failures == 3
+                and self.tg is not None
+            ):
+                short = f"{type(exc).__name__}: {str(exc)[:160]}"
+                await self.tg.error(
+                    f"🧟 Zombie reaper падает: <code>{short}</code>. "
+                    "Half-disabled лоты не вычищаются."
+                )
+            return
+
+        # Логируем результат всегда: heartbeat zombie-reaper'а полезен
+        # для подтверждения что job живой (как cryptobot poll log).
+        logger.info(
+            f"zombie reaper: checked={result.checked} "
+            f"already_dead={result.already_dead} "
+            f"deactivated={result.deactivated} "
+            f"errors={result.errors}"
+        )
+
+        if result.errors > 0:
+            self._zombie_reaper_consecutive_failures += 1
+        else:
+            if (
+                self._zombie_reaper_consecutive_failures >= 3
+                and self.tg is not None
+            ):
+                await self.tg.info("✅ Zombie reaper восстановился")
+            self._zombie_reaper_consecutive_failures = 0
 
     async def _notify_buyer_cryptobot_paid(self, tg_user_id: int, text: str) -> None:
         """

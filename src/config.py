@@ -220,6 +220,17 @@ class Settings(BaseSettings):
     order_reconcile_enabled: bool = True
     order_reconcile_interval_seconds: int = Field(default=120, ge=30)
     order_reconcile_stale_after_seconds: int = Field(default=60, ge=0)
+
+    # Zombie-lot reaper: после _emergency_disable_lot мы отключаем mapping
+    # в БД, но save_lot(active=False) на FunPay мог упасть (например 429).
+    # Получается half-disabled state: sync_stock игнорирует, лот на FunPay
+    # активен и продаётся со старым stock'ом. Reaper находит такие лоты
+    # и пытается deactivate'нуть снова каждые N секунд.
+    zombie_lot_reaper_enabled: bool = True
+    zombie_lot_reaper_interval_seconds: int = Field(default=600, ge=60)
+    # Лимит лотов за один прогон — не больше N save_lot вызовов,
+    # чтобы не вызвать r429 burst если зомби накопились пачкой.
+    zombie_lot_reaper_max_per_run: int = Field(default=5, ge=1, le=50)
     order_reconcile_max_per_run: int = Field(default=10, ge=1, le=100)
 
     # Жёсткий лимит на ПОЛНЫЙ цикл received→delivered. По истечении бот:
