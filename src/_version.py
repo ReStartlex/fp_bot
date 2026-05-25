@@ -4,6 +4,6 @@ deploy/stamp_version.py перед каждым push'ем.
 
 ВАЖНО: НЕ редактируй вручную — твои изменения будут перезаписаны.
 """
-SHA = "326c9d9a0e4d30c66f6f73a3d7c9b3bd72cd741b"
-DATE = "2026-05-25T19:17:54+03:00"
-SUBJECT = "feat(shop): Sprint 2.2 вЂ” Pro UX (persistent menu + FSM-РїРѕРёСЃРє + inline-mode + РїР°РіРёРЅР°С†РёСЏ)"
+SHA = "10af5d762c3307e5425b33b0bc7c5e1aecbaf9bd"
+DATE = "2026-05-25T19:45:28+03:00"
+SUBJECT = "feat(shop): Sprint 2.3 вЂ” UX-pass + brand В«NeuroDropВ» (Р±Р°Р»Р°РЅСЃ/СЂРµС„РµСЂР°Р»С‹ + hotfix)"
