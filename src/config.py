@@ -90,9 +90,13 @@ class Settings(BaseSettings):
     # как класс. Управляется отдельным флагом, чтобы можно было
     # быстро откатить через .env (без передеплоя), если что.
     sync_stock_diff_cache_enabled: bool = True
-    # 300 сек = 5 минут. Каждые 5 минут принудительно делаем GET,
-    # чтобы cache не разъехался с FunPay.
-    sync_stock_diff_cache_ttl_seconds: int = Field(default=300, ge=30, le=3600)
+    # 120 сек = 2 минуты. Раньше было 300с, но из-за этого после ручных
+    # правок цен на FunPay UI или после _emergency_disable_lot со «сбоем
+    # save_lot» расхождение могло прожить до 5 минут — клиенты в этом
+    # окне покупали лот не по той цене, или вообще видели количество=0
+    # уже после восстановления. 120с — компромисс: всё ещё ×4-5 экономия
+    # rate-limit'а, но окно неконсистентности коротко и предсказуемо.
+    sync_stock_diff_cache_ttl_seconds: int = Field(default=120, ge=30, le=3600)
     # Комиссия FunPay для оценки цены клиента: чисто справочно для /calc.
     # Не влияет на то, какую цену мы записываем (мы пишем цену продавца, FunPay
     # сам добавит комиссию). Реальная комиссия зависит от категории.
@@ -300,6 +304,51 @@ class Settings(BaseSettings):
     # повторные одинаковые сообщения вроде "!помощь" -> "!помощь", когда
     # preview визуально не меняется.
     funpay_active_chats_poll_limit: int = Field(default=5, ge=0, le=20)
+    # Размер LRU-дедупа watcher'а (по message_id или (chat_id, author, text)).
+    # Старый дефолт 1024 на активном аккаунте мог переполниться и тогда
+    # старое сообщение, выпавшее из deque, повторно срабатывало после
+    # очередного poll'а. 4096 запасом покрывает сутки активной торговли
+    # (~30 чатов × ~10 сообщений × 12 polls/min).
+    funpay_watcher_dedup_cache_size: int = Field(default=4096, ge=128, le=65536)
+
+    # === Order discovery poll (3-й канал доставки заказов) ===
+    # listen-loop FunPayAPI выключен по умолчанию (см. выше) и в любом
+    # случае нестабилен. Системные сообщения «оплачен заказ #...» из
+    # poll-loop в ChatHandler НЕ создают Order — он только помечает
+    # ChatState. Получается, что часть заказов выпадает: NS-покупка
+    # не запускается, владелец не получает «✅ Заказ выполнен».
+    #
+    # Этот воркер раз в N секунд тянет свежий список paid-заказов через
+    # account.get_sells(state="paid") и для каждого, которого нет в БД,
+    # поднимает FunPayOrderEvent и зовёт process_funpay_order. Это даёт
+    # ленивый, но надёжный 3-й канал, не зависящий от listen() и
+    # обработки системных сообщений в чате.
+    funpay_order_discovery_enabled: bool = True
+    funpay_order_discovery_interval_seconds: int = Field(default=60, ge=15, le=600)
+    # Лимит новых заказов за один прогон — защита от NS-burst, если
+    # вдруг скопилось много пропущенных. Заказы свыше лимита подберёт
+    # следующий тик.
+    funpay_order_discovery_max_per_run: int = Field(default=10, ge=1, le=50)
+
+    # === NS health watchdog ===
+    # Периодический «жив ли NS?» с алертами в Telegram. Раньше падение
+    # NS было видно только через 6-часовой heartbeat и провал sync — то
+    # есть владелец узнавал поздно, заказы уже копились в `failed`.
+    #
+    # Логика: каждые N секунд один лёгкий check_balance. Если несколько
+    # подряд провалов — алерт «🚨 NS лежит N мин, выключи лоты». На
+    # восстановлении — «✅ NS жив, можно включать».
+    ns_health_watchdog_enabled: bool = True
+    ns_health_watchdog_interval_seconds: int = Field(default=90, ge=30, le=600)
+    # Сколько подряд провалов до первого алерта. 3 при интервале 90с =
+    # ~4.5 минуты — даёт NS шанс быть просто медленным, и не флудит
+    # на одно «моргание сети».
+    ns_health_watchdog_alert_after_failures: int = Field(default=3, ge=1, le=10)
+    # Таймаут одного check_balance внутри watchdog'а. 5с — компромисс:
+    # хватает на медленный NS, но не повисает на дохлой сети.
+    ns_health_watchdog_check_timeout_seconds: float = Field(
+        default=5.0, ge=1.0, le=30.0
+    )
 
     @field_validator("ns_api_secret")
     @classmethod

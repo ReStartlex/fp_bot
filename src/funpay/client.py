@@ -20,6 +20,25 @@ T = TypeVar("T")
 
 
 @dataclass(frozen=True)
+class RecentSale:
+    """Лёгкая нормализация FunPayAPI OrderShortcut для discovery.
+
+    Используется `get_recent_sales` и order discovery polling. Мы вытаскиваем
+    только то, что реально нужно processor'у; всё неважное в OrderShortcut
+    (html, subcategory, date, currency и т.п.) выбрасываем — чем меньше surface,
+    тем меньше падений при обновлениях FunPayAPI.
+    """
+    order_id: str
+    status: str  # 'paid' | 'closed' | 'refunded' | прочее
+    buyer_username: str | None = None
+    buyer_user_id: int | None = None
+    funpay_lot_id: int = 0
+    quantity: int = 1
+    price_rub: float | None = None
+    description: str | None = None
+
+
+@dataclass(frozen=True)
 class PaidSalesSnapshot:
     """Результат `get_paid_sales_snapshot`.
 
@@ -546,6 +565,80 @@ class FunPayClient:
             truncated_reason=truncated_reason,
         )
 
+    async def get_recent_sales(
+        self,
+        *,
+        state: str = "paid",
+        max_pages: int = 1,
+    ) -> list[RecentSale]:
+        """Свежий список заказов с подробностями (для order discovery).
+
+        В отличие от ``get_paid_sales_snapshot``, который возвращает только
+        IDs (для матчинга в `sync_pending_confirmation`), этот метод даёт
+        достаточно полей, чтобы построить ``FunPayOrderEvent`` и пропустить
+        заказ через ``process_funpay_order``.
+
+        По умолчанию берём только первую страницу — discovery работает
+        каждые ~60с, и нам важна именно свежая верхушка ленты, а не вся
+        история. При желании ``max_pages`` можно увеличить, но не делаем
+        этого по умолчанию: лишняя пагинация — лишний шанс упереться
+        в rate-limit FunPay.
+
+        Никаких side-effects: только обёртка над ``account.get_sells``.
+        Не падает наружу при пустом ответе — возвращает [].
+
+        Поля OrderShortcut, на которые мы полагаемся:
+            id, status, buyer/buyer_username/buyer_id, price/amount/sum,
+            description, lot_id (когда есть). Все они опциональны, и при
+            отсутствии мы подставляем безопасные дефолты — это норма для
+            FunPayAPI, который часто не отдаёт lot_id в OrderShortcut.
+        """
+        result: list[RecentSale] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        pages = 0
+        max_pages_safe = max(1, min(int(max_pages), self._PAID_SALES_MAX_PAGES))
+
+        while pages < max_pages_safe:
+            pages += 1
+
+            def _call(start_from: str | None = cursor) -> tuple[Any, list[Any]]:
+                return self.account.get_sells(
+                    state=state,
+                    include_paid=(state == "paid"),
+                    include_closed=(state == "closed"),
+                    include_refunded=(state == "refunded"),
+                    start_from=start_from,
+                )
+
+            try:
+                next_cursor, orders = await self._to_thread(_call)
+            except Exception as exc:
+                logger.warning(
+                    f"FunPay get_recent_sales(state={state}, page={pages}) "
+                    f"упал: {type(exc).__name__}: {exc}"
+                )
+                break
+
+            for order in orders or []:
+                sale = _normalize_order_shortcut(order)
+                if sale is not None:
+                    result.append(sale)
+
+            if not next_cursor:
+                break
+            next_cursor_str = str(next_cursor)
+            if next_cursor_str in seen_cursors:
+                logger.debug(
+                    f"FunPay get_recent_sales: повторный курсор "
+                    f"{next_cursor_str!r}, прекращаю пагинацию"
+                )
+                break
+            seen_cursors.add(next_cursor_str)
+            cursor = next_cursor_str
+
+        return result
+
     # ----- Лоты -----
 
     async def get_my_lots(self) -> list[Any]:
@@ -932,3 +1025,100 @@ class FunPayClient:
             else:
                 result[name] = type(value).__name__
         return result
+
+
+# ──────────────────────────── helpers ───────────────────────────────────
+
+
+def _shortcut_attr(obj: Any, *attrs: str) -> Any:
+    """Достаём первое непустое значение из набора атрибутов FunPay OrderShortcut."""
+    for attr in attrs:
+        value = getattr(obj, attr, None)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _shortcut_status(order: Any) -> str:
+    """Извлекаем статус заказа из OrderShortcut: либо .status.value, либо строка."""
+    status = getattr(order, "status", None)
+    if status is None:
+        return ""
+    value = getattr(status, "value", None) or getattr(status, "name", None)
+    if value is not None:
+        return str(value).lower()
+    return str(status).lower()
+
+
+def _normalize_order_shortcut(order: Any) -> "RecentSale | None":
+    """Нормализуем FunPayAPI OrderShortcut в RecentSale.
+
+    Контракт максимально снисходителен: не падаем, если каких-то полей нет
+    (FunPayAPI меняется чаще, чем хотелось бы). Если нет id — заказ
+    бессмыслен, возвращаем None.
+    """
+    raw_id = _shortcut_attr(order, "id", "order_id", "ID")
+    if raw_id is None:
+        return None
+    order_id = str(raw_id).lstrip("#")
+    if not order_id:
+        return None
+
+    buyer = _shortcut_attr(order, "buyer", "buyer_username")
+    if buyer is not None and not isinstance(buyer, (int, str)):
+        buyer_username = getattr(buyer, "username", None)
+        buyer_user_id = getattr(buyer, "id", None)
+    elif isinstance(buyer, str):
+        buyer_username = buyer
+        buyer_user_id = None
+    else:
+        buyer_username = None
+        buyer_user_id = None
+
+    if buyer_username is None:
+        buyer_username = _shortcut_attr(order, "buyer_username", "username")
+    if buyer_user_id is None:
+        buyer_user_id = _shortcut_attr(order, "buyer_id", "user_id")
+
+    if buyer_username is not None:
+        buyer_username = str(buyer_username)
+    try:
+        buyer_user_id = int(buyer_user_id) if buyer_user_id is not None else None
+    except (TypeError, ValueError):
+        buyer_user_id = None
+
+    lot_id_raw = _shortcut_attr(order, "lot_id", "offer_id", "lot")
+    try:
+        funpay_lot_id = int(lot_id_raw) if lot_id_raw is not None else 0
+    except (TypeError, ValueError):
+        funpay_lot_id = 0
+
+    quantity_raw = _shortcut_attr(order, "amount", "quantity", "count")
+    try:
+        quantity = int(quantity_raw) if quantity_raw is not None else 1
+    except (TypeError, ValueError):
+        quantity = 1
+    quantity = max(1, quantity)
+
+    price_raw = _shortcut_attr(order, "price", "sum", "total")
+    try:
+        price_rub = float(price_raw) if price_raw is not None else None
+    except (TypeError, ValueError):
+        price_rub = None
+
+    description = _shortcut_attr(
+        order, "description", "short_description", "title", "full_description"
+    )
+    if description is not None and not isinstance(description, str):
+        description = str(description)
+
+    return RecentSale(
+        order_id=order_id,
+        status=_shortcut_status(order) or "unknown",
+        buyer_username=buyer_username,
+        buyer_user_id=buyer_user_id,
+        funpay_lot_id=funpay_lot_id,
+        quantity=quantity,
+        price_rub=price_rub,
+        description=description,
+    )

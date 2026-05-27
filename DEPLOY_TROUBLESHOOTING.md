@@ -1005,6 +1005,94 @@ systemctl stop funpay-ns-bot funpay-ns-api
   сегодня может умереть. **Всегда проверять §0.2** перед deploy-командой,
   а после успешного деплоя — обновлять таблицу с новой датой.
 
+### 2026-05-28 — релиз «3-й канал заказов + NS watchdog + batch lots»
+
+**Что попало в релиз**:
+
+- **Order discovery poll** (`src/orders/discovery.py`). 3-й канал
+  доставки заказов: каждые `FUNPAY_ORDER_DISCOVERY_INTERVAL_SECONDS=60c`
+  тянет `account.get_sells(state="paid")`, для каждого paid-заказа,
+  которого нет в БД, поднимает `FunPayOrderEvent` → `process_funpay_order`.
+  Решает проблему пропавших уведомлений «✅ Заказ выполнен», когда
+  `FUNPAY_LISTEN_ENABLED=false` (а poll-loop и так не обрабатывает
+  ORDER-события). Идемпотентно: per-order Lock + state machine
+  в processor'е.
+- **NS health watchdog** (`_ns_health_check` в `main.py`). Каждые
+  `NS_HEALTH_WATCHDOG_INTERVAL_SECONDS=90c` дёргает `ns.check_balance()`.
+  При `NS_HEALTH_WATCHDOG_ALERT_AFTER_FAILURES=3` подряд провалах —
+  алерт «🚨 NS лежит, выключи лоты». На восстановлении — «✅ NS жив».
+- **Batch enable/disable всех маппингов** (`src/sync/lots_control.py`).
+  В главном меню две новые кнопки: «🔴 Выключить все лоты» (для каждого
+  маппинга: `enabled=False` + `save_lot(active=False, amount=0)`) и
+  «🟢 Включить все лоты» (для всех: `enabled=True` + сброс diff-cache;
+  реальная активация — ближайшим sync-циклом).
+- **TelegramBot переиспользует `self.ns`** долгоживущего процесса.
+  Раньше каждый клик «Баланс»/«Статус» создавал свой `NSClient` и
+  делал новый login. Теперь токен (2ч TTL) переиспользуется с sync'ом,
+  ответ команд сократился с 3-5с до ~0.5с. Балансы дополнительно
+  кешируются на 15с, NS timeout снижен с 15с до 6с.
+- **diff-cache TTL понижен** с 300с до 120с (`SYNC_STOCK_DIFF_CACHE_TTL_SECONDS`).
+  Меньше окно неконсистентности при ручных правках цен на FunPay UI.
+- **Invalidation diff-cache по `order.funpay_lot_id`**, не по
+  `event.funpay_lot_id`. Для заказов из chat handler / discovery
+  event.funpay_lot_id может быть 0, и раньше invalidation тихо
+  пропускалась — FunPay-сток оставался на «100−proданное» до истечения
+  TTL. Теперь берётся эффективный lot_id из БД.
+- **Visibility exhausted в sync**. При 3+ подряд циклах с
+  `http.exhausted>0` — алерт «⚠ Sync: rate-limit exhausted ×3 подряд»,
+  на восстановлении — recovery-сообщение.
+- **dedup-кэш watcher'а 1024 → 4096**
+  (`FUNPAY_WATCHER_DEDUP_CACHE_SIZE`). На активном аккаунте старый
+  размер мог переполниться и старое сообщение «выпадало» из deque и
+  дисптачилось повторно.
+
+**Деплой-чек-лист (новые .env-настройки)**:
+
+```bash
+# В /opt/funpay-ns-bot/.env добавь / обнови:
+SYNC_STOCK_DIFF_CACHE_TTL_SECONDS=120      # было 300
+FUNPAY_WATCHER_DEDUP_CACHE_SIZE=4096
+FUNPAY_ORDER_DISCOVERY_ENABLED=true
+FUNPAY_ORDER_DISCOVERY_INTERVAL_SECONDS=60
+FUNPAY_ORDER_DISCOVERY_MAX_PER_RUN=10
+NS_HEALTH_WATCHDOG_ENABLED=true
+NS_HEALTH_WATCHDOG_INTERVAL_SECONDS=90
+NS_HEALTH_WATCHDOG_ALERT_AFTER_FAILURES=3
+NS_HEALTH_WATCHDOG_CHECK_TIMEOUT_SECONDS=5
+```
+
+Все настройки имеют разумные defaults в `src/config.py`; .env-блок
+нужен только если хочешь переопределить. После `update.sh` сразу
+сделай рестарт `funpay-ns-bot`:
+
+```bash
+sudo systemctl restart funpay-ns-bot
+sudo journalctl -u funpay-ns-bot -n 80 --no-pager
+```
+
+В логе должно появиться:
+```
+Планировщик запущен: …; всего job'ов: N (sync, heartbeat, low_balance,
+  funpay_reconnect, order_reconciler, new_lots, …, zombie_reaper,
+  order_discovery, ns_health_watchdog)
+```
+
+Особенно проверь, что есть `order_discovery` и `ns_health_watchdog` —
+если нет, значит `.env` отключил их явно. Через 25-40с после старта
+эти job'ы сделают первые тики.
+
+**Если что-то пошло не так**:
+
+- Discovery: `journalctl -u funpay-ns-bot | grep "order discovery"`.
+  Пустые `fetched=0` не логируются — это норма. Если ничего нет в
+  логах больше 5 минут — проверь `FUNPAY_ORDER_DISCOVERY_ENABLED`.
+- Watchdog: при NS down должен прийти алерт в Telegram через 3 × 90с
+  = 4.5 минуты. Если не пришёл — проверь, что `self.ns is not None`
+  и `self.tg.enabled`.
+- Batch enable/disable: в меню должны появиться две новые кнопки.
+  Если их нет, значит код приехал не полностью — `cat BUILD_INFO`
+  и сверь SHA.
+
 ### <добавь сюда следующую попытку>
 
 ---

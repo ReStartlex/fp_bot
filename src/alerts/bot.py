@@ -52,15 +52,29 @@ from src.mapping.safety import mapping_risk_warnings
 from src.ns import NSClient
 from src.ns.models import StockResponse
 from src.sync.fx import get_rate_breakdown
+from src.sync.lots_control import (
+    disable_all_mapped_lots,
+    enable_all_mapped_lots,
+)
 
 
 SyncTrigger = Callable[[], Awaitable[dict]]
 FunPayReconnect = Callable[[], Awaitable[dict]]
 OrderRetry = Callable[[str], Awaitable[dict]]
 
-# Таймауты: если NS/FunPay завис — бот не должен молчать вечно.
-NS_TIMEOUT_SECONDS = 15.0
-FP_TIMEOUT_SECONDS = 15.0
+# Таймауты для интерактивных команд из Telegram. Если NS/FunPay завис —
+# бот не должен молчать вечно: лучше быстро вернуть «timeout», чем заставлять
+# владельца смотреть на «обработка…» 15+ секунд. На медленный NS этого
+# достаточно: реальный _ensure_token+check_balance укладывается в 1-2с.
+NS_TIMEOUT_SECONDS = 6.0
+FP_TIMEOUT_SECONDS = 8.0
+
+# Кеш баланса NS для UI «📊 Статус» / «💰 Балансы». На каждый клик дёргать
+# NS нет смысла — баланс меняется только при заказах. 15с — компромисс:
+# мгновенный refresh после клика остаётся, но повторное открытие меню
+# не делает второй HTTP-запрос. Раздельный кеш для balance и stock,
+# потому что stock тяжелее и обновляется реже.
+NS_BALANCE_CACHE_TTL_SECONDS = 15.0
 
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -390,12 +404,20 @@ class TelegramBot:
         funpay_client: FunPayClient | None = None,
         funpay_reconnect: FunPayReconnect | None = None,
         order_retry: OrderRetry | None = None,
+        ns_client: NSClient | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._sync_trigger = sync_trigger
         self._funpay_client = funpay_client
         self._funpay_reconnect = funpay_reconnect
         self._order_retry = order_retry
+        # Долгоживущий NSClient процесса: разделяем токен (2ч TTL) с sync
+        # и order processor. Раньше каждый клик создавал свой NSClient,
+        # что означало новый login → новый сетевой круг, и команда «Баланс»
+        # отвечала по 3-5с вместо 0.5с. Если ns_client=None — fallback на
+        # одноразовый NSClient как раньше (этот режим оставлен для тестов
+        # и для случая, когда main.py ещё не успел проинициализироваться).
+        self._ns_client = ns_client
         self._bot: Bot | None = None
         self._dp: Dispatcher | None = None
         self._task: asyncio.Task | None = None
@@ -410,6 +432,10 @@ class TelegramBot:
         # кэш каталога NS на 60 секунд, чтобы не дёргать API на каждый клик
         self._stock_cache: tuple[float, StockResponse] | None = None
         self._stock_lock = asyncio.Lock()
+        # Короткий кеш для балансов NS: тик в 15с, формат "<balance>".
+        # Промахи закрываются вызовом NS, успех — сохраняется до TTL.
+        self._balance_cache: tuple[float, str] | None = None
+        self._balance_lock = asyncio.Lock()
 
     def update_funpay_client(self, fp: FunPayClient | None) -> None:
         self._funpay_client = fp
@@ -845,6 +871,23 @@ class TelegramBot:
                 return
             await self._on_group_click(cq)
 
+        # Batch enable/disable всех маппингов: подтверждение через
+        # confirm_keyboard, фактическая работа — в _do_disable_all_lots
+        # / _do_enable_all_lots. См. src/sync/lots_control.py.
+        @dp.callback_query(F.data == "lots_off_confirm")
+        async def cb_lots_off_confirm(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await self._do_disable_all_lots(cq)
+
+        @dp.callback_query(F.data == "lots_on_confirm")
+        async def cb_lots_on_confirm(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await self._do_enable_all_lots(cq)
+
         # Кнопки на алертах про manual_hold: hold:retry/done/show:<funpay_order_id>.
         # Эти алерты приходят из processor._trigger_manual_hold и из reconciler
         # для застрявших заказов. callback_data не session-based — несёт прямой
@@ -966,6 +1009,19 @@ class TelegramBot:
     async def _plain_settings(self, msg: Message, text: str) -> None:
         await self._do_show_settings(self._slash_msg(msg, text))  # type: ignore[arg-type]
 
+    async def _ns_call(self, coro_factory, *, timeout: float):
+        """Унифицированный вызов NS через долгоживущий клиент или fallback.
+
+        Если App передал нам ``self._ns_client`` — используем его (нет
+        повторного login'а, токен живой до 2ч). Если нет — создаём
+        одноразовый. Это покрывает не только нормальный prod-режим,
+        но и unit-тесты, где TelegramBot создаётся без ns_client.
+        """
+        if self._ns_client is not None:
+            return await asyncio.wait_for(coro_factory(self._ns_client), timeout=timeout)
+        async with NSClient() as ns:
+            return await asyncio.wait_for(coro_factory(ns), timeout=timeout)
+
     async def _get_stock(self, *, force: bool = False) -> StockResponse:
         """NS-каталог с кэшем 60 секунд."""
         async with self._stock_lock:
@@ -974,22 +1030,39 @@ class TelegramBot:
                 ts, cached = self._stock_cache
                 if now - ts < 60.0:
                     return cached
-            async with NSClient() as ns:
-                stock = await asyncio.wait_for(ns.get_stock(), timeout=NS_TIMEOUT_SECONDS)
+            stock = await self._ns_call(
+                lambda ns: ns.get_stock(), timeout=NS_TIMEOUT_SECONDS
+            )
             self._stock_cache = (now, stock)
             return stock
 
-    async def _safe_ns_balance(self) -> str:
-        try:
-            async with NSClient() as ns:
-                bal = await asyncio.wait_for(
-                    ns.check_balance(), timeout=NS_TIMEOUT_SECONDS
+    async def _safe_ns_balance(self, *, force: bool = False) -> str:
+        """Баланс NS с коротким кешем 15с.
+
+        Кеш нужен, потому что владелец часто открывает «📊 Статус» и
+        «💰 Балансы» подряд — на каждый клик создавать новый round-trip
+        к ns.gifts бессмысленно. ``force=True`` пропускает кеш —
+        полезно для будущей кнопки «🔄 Обновить баланс».
+        """
+        async with self._balance_lock:
+            now = time.time()
+            if not force and self._balance_cache is not None:
+                ts, cached = self._balance_cache
+                if now - ts < NS_BALANCE_CACHE_TTL_SECONDS:
+                    return cached
+            try:
+                bal = await self._ns_call(
+                    lambda ns: ns.check_balance(), timeout=NS_TIMEOUT_SECONDS
                 )
-            return f"{bal.balance}"
-        except asyncio.TimeoutError:
-            return "<i>timeout</i>"
-        except Exception as exc:
-            return f"<i>n/a ({html.escape(str(exc))[:80]})</i>"
+                value = f"{bal.balance}"
+            except asyncio.TimeoutError:
+                # При timeout кеш НЕ обновляем, чтобы следующий клик
+                # сразу попробовал заново, а не висел 15с со старой ошибкой.
+                return "<i>timeout</i>"
+            except Exception as exc:
+                return f"<i>n/a ({html.escape(str(exc))[:80]})</i>"
+            self._balance_cache = (now, value)
+            return value
 
     async def _safe_fp_status(self) -> str:
         if self._funpay_client is None:
@@ -1134,8 +1207,137 @@ class TelegramBot:
             await self._run_reconnect_via_cq(cq)
         elif action == ui.MENU_KIND_HELP:
             await self._edit_or_answer(cq, self.HELP_TEXT, reply_markup=ui.single_close_kb())
+        elif action == ui.MENU_KIND_LOTS_DISABLE_ALL:
+            await self._confirm_disable_all_lots(cq)
+        elif action == ui.MENU_KIND_LOTS_ENABLE_ALL:
+            await self._confirm_enable_all_lots(cq)
         else:
             await cq.answer(f"Неизвестная команда меню: {action}")
+
+    # ─────────────── batch enable/disable всех лотов ───────────────
+
+    async def _count_mapped_lots(self) -> tuple[int, int]:
+        """Возвращает (всего маппингов, активных). Дёшево, без I/O в FunPay."""
+        async with session_factory()() as session:
+            total = (await session.execute(
+                select(func.count()).select_from(Mapping)
+            )).scalar_one()
+            active = (await session.execute(
+                select(func.count())
+                .select_from(Mapping)
+                .where(Mapping.enabled.is_(True))
+            )).scalar_one()
+        return int(total or 0), int(active or 0)
+
+    @_guard
+    async def _confirm_disable_all_lots(self, cq: CallbackQuery) -> None:
+        total, active = await self._count_mapped_lots()
+        text = (
+            "🔴 <b>Выключить ВСЕ замапленные лоты?</b>\n\n"
+            f"Найдено маппингов: <b>{total}</b> "
+            f"(сейчас активных: <b>{active}</b>).\n\n"
+            "Что будет сделано:\n"
+            "  • <b>mapping.enabled = False</b> для всех маппингов в БД.\n"
+            "  • <b>save_lot(active=False, amount=0)</b> для каждого лота "
+            "на FunPay (с паузой ~400ms между запросами, чтобы не словить 429).\n\n"
+            "<i>Лоты сразу снимаются с продажи. Включить обратно можно одной "
+            "кнопкой «🟢 Включить все лоты» (после восстановления NS).</i>"
+        )
+        await self._edit_or_answer(
+            cq,
+            text,
+            reply_markup=ui.confirm_keyboard(
+                yes_data="lots_off_confirm",
+                yes_text="🔴 Да, выключить все",
+                no_text="✖ Отмена",
+            ),
+        )
+
+    @_guard
+    async def _confirm_enable_all_lots(self, cq: CallbackQuery) -> None:
+        total, active = await self._count_mapped_lots()
+        text = (
+            "🟢 <b>Включить ВСЕ замапленные лоты?</b>\n\n"
+            f"Найдено маппингов: <b>{total}</b> "
+            f"(сейчас активных: <b>{active}</b>).\n\n"
+            "Что будет сделано:\n"
+            "  • <b>mapping.enabled = True</b> для ВСЕХ маппингов "
+            "(включая ранее отключённые).\n"
+            "  • <b>Сброс diff-cache</b>, чтобы ближайший sync (≤30с) "
+            "сам поднял каждый лот с актуальной ценой/стоком.\n\n"
+            "<i>Реальная активация на FunPay произойдёт в течение одного "
+            "sync-цикла. Если нужно быстрее — после подтверждения нажми "
+            "«🔄 Синхронизация» в меню.</i>"
+        )
+        await self._edit_or_answer(
+            cq,
+            text,
+            reply_markup=ui.confirm_keyboard(
+                yes_data="lots_on_confirm",
+                yes_text="🟢 Да, включить все",
+                no_text="✖ Отмена",
+            ),
+        )
+
+    @_guard
+    async def _do_disable_all_lots(self, cq: CallbackQuery) -> None:
+        await cq.answer("Выключаю всё, подождите…")
+        try:
+            await self._edit_or_answer(
+                cq,
+                "⏳ Выключаю все лоты… это может занять до минуты на 30+ "
+                "маппингов (между save_lot ~400ms).",
+                reply_markup=None,
+            )
+        except Exception:
+            # Может упасть, если сообщение уже отредактировано (race с
+            # повторным кликом). Это не блокирует основную работу.
+            pass
+        result = await disable_all_mapped_lots(funpay_client=self._funpay_client)
+        text = (
+            "🔴 <b>Все лоты выключены</b>\n\n"
+            f"Маппингов всего: <b>{result.total}</b>\n"
+            f"В БД отключено: <b>{result.db_updated}</b>\n"
+            f"FunPay save_lot успешно: <b>{result.funpay_changed}</b>\n"
+            f"FunPay уже dead: <b>{result.funpay_already}</b>\n"
+            f"Ошибок: <b>{result.errors}</b>"
+        )
+        if result.errors:
+            err_ids = ", ".join(str(x) for x in result.error_lot_ids[:10])
+            more = (
+                f" и ещё {len(result.error_lot_ids) - 10}"
+                if len(result.error_lot_ids) > 10 else ""
+            )
+            text += (
+                f"\n\n⚠ Не удалось обновить на FunPay лоты: "
+                f"<code>{err_ids}</code>{more}.\n"
+                f"<i>В БД они уже выключены — sync не вернёт их в продажу. "
+                f"Зависшие на FunPay лоты подберёт zombie-reaper "
+                f"в течение ~10 минут.</i>"
+            )
+        await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
+
+    @_guard
+    async def _do_enable_all_lots(self, cq: CallbackQuery) -> None:
+        await cq.answer("Включаю всё…")
+        result = await enable_all_mapped_lots(funpay_client=self._funpay_client)
+        text = (
+            "🟢 <b>Все маппинги включены</b>\n\n"
+            f"Маппингов всего: <b>{result.total}</b>\n"
+            f"В БД активировано: <b>{result.db_updated}</b>\n\n"
+            "<i>Реальные цены/сток на FunPay поднимутся ближайшим "
+            "sync-циклом (≤30с). Хочешь сразу — нажми «🔄 Синхронизация» "
+            "в меню.</i>"
+        )
+        if result.errors:
+            err_ids = ", ".join(str(x) for x in result.error_lot_ids[:10])
+            text += (
+                f"\n\n⚠ Ошибок при сбросе diff-cache: <b>{result.errors}</b> "
+                f"(лоты: <code>{err_ids}</code>). "
+                f"Это не критично: sync всё равно их подберёт по штатному "
+                f"расписанию."
+            )
+        await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
 
     # ─────────────── пагинация (callback) ───────────────
 

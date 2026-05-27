@@ -1217,15 +1217,23 @@ async def _deliver_pins(
         # — FunPay-сток так и торчит на 97 до истечения TTL. Сбрасываем
         # last_synced_at, чтобы следующий sync-цикл (≤30с) пошёл через
         # реальный FunPay GET и поднял сток обратно к target.
-        if event.funpay_lot_id and event.funpay_lot_id > 0:
+        #
+        # ВАЖНО: используем `order.funpay_lot_id`, а НЕ `event.funpay_lot_id`.
+        # Для заказов, пришедших через chat handler / order discovery,
+        # event.funpay_lot_id может быть 0 (FunPayAPI часто не отдаёт
+        # lot_id в OrderShortcut). В таком случае мы матчили лот по
+        # описанию в _resolve_mapping, и сохранили в БД именно
+        # эффективный lot_id из mapping'а — его и используем.
+        effective_lot_id = order.funpay_lot_id or event.funpay_lot_id
+        if effective_lot_id and effective_lot_id > 0:
             try:
                 await invalidate_mapping_cache_for_funpay_lot(
-                    session, funpay_lot_id=event.funpay_lot_id
+                    session, funpay_lot_id=effective_lot_id
                 )
             except Exception as exc:
                 log.warning(
                     f"invalidate_mapping_cache_for_funpay_lot упал "
-                    f"(lot={event.funpay_lot_id}): {exc}"
+                    f"(lot={effective_lot_id}): {exc}"
                 )
         await session.commit()
 
