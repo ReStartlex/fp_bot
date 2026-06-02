@@ -32,9 +32,14 @@ MENU_KIND_NS_SEARCH = "ns_search_hint"
 MENU_KIND_SYNC = "sync"
 MENU_KIND_ORDERS = "orders"
 MENU_KIND_PROBLEMS = "problems"
+MENU_KIND_PENDING = "pending_confirm"  # заказы старше 24ч без подтверждения
 MENU_KIND_STATS = "stats"
 MENU_KIND_RECONNECT = "fp_reconnect"
 MENU_KIND_HELP = "help"
+# Batch-управление маппингами: выключить/включить все лоты сразу.
+# Подтверждение через confirm_keyboard, фактическая работа в bot._do_*.
+MENU_KIND_LOTS_DISABLE_ALL = "lots_off_all"
+MENU_KIND_LOTS_ENABLE_ALL = "lots_on_all"
 
 
 def main_menu(target_lot_label: str | None = None) -> InlineKeyboardMarkup:
@@ -72,12 +77,31 @@ def main_menu(target_lot_label: str | None = None) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📦 Заказы", callback_data=f"menu:{MENU_KIND_ORDERS}"),
-            InlineKeyboardButton(text="🧯 Проблемы", callback_data=f"menu:{MENU_KIND_PROBLEMS}"),
+            InlineKeyboardButton(
+                text="⏳ Ждут подтв.",
+                callback_data=f"menu:{MENU_KIND_PENDING}",
+            ),
         ],
         [
+            InlineKeyboardButton(text="🧯 Проблемы", callback_data=f"menu:{MENU_KIND_PROBLEMS}"),
             InlineKeyboardButton(text="📈 Прибыль", callback_data=f"menu:{MENU_KIND_STATS}"),
+        ],
+        [
             InlineKeyboardButton(
                 text="🔌 FunPay reconnect", callback_data=f"menu:{MENU_KIND_RECONNECT}"
+            ),
+        ],
+        # Аварийные кнопки batch enable/disable: одним кликом снимаем с
+        # продажи / возвращаем в продажу ВСЕ замапленные лоты. Полезно,
+        # когда NS лёг и нельзя выдавать товары.
+        [
+            InlineKeyboardButton(
+                text="🔴 Выключить все лоты",
+                callback_data=f"menu:{MENU_KIND_LOTS_DISABLE_ALL}",
+            ),
+            InlineKeyboardButton(
+                text="🟢 Включить все лоты",
+                callback_data=f"menu:{MENU_KIND_LOTS_ENABLE_ALL}",
             ),
         ],
         [
@@ -166,6 +190,27 @@ def confirm_keyboard(
 
 def single_close_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[_back_to_menu_btn(), _close_btn()]])
+
+
+def pending_confirm_kb() -> InlineKeyboardMarkup:
+    """
+    Клавиатура под последним сообщением /pending_confirm.
+
+    Добавляет верхнюю кнопку «🔄 Sync с FunPay» — она запускает
+    `sync_pending_confirmation` (см. src/orders/sync_paid.py),
+    чтобы вычистить из БД фантомные заказы, которые саппорт
+    FunPay уже подтвердил тихо. Кнопка нужна именно здесь:
+    пользователь видит мусорный список → жмёт sync → видит чистый.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔄 Sync с FunPay (чистка фантомов)",
+                callback_data="sync_pending_confirm",
+            )],
+            [_back_to_menu_btn(), _close_btn()],
+        ]
+    )
 
 
 # ─────────────── обрезка названий ───────────────

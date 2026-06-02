@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from loguru import logger
@@ -28,6 +29,7 @@ from src.db.repo import (
     list_mappings,
     reserved_quantities_by_service,
     start_sync_run,
+    update_mapping_last_synced,
 )
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
@@ -245,12 +247,129 @@ def _extract_active(lot_fields: Any) -> bool:
     return True  # консервативно считаем активным
 
 
+def _find_mapping_id_for_decision(
+    mappings: list[Any], decision: "LotSyncDecision"
+) -> int | None:
+    """Найти Mapping.id по funpay_lot_id из decision.
+
+    Линейный поиск — список маленький (десятки лотов), оптимизировать
+    через dict не имеет смысла. Возвращает None если не нашли
+    (защита от теоретического рассогласования).
+    """
+    for m in mappings:
+        if getattr(m, "funpay_lot_id", None) == decision.funpay_lot_id:
+            return getattr(m, "id", None)
+    return None
+
+
+def _compute_target_quickly(
+    *,
+    ns_service: Service | None,
+    mapping: Any,
+    settings: Settings,
+    fx_rate: float,
+    effective_markup: float,
+    effective_stock_cap: int,
+    group: Any | None,
+) -> PricingResult | None:
+    """
+    Быстрый расчёт target (price, stock) ТОЛЬКО на основе NS-данных,
+    без единого FunPay-запроса. Используется fast-path'ом diff-sync.
+
+    Если ns_service отсутствует (нет в каталоге) — возвращает None,
+    fast-path не применим, дальше пойдёт обычный путь, который вернёт
+    skip_reason="NS service_id не найден".
+    """
+    if ns_service is None:
+        return None
+    return compute_pricing(
+        ns_service=ns_service,
+        mapping=mapping,
+        settings=settings,
+        fx_rate_usd_to_target=fx_rate,
+        default_markup=effective_markup,
+        default_stock_cap=effective_stock_cap,
+        group_markup_percent=group.markup_percent if group is not None else None,
+        group_stock_cap=group.stock_cap if group is not None else None,
+    )
+
+
+def _is_cache_hit(
+    *,
+    mapping: Any,
+    target: PricingResult,
+    ttl_seconds: int,
+    now: datetime | None = None,
+) -> bool:
+    """
+    True, если target совпадает с last_synced и last_synced свежий.
+
+    Все три условия должны быть выполнены:
+      1. Cache заполнен (`last_synced_at` не NULL — иначе первый run);
+      2. Cache свежий: `now - last_synced_at < TTL` (защита от рассинхрона
+         с FunPay, если кто-то правит цены через UI вручную);
+      3. Target == cache:
+         - price (округлённая): сравниваем как float с допуском 0.005
+         - stock: int-сравнение
+         - active: bool (производное от stock > 0)
+
+    Допуск 0.005 на цену — потому что round_price() может дать
+    разный результат после floating-point round-trip через БД.
+    Stock и active — точное сравнение.
+    """
+    last_at = getattr(mapping, "last_synced_at", None)
+    last_price = getattr(mapping, "last_synced_price", None)
+    last_stock = getattr(mapping, "last_synced_stock", None)
+    last_active = getattr(mapping, "last_synced_active", None)
+
+    if last_at is None or last_price is None or last_stock is None or last_active is None:
+        return False
+
+    current_time = now or datetime.utcnow()
+    if (current_time - last_at).total_seconds() >= ttl_seconds:
+        return False
+
+    target_price = target.round_price()
+    target_stock = target.stock
+    target_active = target.stock > 0
+
+    if abs(float(last_price) - float(target_price)) > 0.005:
+        return False
+    if int(last_stock) != int(target_stock):
+        return False
+    if bool(last_active) != bool(target_active):
+        return False
+
+    return True
+
+
+class SaveLotFailed(RuntimeError):
+    """
+    FunPay save_lot вернул ответ, но это НЕ подтверждённый успех.
+
+    Бросается из `_apply_decision`, если `funpay_client.save_lot()`
+    отдал `{"ok": False, ...}` — например, исчерпание 429-retries
+    (rate-limit) или ошибка от самого FunPay в JSON-ответе.
+
+    КРИТИЧНО: до этой проверки `_apply_decision` молча возвращался
+    после save_lot, и `run_sync_once` инкрементил lots_updated даже
+    если обновление реально не прошло. Метрики r429/exhaust помогли
+    это диагностировать. Теперь fail виден как WARN + skipped++.
+    """
+
+
 async def _apply_decision(
     decision: LotSyncDecision,
     funpay_client: FunPayClient,
     settings: Settings,
 ) -> None:
-    """Применить решение к лоту на FunPay."""
+    """Применить решение к лоту на FunPay.
+
+    На fail save_lot бросает SaveLotFailed — это поймает try/except
+    в run_sync_once и инкрементнёт lots_skipped, плюс залогирует
+    WARN. Раньше fail save_lot молча проглатывался, и lots_updated
+    врал.
+    """
     lot_fields = await funpay_client.get_lot_fields(decision.funpay_lot_id)
 
     # Принципы безопасной мутации: пишем только в известные атрибуты
@@ -263,7 +382,20 @@ async def _apply_decision(
     elif decision.will_activate:
         _set_active(lot_fields, True)
 
-    await funpay_client.save_lot(lot_fields)
+    result = await funpay_client.save_lot(lot_fields)
+
+    # FunPayClient.save_lot может вернуть:
+    #   * dict с ключом "ok": bool — наш собственный admin_http.save_lot
+    #   * None (старые/мокированные клиенты) — считаем успехом
+    #   * другие типы — считаем успехом (на стороне нашего admin_http
+    #     это всегда dict, но защищаемся от изменения контракта).
+    if isinstance(result, dict) and result.get("ok") is False:
+        err = result.get("funpay_error") or result.get("json") or "unknown FunPay error"
+        http_status = result.get("http_status")
+        raise SaveLotFailed(
+            f"save_lot({decision.funpay_lot_id}) не подтвердил успех: "
+            f"http={http_status}, error={err}"
+        )
 
 
 def _set_price(lot_fields: Any, price: float) -> None:
@@ -316,7 +448,21 @@ async def sync_once(
     lots_checked = 0
     lots_updated = 0
     lots_skipped = 0
+    # diff-cache fast-path: лоты, которые НЕ потребовали FunPay GET
+    # (NS-target совпадает с last_synced и last_synced свежий).
+    # Это НЕ skipped — это «не было нужды трогать», т.е. желаемый
+    # стабильный режим. Логируется отдельным полем в "Sync done".
+    lots_unchanged = 0
+    # Счётчик «capped»: лотов, у которых NS_stock > effective_cap.
+    # Полезно для UX-диагностики: «99/100» после продажи может выглядеть
+    # как «не синхронизируется», хотя на самом деле работает корректно —
+    # просто cap=100 ограничивает выставленный stock. Высокое значение
+    # capped=N намекает что юзеру стоит увеличить cap или дать per-lot cap.
+    lots_capped = 0
     error: str | None = None
+    # Маппинги, которые нужно обновить last_synced_* после успешного цикла
+    # (только те, для которых _apply_decision прошёл без исключения).
+    pending_cache_updates: list[tuple[int, float, int, bool]] = []
 
     own_ns = ns_client is None
     own_fp = funpay_client is None
@@ -352,7 +498,7 @@ async def sync_once(
                     lots_checked=0, lots_updated=0, lots_skipped=0,
                 )
                 await session.commit()
-            return {"checked": 0, "updated": 0, "skipped": 0}
+            return {"checked": 0, "unchanged": 0, "updated": 0, "skipped": 0}
 
         stock = await ns_client.get_stock()
         services_index = _flatten_services(stock)
@@ -365,12 +511,57 @@ async def sync_once(
             f"stock_cap default {effective_stock_cap}"
         )
 
+        # Готовим diff-cache параметры заранее (читаем из settings один раз).
+        diff_cache_enabled = getattr(settings, "sync_stock_diff_cache_enabled", True)
+        diff_cache_ttl = int(getattr(settings, "sync_stock_diff_cache_ttl_seconds", 300))
+        cache_check_now = datetime.utcnow()  # фиксируем "now" для всех проверок цикла
+
         decisions: list[LotSyncDecision] = []
+
         for mapping in mappings:
             ns_service = services_index.get(mapping.ns_service_id)
             if ns_service is not None:
                 reserved = reserved_by_service.get(mapping.ns_service_id, 0)
                 ns_service = _service_with_reserved_stock(ns_service, reserved)
+
+            # === Diff-cache fast-path ===
+            # Если NS-target совпадает с last_synced и last_synced свежий —
+            # пропускаем FunPay-запрос полностью (главный источник 429-нагрузки).
+            if diff_cache_enabled:
+                quick_target = _compute_target_quickly(
+                    ns_service=ns_service,
+                    mapping=mapping,
+                    settings=settings,
+                    fx_rate=fx_rate,
+                    effective_markup=effective_markup,
+                    effective_stock_cap=effective_stock_cap,
+                    group=(
+                        groups_by_id.get(mapping.group_id)
+                        if mapping.group_id is not None else None
+                    ),
+                )
+                if quick_target is not None and _is_cache_hit(
+                    mapping=mapping,
+                    target=quick_target,
+                    ttl_seconds=diff_cache_ttl,
+                    now=cache_check_now,
+                ):
+                    label = mapping.label or f"lot {mapping.funpay_lot_id}"
+                    logger.debug(
+                        f"  [{label}] cache hit (price={quick_target.round_price()}, "
+                        f"stock={quick_target.stock}) — skip FunPay"
+                    )
+                    lots_unchanged += 1
+                    # ВАЖНО: НЕ обновляем last_synced_at при cache-hit!
+                    # TTL должен срабатывать честно — это гарантия того,
+                    # что мы периодически переоткалибруем кеш с реальным
+                    # FunPay-стоком. Иначе FunPay сам при продаже снижает
+                    # сток (100→97), наш target всё ещё 100 (cap), cache
+                    # видит совпадение и пропускает sync навсегда —
+                    # см. инцидент 2026-05-25.
+                    continue
+
+            # === Обычный путь: FunPay GET для проверки текущего состояния ===
             decision = await _decide_for_one(
                 ns_service, mapping, settings, fx_rate, funpay_client,
                 effective_markup=effective_markup,
@@ -399,13 +590,51 @@ async def sync_once(
             action_str = ", ".join(actions) if actions else "no changes"
             label = decision.label or f"lot {decision.funpay_lot_id}"
 
+            # Cap-аннотация: если NS возвращает stock больше нашего cap'а,
+            # дописываем подсказку «capped: NS=N>cap=K» в action_str.
+            # Это полезно при диагностике «висит на 99» — сразу видно
+            # что это работа cap'а, а не баг синхронизации.
+            # Поле в Service называется in_stock (а не stock); запас на
+            # случай миграции схемы — оба варианта.
+            ns_service_for_log = services_index.get(decision.ns_service_id)
+            if ns_service_for_log is not None:
+                raw_ns_stock = int(
+                    getattr(ns_service_for_log, "in_stock", None)
+                    or getattr(ns_service_for_log, "stock", 0)
+                    or 0
+                )
+                if raw_ns_stock > decision.target.stock and decision.target.stock > 0:
+                    lots_capped += 1
+                    action_str = (
+                        f"{action_str} (capped: NS={raw_ns_stock}>cap={decision.target.stock})"
+                    )
+
             if decision.skip_reason:
                 logger.warning(f"  [{label}] SKIP: {decision.skip_reason}")
                 lots_skipped += 1
                 continue
 
             if not actions:
+                # Verified no-action: FunPay-GET подтвердил, что
+                # current_price/stock на FunPay уже == target. Это идеальный
+                # момент заполнить diff-cache: на следующем цикле fast-path
+                # увидит совпадение и пропустит FunPay-GET совсем.
+                #
+                # КРИТИЧНО: этот блок ДОЛЖЕН быть ДО `continue`, иначе
+                # cache не наполнится никогда (только что нашёл этот баг
+                # в проде — `unchanged=1` всегда, потому что cache
+                # обновлялся только при save_lot success, а save_lot'ов
+                # в стабильном состоянии 0). Без этого fast-path
+                # бесполезен — все лоты вечно cache miss.
                 logger.debug(f"  [{label}] {action_str}")
+                mapping_id = _find_mapping_id_for_decision(mappings, decision)
+                if mapping_id is not None and decision.current_price is not None:
+                    pending_cache_updates.append((
+                        mapping_id,
+                        decision.target.round_price(),
+                        decision.target.stock,
+                        decision.target.stock > 0,
+                    ))
                 continue
 
             if dry_run:
@@ -416,11 +645,47 @@ async def sync_once(
                     await _apply_decision(decision, funpay_client, settings)
                     logger.success(f"  [{label}] applied: {action_str}")
                     lots_updated += 1
+                    # diff-cache: после успешного save_lot запоминаем
+                    # «новое» равновесие. КРИТИЧНО: только при success.
+                    # Если save_lot fail'нул (SaveLotFailed) — last_synced
+                    # НЕ обновляем, чтобы на следующем цикле retry прошёл
+                    # через нормальный путь (а не cache-hit).
+                    mapping_id = _find_mapping_id_for_decision(mappings, decision)
+                    if mapping_id is not None:
+                        pending_cache_updates.append((
+                            mapping_id,
+                            decision.target.round_price(),
+                            decision.target.stock,
+                            decision.target.stock > 0,
+                        ))
                 except Exception as exc:
                     logger.exception(f"  [{label}] update FAILED: {exc}")
                     lots_skipped += 1
                 # Не спамим FunPay: пауза согласно rate-limit
                 await asyncio.sleep(1.0 / settings.funpay_update_rate_limit_per_second)
+
+        # === Сохранение diff-cache: только успешные save_lot + verified-no-action ===
+        # pending_cache_updates наполняется в двух местах:
+        #   1. После успешного save_lot (мы знаем что FunPay теперь == target)
+        #   2. После verified no-action (FunPay-GET подтвердил FunPay уже == target)
+        # Cache-hits (fast-path) сюда НЕ попадают — их last_synced_at должен
+        # истекать честно через TTL, чтобы периодически переоткалибровываться.
+        if pending_cache_updates:
+            try:
+                async with session_factory()() as session:
+                    for mid, price, stock, active in pending_cache_updates:
+                        await update_mapping_last_synced(
+                            session,
+                            mapping_id=mid,
+                            price=price,
+                            stock=stock,
+                            active=active,
+                        )
+                    await session.commit()
+            except Exception as exc:  # noqa: BLE001
+                # Cache — это оптимизация, её падение не должно ломать sync.
+                # Хуже всего: следующий цикл сделает лишний FunPay GET — не катастрофа.
+                logger.warning(f"diff-cache: не удалось обновить last_synced: {exc}")
 
     except Exception as exc:
         logger.exception(f"Sync run упал: {exc}")
@@ -443,14 +708,57 @@ async def sync_once(
         )
         await session.commit()
 
-    if lots_checked > 0 or error:
-        logger.info(
+    # Снимаем HTTP-метрики FunPay за прошедший цикл (атомарно сбрасываются
+    # в admin-клиенте). Это даёт прямую видимость работы rate-limiter'a и
+    # retry-логики в проде, без необходимости grep'ать journalctl.
+    # `exhausted` > 0 — это уже инцидент (лот пропущен, нужен внимание).
+    http_metrics: dict[str, int] = {"ok": 0, "retry_429": 0, "retry_5xx": 0, "exhausted": 0}
+    if funpay_client is not None:
+        try:
+            http_metrics = funpay_client.get_and_reset_http_metrics()
+        except Exception as exc:  # noqa: BLE001
+            # метрики — это observability, они не должны ломать sync_stock
+            logger.debug(f"Sync done: не удалось снять http-метрики: {exc}")
+
+    http_str = (
+        f"http=[ok={http_metrics['ok']} "
+        f"r429={http_metrics['retry_429']} "
+        f"r5xx={http_metrics['retry_5xx']} "
+        f"fails={http_metrics['exhausted']}]"
+    )
+
+    # Total = checked + unchanged: для оператора видно сколько маппингов
+    # реально обработано (включая cache-hits, которые не идут в `checked`
+    # потому что не было «решения»).
+    total_mappings = lots_checked + lots_unchanged
+
+    # `capped=N` показываем только если N>0, чтобы не засорять обычные
+    # строки. Конкретные имена capped-лотов не пишем — это видно
+    # построчно через action_str «(capped: NS=N>cap=K)».
+    capped_suffix = f", capped={lots_capped}" if lots_capped > 0 else ""
+
+    if total_mappings > 0 or error:
+        # На exhausted'ы хотим обращать внимание — повышаем уровень до WARNING.
+        line = (
             f"Sync done: checked={lots_checked}, "
-            f"updated={lots_updated}, skipped={lots_skipped}"
+            f"unchanged={lots_unchanged}, "
+            f"updated={lots_updated}, skipped={lots_skipped}{capped_suffix}, {http_str}"
         )
+        if http_metrics["exhausted"] > 0:
+            logger.warning(line + "  (есть исчерпания retry — лоты пропущены!)")
+        else:
+            logger.info(line)
     else:
         logger.debug(
             f"Sync done (empty): checked={lots_checked}, "
-            f"updated={lots_updated}, skipped={lots_skipped}"
+            f"unchanged={lots_unchanged}, "
+            f"updated={lots_updated}, skipped={lots_skipped}{capped_suffix}, {http_str}"
         )
-    return {"checked": lots_checked, "updated": lots_updated, "skipped": lots_skipped}
+    return {
+        "checked": lots_checked,
+        "unchanged": lots_unchanged,
+        "updated": lots_updated,
+        "skipped": lots_skipped,
+        "capped": lots_capped,
+        "http": http_metrics,
+    }

@@ -126,3 +126,56 @@ async def test_send_message_raises_when_both_paths_fail():
 
     with pytest.raises(RuntimeError, match="admin broken too"):
         await fp.send_message(1, "x")
+
+
+@pytest.mark.asyncio
+async def test_send_message_raises_when_admin_http_returns_ok_false():
+    """
+    Регрессия (аудит #2): admin_http fallback может вернуть {"ok": False}
+    БЕЗ исключения (например HTTP 200 с ошибкой в теле или сетевой timeout
+    обработанный внутри admin_http). Раньше processor.py трактовал такой
+    return как успех и помечал заказ delivered, хотя сообщение НЕ дошло.
+
+    Контракт: при ok=False fallback должен бросать RuntimeError, чтобы
+    вызывающий код (processor, chat handler) видел это как обычное
+    исключение и НЕ ставил delivered.
+    """
+    fp = FunPayClient(_make_settings())
+
+    mock_account = MagicMock()
+    mock_account.send_message = MagicMock(
+        side_effect=RuntimeError("primary path broken")
+    )
+    fp._account = mock_account
+
+    fake_admin = MagicMock()
+    fake_admin.send_chat_message = AsyncMock(
+        return_value={"ok": False, "http_status": 500, "error": "server died"}
+    )
+    fp._admin_client_cache = fake_admin
+
+    with pytest.raises(RuntimeError, match="admin_http"):
+        await fp.send_message(123, "should not be considered delivered")
+
+    fake_admin.send_chat_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_send_message_returns_ok_true_from_admin_http_fallback():
+    """Граница: ok=True от fallback — всё штатно, exception НЕ поднимаем."""
+    fp = FunPayClient(_make_settings())
+
+    mock_account = MagicMock()
+    mock_account.send_message = MagicMock(
+        side_effect=RuntimeError("primary path broken")
+    )
+    fp._account = mock_account
+
+    fake_admin = MagicMock()
+    fake_admin.send_chat_message = AsyncMock(
+        return_value={"ok": True, "http_status": 200}
+    )
+    fp._admin_client_cache = fake_admin
+
+    result = await fp.send_message(123, "delivered ok")
+    assert isinstance(result, dict) and result.get("ok") is True

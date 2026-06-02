@@ -51,6 +51,25 @@ class Mapping(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
+    # === Diff-based sync cache ===
+    # Зачем: sync_stock каждые 30 сек делает 47 GET к FunPay (`get_lot_fields`)
+    # чтобы проверить, не разошлись ли наши и FunPay-цены. На практике
+    # 46 из 47 лотов НЕ меняются между циклами (в проде видно: updated=1
+    # стабильно). Эти GET зря тратят rate-limit и провоцируют 429.
+    #
+    # Решение: после успешного save_lot запоминаем `(price, stock, active)`.
+    # В следующем цикле, если target из NS совпадает с last_synced и
+    # last_synced свежий (TTL), пропускаем FunPay-запрос целиком.
+    # Раз в TTL делаем «полный» цикл — на случай если кто-то менял
+    # цены на FunPay вручную через их UI, чтобы наш cache не разъехался.
+    #
+    # NULL = «ещё не синхронизировался» (первый прогон после миграции
+    # или после ручного сброса). Fast-path в этом случае не применяется.
+    last_synced_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    last_synced_stock: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_synced_active: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
 
@@ -184,8 +203,246 @@ class Order(Base):
     profit_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     profit_margin_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="received")
-    # Возможные статусы: received, ns_created, ns_paid, delivered, failed, refunded
+    # Возможные статусы:
+    #   received → ns_created → ns_paid → pins_ready → delivering → delivered
+    #   На любом шаге: failed | refunded | manual_hold
+    #
+    # `delivering` — промежуточный статус «send_message в FunPay в процессе».
+    # Аудит #3: если crash между success send_message и commit'ом delivered,
+    # статус останется delivering, и reconciler НЕ повторит отправку
+    # автоматически (риск дубля), а переведёт в manual_hold для оператора.
     pins_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Описание лота как пришло из FunPay-события. Нужно reconciler'у,
+    # чтобы после рестарта он мог повторно сматчить маппинг по
+    # описанию (если funpay_lot_id=0 — старый формат событий без lot_id).
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # === Подтверждение успешного выполнения заказа ===
+    # FunPay шлёт системное сообщение когда покупатель ИЛИ администратор
+    # support'а нажимает «подтвердить выполнение» (после 24ч ожидания
+    # покупатель может попросить саппорт сделать это вручную; ~50% наших
+    # клиентов сами никогда не подтверждают).
+    #
+    # confirmed_at = когда пришло системное сообщение от FunPay (UTC)
+    # confirmed_by = кто подтвердил: "buyer" (сам покупатель) или
+    #                "admin" (саппорт FunPay по нашему запросу)
+    #                NULL = ещё не подтверждён.
+    #
+    # Используется командой /pending_confirm в Telegram-боте: список
+    # заказов status=delivered, прошло >24ч, confirmed_at=NULL —
+    # это именно те заказы, которые нужно отправить в саппорт.
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    confirmed_by: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+# ════════════════════════════════════════════════════════════════════════
+#                    Phase 1: TG-shop модели
+# ════════════════════════════════════════════════════════════════════════
+# Все таблицы префикс shop_, чтобы аналитика и backup отделяли их от
+# FunPay-pipeline. Живут в той же bridge.db (один engine, один backup).
+# Деньги — в копейках Integer, чтобы не накапливать float-погрешность
+# на 1%-кэшбэке и многократных списаниях/начислениях.
+
+
+class ShopUser(Base):
+    """Покупатель в Telegram-магазине."""
+    __tablename__ = "shop_users"
+    __table_args__ = (UniqueConstraint("telegram_user_id", name="uq_shop_users_tg"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    telegram_username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    first_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    language_code: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+
+    # Внутренний баланс (кэшбэк, рефуанды). Храним в копейках, чтобы
+    # 1%-начисления не накапливали float-погрешность.
+    balance_kopecks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Кто пригласил (FK на shop_users.id). Null = пришёл сам.
+    # Дублирует ShopReferral.referrer_user_id для быстрых выборок без JOIN,
+    # но source-of-truth — таблица ShopReferral (там UNIQUE constraint).
+    referred_by_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # Если оператор забанил клиента (например, попытка чарджбэка).
+    blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class ShopReferral(Base):
+    """
+    Связь реферал → пригласивший. Один реферал = один inviter навсегда.
+    UNIQUE по referred_user_id защищает от перепривязки и двойных начислений
+    при попытке повторно «зарегистрироваться по чужой ссылке».
+    """
+    __tablename__ = "shop_referrals"
+    __table_args__ = (UniqueConstraint("referred_user_id", name="uq_shop_referrals_referred"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    referrer_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    referred_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+
+
+class ShopOrder(Base):
+    """
+    Заказ из shop-бота, который идёт в NS.
+
+    Жизненный цикл:
+        draft → awaiting_payment → paid → ns_created → ns_paid
+              → delivering → delivered
+        На любом шаге: payment_failed | failed | manual_hold | refunded
+
+    Idempotency: ns_custom_id = f"shop-{shop_order.id}", уникален навсегда.
+    Перед NS.create_order() processor вызывает NS.order_info(custom_id):
+    если заказ уже есть в NS, переиспользуем его (защита от двойной NS-покупки).
+    """
+    __tablename__ = "shop_orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # Snapshot карточки NS на момент покупки (на случай если NS уберёт услугу).
+    ns_service_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    ns_service_name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # Поля для NS create_order — JSON-список dict'ов.
+    fields_json: Mapped[str] = mapped_column(Text, nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+    # Что мы реально взяли с покупателя (копейки RUB).
+    total_rub_kopecks: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Сколько списано с внутреннего баланса покупателя.
+    balance_used_kopecks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Сколько ушло во внешнюю оплату (CryptoBot/Stars).
+    # external_paid = total - balance_used; держим явно для устойчивости
+    # к расхождениям с провайдером (если фактически списали меньше — увидим).
+    external_paid_kopecks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Snapshot для post-mortem аналитики.
+    ns_price_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    fx_rate_at_sale: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    markup_percent_at_sale: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # NS pipeline (заполняется processor'ом).
+    ns_custom_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    ns_order_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    pins_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Метод внешней оплаты (cryptobot|stars|balance_only).
+    payment_method: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+    paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class ShopPayment(Base):
+    """
+    Внешний платёж за shop-заказ (CryptoBot / Telegram Stars).
+    UNIQUE(provider, provider_invoice_id) защищает от replay-атаки webhook'а:
+    даже если CryptoBot пришлёт нам один и тот же invoice дважды, INSERT
+    упадёт и мы не зачислим деньги повторно.
+    """
+    __tablename__ = "shop_payments"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "provider_invoice_id",
+            name="uq_shop_payments_provider_invoice",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Sprint 3: nullable, потому что у top-up'ов нет привязки к заказу;
+    # user_id мы храним в raw_payload_json.topup_user_id (см. repo).
+    # У checkout-платежей (Sprint 3.5+) order_id будет задан.
+    order_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)  # cryptobot | stars
+    provider_invoice_id: Mapped[str] = mapped_column(String(128), nullable=False)
+
+    amount_kopecks: Mapped[int] = mapped_column(Integer, nullable=False)
+    currency: Mapped[str] = mapped_column(String(8), nullable=False, default="RUB")
+
+    # pending | paid | expired | failed
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    raw_payload_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Текст ошибки если status=failed (например, "expired" / "rejected_by_user").
+    error: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class ShopBalanceLedger(Base):
+    """
+    Журнал движений внутреннего баланса (append-only, double-entry-аудит).
+
+    Контракт: сумма всех change_kopecks для user_id ≡ ShopUser.balance_kopecks.
+    Любой код, который меняет shop_users.balance_kopecks, ОБЯЗАН добавить
+    запись в ledger в той же транзакции. Это даёт нам аудит-trail для
+    спорных кейсов («куда делись мои 50₽?») и инвариант для тестов.
+    """
+    __tablename__ = "shop_balance_ledger"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # +N (начисление) или -N (списание). Никогда не 0.
+    change_kopecks: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # referral_cashback | order_payment | refund | manual_admin
+    reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    related_order_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    note: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+
+
+class ShopCatalogCache(Base):
+    """
+    Snapshot каталога NS, обновляется фоновым воркером раз в
+    shop_catalog_refresh_seconds. UI бота читает только отсюда — мгновенный
+    ответ. Если воркер упал, кеш «стареет», но не пустеет, и shop продолжает
+    продавать по последним известным ценам (с алертом владельцу в Telegram).
+    """
+    __tablename__ = "shop_catalog_cache"
+
+    ns_service_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    category_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    category_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    service_name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # «Базовое» имя категории — то, что до первого `|`. Используется для
+    # группировки региональных/платформенных вариантов в UI:
+    # «Apple Gift Card | US», «Apple Gift Card | EU» → одна группа.
+    # См. src/shop/taxonomy.py.
+    base_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    # Стабильный 10-символьный hash от base_name. Используется как ключ
+    # в Telegram callback_data (sha1[:10], коллизия маловероятна).
+    group_slug: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+
+    ns_price_usd: Mapped[float] = mapped_column(Float, nullable=False)
+    rub_price_kopecks: Mapped[int] = mapped_column(Integer, nullable=False)
+    in_stock: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Схема полей для NS create_order — JSON-список FieldType dict'ов.
+    # Нужна на checkout: показываем форму "введите email" / "введите username".
+    fields_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Управляется оператором: если NS-услуга проблемная — выключаем тут,
+    # покупатели не увидят её в каталоге.
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )

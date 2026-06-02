@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Optional
@@ -45,6 +46,7 @@ from src.db.models import KnownLot, Mapping, Order
 from src.db.repo import (
     create_order,
     find_order_by_funpay_id,
+    invalidate_mapping_cache_for_funpay_lot,
     update_order,
 )
 from src.db.session import session_factory
@@ -54,9 +56,10 @@ from src.ns import NSClient
 from src.ns.exceptions import (
     NSError,
     NSInsufficientFunds,
+    NSNotFoundError,
     NSOrderTimeoutError,
 )
-from src.ns.models import OrderStatus
+from src.ns.models import OrderInfo, OrderStatus
 from src.sync.fx import get_usd_rub_rate
 
 
@@ -292,6 +295,143 @@ def _pins_from_order(order: Order) -> list:
     return data if isinstance(data, list) else []
 
 
+def _order_age_seconds(order: Order, *, now: datetime | None = None) -> float:
+    """Сколько секунд прошло от Order.created_at. naive UTC, как и весь проект."""
+    current = now or datetime.utcnow()
+    return max(0.0, (current - order.created_at).total_seconds())
+
+
+def _is_hard_timeout(
+    order: Order, settings: Settings, *, now: datetime | None = None
+) -> bool:
+    """True если истёк жёсткий лимит на полный цикл received→delivered."""
+    limit = settings.order_delivery_hard_timeout_seconds
+    if limit <= 0:
+        return False
+    return _order_age_seconds(order, now=now) >= limit
+
+
+def _is_valid_uuid4(value: str | None) -> bool:
+    """
+    Истина если value — корректный UUID4-string в каноническом формате.
+
+    NS API проверяет custom_id регуляркой uuid4 (8-4-4-4-12, version=4),
+    поэтому нам недостаточно `uuid.UUID(value)` — он принимает и v5/v3/v1.
+    UUID версия кодируется в 13-м hex-символе: для v4 это всегда `4`.
+    """
+    if not value:
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return parsed.version == 4
+
+
+async def _ns_check_existing_order(
+    ns_client: NSClient,
+    custom_id: str,
+    log,
+) -> OrderInfo | None:
+    """Аудит #1: idempotency-проверка существования NS-заказа.
+
+    Возвращает OrderInfo если заказ уже существует в NS, иначе None.
+    404 — заказа нет (можно безопасно создавать). Любая другая ошибка
+    логируется и трактуется как «не знаем» → None (продолжим create/pay
+    как обычно; deterministic custom_id защитит от UUID-дубля при retry).
+    """
+    try:
+        return await ns_client.order_info(custom_id)
+    except NSNotFoundError:
+        return None
+    except NSError as exc:
+        log.warning(
+            f"NS idempotency check для {custom_id} упал: {exc}; "
+            "продолжаю обычным путём"
+        )
+        return None
+
+
+async def _trigger_manual_hold(
+    *,
+    funpay_order_id: str,
+    stage: str,
+    reason: str,
+    funpay_client: FunPayClient | None,
+    telegram: TelegramNotifier | None,
+    log,
+) -> dict:
+    """
+    Перевести заказ в manual_hold по hard-timeout / NS-timeout.
+
+    Что делает (в этом порядке):
+      1) update_order(status='manual_hold', error=reason) — атомарно;
+      2) пихает алерт в Telegram с кнопками retry/done/details;
+      3) аварийно выключает FunPay-лот, чтобы новые покупатели не
+         попадали на тот же узкий участок;
+      4) возвращает stable-словарь {status: manual_hold, reason, ...}
+         для возврата из process_funpay_order.
+
+    Безопасно вызывать многократно: повторный manual_hold для уже
+    held заказа просто перепишет error/timestamp, дублирующий
+    Telegram-алерт оператор просто проигнорирует.
+    """
+    has_pins = False
+    ns_custom_id: str | None = None
+    buyer_username: str | None = None
+    funpay_lot_id: int | None = None
+    age_seconds = 0
+    async with session_factory()() as session:
+        order = await find_order_by_funpay_id(session, funpay_order_id)
+        if order is not None:
+            await update_order(
+                session,
+                order,
+                status="manual_hold",
+                error=f"{stage}: {reason}",
+            )
+            await session.commit()
+            has_pins = bool(_pins_from_order(order))
+            ns_custom_id = order.ns_custom_id
+            buyer_username = order.buyer_username
+            funpay_lot_id = order.funpay_lot_id
+            age_seconds = int(_order_age_seconds(order))
+
+    if telegram is not None:
+        try:
+            await telegram.manual_hold_required(
+                funpay_order_id=funpay_order_id,
+                stage=stage,
+                age_seconds=age_seconds,
+                buyer_username=buyer_username,
+                ns_custom_id=ns_custom_id,
+                has_pins=has_pins,
+                reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001 — diagnostics, alert не критичен
+            log.warning(f"Не смог отправить manual_hold alert в Telegram: {exc}")
+
+    await _emergency_disable_lot(
+        funpay_lot_id,
+        funpay_client,
+        telegram,
+        reason=f"manual_hold ({stage}): {reason}",
+        log=log,
+    )
+
+    log.warning(
+        f"manual_hold выставлен: stage={stage}, age={age_seconds}s, "
+        f"ns_custom_id={ns_custom_id}, has_pins={has_pins}, reason={reason}"
+    )
+    return {
+        "status": "manual_hold",
+        "reason": reason,
+        "stage": stage,
+        "ns_custom_id": ns_custom_id,
+        "has_pins": has_pins,
+    }
+
+
 async def _should_hold_delivery(
     session,
     order: Order,
@@ -458,6 +598,7 @@ async def _process_locked(
                 chat_id=event.chat_id,
                 quantity=event.quantity,
                 funpay_price_rub=event.funpay_price_rub,
+                description=event.description,
             )
             await update_order(session, order, status="failed", error=reason)
             await session.commit()
@@ -489,12 +630,28 @@ async def _process_locked(
             chat_id=event.chat_id,
             quantity=event.quantity,
             funpay_price_rub=event.funpay_price_rub,
+            description=event.description,
         )
         await session.commit()
         db_order_id = db_order.id
         order_status = db_order.status
         existing_ns_custom_id = db_order.ns_custom_id
         existing_ns_price_usd = db_order.ns_price_usd
+        existing_age_seconds = _order_age_seconds(db_order)
+
+    if not force_delivery and _is_hard_timeout(db_order, settings):
+        return await _trigger_manual_hold(
+            funpay_order_id=event.funpay_order_id,
+            stage="before_ns_purchase",
+            reason=(
+                f"hard timeout: заказу {int(existing_age_seconds)}s, "
+                f"лимит {settings.order_delivery_hard_timeout_seconds}s; "
+                "автопокупка остановлена"
+            ),
+            funpay_client=funpay_client,
+            telegram=telegram,
+            log=log,
+        )
 
     # Если продавец уже вмешался вручную после оплаты, не покупаем код в NS:
     # это дешевле и безопаснее, чем купить pins и остановиться только перед доставкой.
@@ -569,23 +726,63 @@ async def _process_locked(
                 )
                 return {"status": "failed", "reason": error_text}
 
-            try:
-                created = await ns_client.create_order(
-                    service_id=mapping.ns_service_id, fields=ns_fields
-                )
-            except NSError as exc:
-                error_text = f"NS create_order упал: {exc}"
-                log.error(error_text)
-                await _mark_failed(
-                    db_order_id, error_text, telegram, event,
-                    funpay_client=funpay_client,
-                    funpay_lot_id=effective_funpay_lot_id,
-                    log=log,
-                )
-                return {"status": "failed", "reason": error_text}
+            # Аудит #1: idempotency NS create_order.
+            # 1) UUID4 custom_id, генерируется ОДИН раз и сразу пишется в БД
+            #    — при retry мы возьмём этот же UUID и обратимся к ТОМУ ЖЕ
+            #    NS-заказу, никакого UUID-дубля.
+            #    NB: до 2026-05-25 здесь была детерминистическая схема
+            #    `fp-{funpay_order_id}`, но NS обновил валидацию и теперь
+            #    требует строго UUID4 ({400, custom_id must be a valid UUID4}).
+            # 2) Intent marker: сохраняем UUID в БД ДО вызова NS, чтобы при
+            #    crash до ответа retry уже знал, какой id проверять.
+            # 3) Pre-check `order_info`: если предыдущий attempt успел дойти
+            #    до NS — пропускаем create.
+            if ns_custom_id is None or not _is_valid_uuid4(ns_custom_id):
+                # Либо новый заказ, либо в БД остался legacy "fp-..." id
+                # (с предыдущей версии кода). В обоих случаях генерим UUID4
+                # и перезаписываем — старый "fp-..." не существует в NS,
+                # обращение к нему по order_info даст 404 / валидационную
+                # ошибку. Перегенерация безопасна, потому что create_order
+                # для legacy-id всё равно бы провалился с 400.
+                if ns_custom_id is not None:
+                    log.warning(
+                        f"legacy ns_custom_id={ns_custom_id!r} в БД не UUID4 — "
+                        "перегенерирую"
+                    )
+                ns_custom_id = NSClient.new_custom_id()
+            async with session_factory()() as session:
+                db_order = await find_order_by_funpay_id(session, event.funpay_order_id)
+                assert db_order is not None
+                if db_order.ns_custom_id != ns_custom_id:
+                    await update_order(session, db_order, ns_custom_id=ns_custom_id)
+                    await session.commit()
 
-            ns_custom_id = created.custom_id
-            ns_price_usd = float(created.total_to_pay)
+            pre_info = await _ns_check_existing_order(ns_client, ns_custom_id, log)
+            if pre_info is not None:
+                log.info(
+                    f"NS idempotency: заказ {ns_custom_id} уже существует "
+                    f"(status={pre_info.status_enum}), create пропускаю"
+                )
+                if pre_info.total_price is not None:
+                    ns_price_usd = float(pre_info.total_price)
+            else:
+                try:
+                    created = await ns_client.create_order(
+                        service_id=mapping.ns_service_id,
+                        fields=ns_fields,
+                        custom_id=ns_custom_id,
+                    )
+                except NSError as exc:
+                    error_text = f"NS create_order упал: {exc}"
+                    log.error(error_text)
+                    await _mark_failed(
+                        db_order_id, error_text, telegram, event,
+                        funpay_client=funpay_client,
+                        funpay_lot_id=effective_funpay_lot_id,
+                        log=log,
+                    )
+                    return {"status": "failed", "reason": error_text}
+                ns_price_usd = float(created.total_to_pay)
             log.info(
                 f"NS create_order: custom_id={ns_custom_id}, "
                 f"к оплате={ns_price_usd:.4f} USD"
@@ -617,10 +814,16 @@ async def _process_locked(
         # ─── 7. NS pay_order (если ещё не оплачен) ───
         pins: list = []
         if order_status == "ns_created":
-            try:
-                pay_resp = await ns_client.pay_order(ns_custom_id)
-            except NSInsufficientFunds as exc:
-                error_text = f"Недостаточно средств на NS: balance={exc.balance}"
+            # Аудит #1: idempotency pay_order. Pre-check `order_info`:
+            # если предыдущий pay уже дошёл до NS (status != CREATED),
+            # повторный pay не нужен — переиспользуем существующий статус.
+            # Это предотвращает потенциальное двойное списание.
+            pre_info = await _ns_check_existing_order(ns_client, ns_custom_id, log)
+            pre_status = pre_info.status_enum if pre_info is not None else None
+
+            if pre_status in (OrderStatus.REFUNDED, OrderStatus.CANCELLED):
+                msg = pre_info.status_message if pre_info else ""
+                error_text = f"NS вернул возврат/отмену (idempotency check): {msg}"
                 log.error(error_text)
                 await _mark_failed(
                     db_order_id, error_text, telegram, event,
@@ -629,18 +832,38 @@ async def _process_locked(
                     log=log,
                 )
                 return {"status": "failed", "reason": error_text}
-            except NSError as exc:
-                error_text = f"NS pay_order упал: {exc}"
-                log.error(error_text)
-                await _mark_failed(
-                    db_order_id, error_text, telegram, event,
-                    funpay_client=funpay_client,
-                    funpay_lot_id=effective_funpay_lot_id,
-                    log=log,
+
+            if pre_status in (OrderStatus.IN_PROGRESS, OrderStatus.COMPLETED):
+                log.info(
+                    f"NS idempotency: pay_order пропускаю — заказ "
+                    f"{ns_custom_id} уже в статусе {pre_status.name}"
                 )
-                return {"status": "failed", "reason": error_text}
-            log.info(f"NS pay_order: status={pay_resp.status}")
-            pins = list(pay_resp.pins or [])
+                pins = list(pre_info.pins or []) if pre_info else []
+            else:
+                try:
+                    pay_resp = await ns_client.pay_order(ns_custom_id)
+                except NSInsufficientFunds as exc:
+                    error_text = f"Недостаточно средств на NS: balance={exc.balance}"
+                    log.error(error_text)
+                    await _mark_failed(
+                        db_order_id, error_text, telegram, event,
+                        funpay_client=funpay_client,
+                        funpay_lot_id=effective_funpay_lot_id,
+                        log=log,
+                    )
+                    return {"status": "failed", "reason": error_text}
+                except NSError as exc:
+                    error_text = f"NS pay_order упал: {exc}"
+                    log.error(error_text)
+                    await _mark_failed(
+                        db_order_id, error_text, telegram, event,
+                        funpay_client=funpay_client,
+                        funpay_lot_id=effective_funpay_lot_id,
+                        log=log,
+                    )
+                    return {"status": "failed", "reason": error_text}
+                log.info(f"NS pay_order: status={pay_resp.status}")
+                pins = list(pay_resp.pins or [])
             async with session_factory()() as session:
                 db_order = await find_order_by_funpay_id(session, event.funpay_order_id)
                 assert db_order is not None
@@ -650,18 +873,72 @@ async def _process_locked(
 
         # ─── 8. Получаем pins (если ещё не получили) ───
         if order_status == "ns_paid" and not pins:
+            # wait_order_completion внутри сам поллит NS до своего timeout'a
+            # (NS_ORDER_TIMEOUT_SECONDS). Мы дополнительно усекаем его до
+            # остатка до hard-timeout, чтобы не уходить за общий лимит
+            # цикла received→delivered. min_wait = 10s, чтобы хотя бы один
+            # poll-цикл успел отработать; иначе сразу manual_hold.
+            wait_timeout: float | None = None
+            if settings.order_delivery_hard_timeout_seconds > 0:
+                async with session_factory()() as session:
+                    fresh = await find_order_by_funpay_id(
+                        session, event.funpay_order_id
+                    )
+                assert fresh is not None
+                age = _order_age_seconds(fresh)
+                remaining = (
+                    settings.order_delivery_hard_timeout_seconds - age
+                )
+                if remaining <= 10:
+                    return await _trigger_manual_hold(
+                        funpay_order_id=event.funpay_order_id,
+                        stage="ns_wait_completion",
+                        reason=(
+                            f"hard timeout до старта ожидания pins: "
+                            f"age={int(age)}s, "
+                            f"лимит={settings.order_delivery_hard_timeout_seconds}s"
+                        ),
+                        funpay_client=funpay_client,
+                        telegram=telegram,
+                        log=log,
+                    )
+                wait_timeout = min(
+                    float(settings.ns_order_timeout_seconds), remaining
+                )
             try:
-                info = await ns_client.wait_order_completion(ns_custom_id)
+                info = await ns_client.wait_order_completion(
+                    ns_custom_id, timeout_seconds=wait_timeout
+                )
             except NSOrderTimeoutError as exc:
-                error_text = f"NS заказ не завершился по тайм-ауту: {exc}"
-                log.error(error_text)
-                await _mark_failed(
-                    db_order_id, error_text, telegram, event,
+                # Деньги уже списаны в NS, но pins не пришли вовремя.
+                # Это ровно тот сценарий, где нужен оператор: проверить
+                # NS-кабинет/саппорт и решить, выдавать ли вручную.
+                reason = f"NS не выдал коды за тайм-аут: {exc}"
+                log.error(reason)
+                return await _trigger_manual_hold(
+                    funpay_order_id=event.funpay_order_id,
+                    stage="ns_wait_completion",
+                    reason=reason,
                     funpay_client=funpay_client,
-                    funpay_lot_id=effective_funpay_lot_id,
+                    telegram=telegram,
                     log=log,
                 )
-                return {"status": "failed", "reason": error_text}
+            except NSError as exc:
+                # Аудит #6: NSAPIError (429 после retry-исчерпания, 5xx,
+                # 4xx и т.п.) ПОСЛЕ pay_order. Деньги уже списаны, pins
+                # не получены — оператор должен решить через Telegram.
+                # До фикса: исключение вылетало наверх, статус оставался
+                # ns_paid, никакого алерта.
+                reason = f"NS вернул ошибку при ожидании pins: {exc}"
+                log.error(reason)
+                return await _trigger_manual_hold(
+                    funpay_order_id=event.funpay_order_id,
+                    stage="ns_wait_completion",
+                    reason=reason,
+                    funpay_client=funpay_client,
+                    telegram=telegram,
+                    log=log,
+                )
             if info.status_enum == OrderStatus.COMPLETED and info.pins:
                 pins = list(info.pins)
             elif info.status_enum in (OrderStatus.REFUNDED, OrderStatus.CANCELLED):
@@ -691,6 +968,26 @@ async def _process_locked(
         async with session_factory()() as session:
             db_order = await find_order_by_funpay_id(session, event.funpay_order_id)
             assert db_order is not None
+            # Hard-timeout сразу после получения pins: pins на руках,
+            # но мы переползли общий лимит. Сначала сохраняем pins
+            # отдельным flush'ом, чтобы они не потерялись, а статус и
+            # alert ставит _trigger_manual_hold ниже.
+            if not force_delivery and _is_hard_timeout(db_order, settings):
+                age_now = int(_order_age_seconds(db_order))
+                await update_order(session, db_order, pins=pins)
+                await session.commit()
+                return await _trigger_manual_hold(
+                    funpay_order_id=event.funpay_order_id,
+                    stage="post_pins_pre_delivery",
+                    reason=(
+                        f"hard timeout с pins на руках: age={age_now}s, "
+                        f"лимит={settings.order_delivery_hard_timeout_seconds}s; "
+                        f"pins сохранены, нажми Retry для доставки"
+                    ),
+                    funpay_client=funpay_client,
+                    telegram=telegram,
+                    log=log,
+                )
             if (
                 not force_delivery
                 and await _should_hold_delivery(
@@ -768,6 +1065,26 @@ async def _deliver_pins(
 
     async with session_factory()() as session:
         latest = await find_order_by_funpay_id(session, event.funpay_order_id)
+        # ── Защита от гонки с оператором ──
+        # Между моментом, когда мы вошли в _deliver_pins, и моментом
+        # send_message, оператор мог в Telegram нажать «✅ Выдано вручную»
+        # (или «Retry» с уже delivered'нутыми pins). В этом случае
+        # автоматическая повторная отправка = дубль = потеря денег.
+        # Гард срабатывает ДАЖЕ при force_delivery: если оператор уже
+        # пометил выдано вручную, никакой Retry не должен переотправить.
+        if latest is not None and latest.status == "delivered":
+            log.warning(
+                "Заказ уже delivered (вероятно оператор подтвердил вручную) — "
+                "не отправляю pins повторно (force_delivery="
+                f"{force_delivery})"
+            )
+            return {
+                "status": "delivered",
+                "ns_custom_id": ns_custom_id,
+                "pins_count": len(pins),
+                "skipped": True,
+                "reason": "already delivered by operator",
+            }
         if (
             latest is not None
             and not force_delivery
@@ -823,10 +1140,28 @@ async def _deliver_pins(
             "reason": "no funpay client or chat_id",
         }
 
+    # Аудит #3: двухфазная доставка. ДО send_message — статус `delivering`.
+    # Это intent-marker «попытка отправки в процессе». Если процесс упадёт
+    # между success send_message и commit'ом delivered, статус останется
+    # delivering, и reconciler НЕ повторит отправку автоматически
+    # (риск двойной выдачи) — переведёт в manual_hold для оператора.
+    async with session_factory()() as session:
+        order = await find_order_by_funpay_id(session, event.funpay_order_id)
+        if order is not None:
+            await update_order(session, order, status="delivering")
+            await session.commit()
+
     try:
         await funpay_client.send_message(event.chat_id, delivery_text)
     except Exception as exc:
-        log.error(f"Доставка в чат FunPay упала: {exc}; статус остаётся pins_ready")
+        # send_message бросил — сообщение НЕ ушло. Безопасно откатить
+        # на pins_ready, чтобы reconciler/Retry могли попробовать ещё раз.
+        log.error(f"Доставка в чат FunPay упала: {exc}; откат на pins_ready")
+        async with session_factory()() as session:
+            order = await find_order_by_funpay_id(session, event.funpay_order_id)
+            if order is not None and order.status == "delivering":
+                await update_order(session, order, status="pins_ready")
+                await session.commit()
         await _emergency_disable_lot(
             db_order.funpay_lot_id,
             funpay_client,
@@ -876,6 +1211,30 @@ async def _deliver_pins(
             profit_rub=profit_rub,
             profit_margin_percent=profit_margin_percent,
         )
+        # Инвалидация diff-cache. FunPay при продаже САМ списывает сток
+        # (100→97), наш target = min(NS, cap) = 100 не меняется, поэтому
+        # без инвалидации diff-cache видит совпадение и пропускает sync
+        # — FunPay-сток так и торчит на 97 до истечения TTL. Сбрасываем
+        # last_synced_at, чтобы следующий sync-цикл (≤30с) пошёл через
+        # реальный FunPay GET и поднял сток обратно к target.
+        #
+        # ВАЖНО: используем `order.funpay_lot_id`, а НЕ `event.funpay_lot_id`.
+        # Для заказов, пришедших через chat handler / order discovery,
+        # event.funpay_lot_id может быть 0 (FunPayAPI часто не отдаёт
+        # lot_id в OrderShortcut). В таком случае мы матчили лот по
+        # описанию в _resolve_mapping, и сохранили в БД именно
+        # эффективный lot_id из mapping'а — его и используем.
+        effective_lot_id = order.funpay_lot_id or event.funpay_lot_id
+        if effective_lot_id and effective_lot_id > 0:
+            try:
+                await invalidate_mapping_cache_for_funpay_lot(
+                    session, funpay_lot_id=effective_lot_id
+                )
+            except Exception as exc:
+                log.warning(
+                    f"invalidate_mapping_cache_for_funpay_lot упал "
+                    f"(lot={effective_lot_id}): {exc}"
+                )
         await session.commit()
 
     if telegram is not None:
@@ -954,6 +1313,9 @@ async def _emergency_disable_lot(
             )
         return False
 
+    funpay_disabled = False
+    funpay_error: str | None = None
+
     try:
         lot_fields = await funpay_client.get_lot_fields(funpay_lot_id)
         if hasattr(lot_fields, "active"):
@@ -963,6 +1325,20 @@ async def _emergency_disable_lot(
         result = await funpay_client.save_lot(lot_fields)
         if isinstance(result, dict) and result.get("ok") is False:
             raise RuntimeError(result)
+        funpay_disabled = True
+    except Exception as exc:
+        funpay_error = str(exc)
+        if log is not None:
+            log.opt(exception=exc).error(
+                f"Не смог аварийно выключить FunPay-лот {funpay_lot_id}: {exc}"
+            )
+
+    # Аудит #8: даже если save_lot на FunPay упал, отключаем mapping в БД.
+    # Иначе sync_stock на следующем цикле увидит mapping.enabled=True и
+    # «починит» лот обратно — проблемный лот продолжит продаваться,
+    # копируя новые failed-заказы.
+    mapping_disabled_in_db = False
+    try:
         async with session_factory()() as session:
             mapping = (
                 await session.execute(
@@ -972,15 +1348,26 @@ async def _emergency_disable_lot(
             if mapping is not None and mapping.enabled:
                 mapping.enabled = False
                 await session.commit()
+                mapping_disabled_in_db = True
     except Exception as exc:
         if log is not None:
             log.opt(exception=exc).error(
-                f"Не смог аварийно выключить FunPay-лот {funpay_lot_id}: {exc}"
+                f"Не смог отключить mapping в БД для FunPay-лота "
+                f"{funpay_lot_id}: {exc}"
             )
+
+    if not funpay_disabled:
         if telegram is not None:
+            extra = (
+                "Локальный mapping отключён — sync лот обратно не включит, "
+                "но вручную через FunPay UI лот всё ещё активен."
+                if mapping_disabled_in_db
+                else "ВНИМАНИЕ: и mapping в БД отключить не удалось."
+            )
             await telegram.error(
                 f"🚨 Не смог аварийно выключить FunPay-лот "
-                f"<code>{funpay_lot_id}</code>: <code>{str(exc)[:300]}</code>"
+                f"<code>{funpay_lot_id}</code>: "
+                f"<code>{(funpay_error or '?')[:300]}</code>. {extra}"
             )
         return False
 

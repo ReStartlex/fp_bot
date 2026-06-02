@@ -170,21 +170,33 @@ def post_review(buyer: str | None, lang: Lang | None = None) -> str:
 def order_confirmed_review_request(
     buyer: str | None, lang: Lang | None = None
 ) -> str:
-    """Шлём после системного сообщения FunPay о подтверждении заказа."""
+    """
+    Шлём после системного сообщения FunPay о подтверждении заказа
+    (как от покупателя, так и от админа саппорта).
+
+    Цель текста — мягко мотивировать на отзыв, не давить. Эмодзи и
+    «человечный» тон работают лучше формального «спасибо за покупку».
+    Конкретика «пары слов достаточно» снимает у клиента ощущение
+    «нужно писать сочинение» — это критично для конверсии в отзыв.
+    """
     lang = lang or _lang()
     name = _addr(buyer)
     if lang == "en":
         return (
-            f"💚 {name}, thanks for confirming the order!\n"
-            f"✨ I'm glad everything went smoothly.\n"
-            f"⭐ If you liked the service, a short review on FunPay would "
-            f"help me a lot. Have a great day!"
+            f"💚 Huge thanks for confirming the order, {name}!\n"
+            f"✨ Really glad everything went smoothly.\n\n"
+            f"⭐ If the service was good — even a couple of words "
+            f"in a FunPay review would help me a lot. "
+            f"It takes 10 seconds, but means the world to me 🙏\n\n"
+            f"🤝 Need anything else? Just ping me here, always happy to help!"
         )
     return (
-        f"💚 {name}, спасибо за подтверждение заказа!\n"
-        f"✨ Очень рад, что всё прошло успешно.\n"
-        f"⭐ Если сервис понравился, буду очень благодарен за короткий "
-        f"отзыв на FunPay. Хорошего дня!"
+        f"💚 {name}, огромное спасибо за подтверждение заказа!\n"
+        f"✨ Очень рад, что всё прошло гладко.\n\n"
+        f"⭐ Если сервис понравился — оставьте, пожалуйста, "
+        f"короткий отзыв на FunPay. Буквально пары слов достаточно, "
+        f"а для меня это очень важно 🙏\n\n"
+        f"🤝 Будут вопросы или ещё что-то понадобится — пишите, всегда рад!"
     )
 
 

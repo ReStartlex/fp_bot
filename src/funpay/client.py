@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from dataclasses import dataclass, field
 from typing import Any, Callable, TypeVar
 
 from loguru import logger
@@ -16,6 +17,47 @@ from src.config import Settings, get_settings
 
 
 T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class RecentSale:
+    """Лёгкая нормализация FunPayAPI OrderShortcut для discovery.
+
+    Используется `get_recent_sales` и order discovery polling. Мы вытаскиваем
+    только то, что реально нужно processor'у; всё неважное в OrderShortcut
+    (html, subcategory, date, currency и т.п.) выбрасываем — чем меньше surface,
+    тем меньше падений при обновлениях FunPayAPI.
+    """
+    order_id: str
+    status: str  # 'paid' | 'closed' | 'refunded' | прочее
+    buyer_username: str | None = None
+    buyer_user_id: int | None = None
+    funpay_lot_id: int = 0
+    quantity: int = 1
+    price_rub: float | None = None
+    description: str | None = None
+
+
+@dataclass(frozen=True)
+class PaidSalesSnapshot:
+    """Результат `get_paid_sales_snapshot`.
+
+    Аудит #7: чтобы `sync_pending_confirmation` мог отличить "точно
+    весь список оплачённых заказов" от "пагинация оборвалась, могут
+    быть пропущены" — иначе под флагом «авто-confirmed» закрываются
+    реально-оплачённые заказы, для которых деньги ещё заморожены.
+    """
+
+    ids: list[str] = field(default_factory=list)
+    is_complete: bool = True
+    truncated_reason: str | None = None
+
+    def __iter__(self):
+        # Обратная совместимость с кодом, который раньше получал list[str].
+        return iter(self.ids)
+
+    def __len__(self) -> int:
+        return len(self.ids)
 
 
 class FunPayClient:
@@ -413,14 +455,189 @@ class FunPayClient:
                 }
 
             data: dict[str, Any] = {"used_lot_id": target_lot}
-            for attr in ("total", "available", "currency", "rub", "usd", "eur"):
+
+            # FunPayAPI обновили модель Balance: вместо устаревших полей
+            # `total`/`available` теперь приходят `total_rub`/`available_rub`
+            # (и аналогичные для USD/EUR). Поддерживаем оба контракта,
+            # чтобы при следующем апгрейде FunPayAPI не сломаться снова.
+            modern_attrs = (
+                "total_rub", "available_rub",
+                "total_usd", "available_usd",
+                "total_eur", "available_eur",
+            )
+            legacy_attrs = ("total", "available", "currency", "rub", "usd", "eur")
+            for attr in modern_attrs + legacy_attrs:
                 value = getattr(bal, attr, None)
                 if value is not None:
                     data[attr] = value
+
+            # Удобные алиасы для UI: бот рендерит fp_bal["rub"] первым делом.
+            # У современной модели поле называется total_rub — мэппим его.
+            if "rub" not in data and "total_rub" in data:
+                data["rub"] = data["total_rub"]
+            if "usd" not in data and "total_usd" in data:
+                data["usd"] = data["total_usd"]
+            if "eur" not in data and "total_eur" in data:
+                data["eur"] = data["total_eur"]
+
             data["raw_repr"] = repr(bal)
             return data
 
         return await self._to_thread(_call)
+
+    # ----- Продажи (sales) -----
+
+    # Защита от потенциально-бесконечной пагинации FunPay (если сервер
+    # вернёт зацикленный курсор). 50 страниц * ~30 заказов = 1500 запасом
+    # перекрывают любой реалистичный размер списка «Оплачен».
+    _PAID_SALES_MAX_PAGES = 50
+
+    async def get_paid_sales_snapshot(self) -> "PaidSalesSnapshot":
+        """
+        Возвращает funpay_order_id всех заказов в статусе «Оплачен»
+        (ожидающих подтверждения покупателя/саппорта).
+
+        Использует FunPayAPI.Account.get_sells(state="paid") с пагинацией
+        через курсор `continue`. Возвращаемые id — без префикса `#`,
+        чтобы матчить значения в `Order.funpay_order_id`.
+
+        Главный потребитель — sync_pending_confirmation: всё, что у нас
+        в БД помечено `delivered, confirmed_at=NULL`, но в этом списке
+        ОТСУТСТВУЕТ — значит FunPay/саппорт уже подтвердил такие заказы
+        тихо (без системного сообщения в чат) и можно проставить
+        confirmed_at автоматически.
+        """
+        result: list[str] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        is_complete = True
+        truncated_reason: str | None = None
+
+        for _ in range(self._PAID_SALES_MAX_PAGES):
+
+            def _call(start_from: str | None = cursor) -> tuple[Any, list[Any]]:
+                return self.account.get_sells(
+                    state="paid",
+                    include_paid=True,
+                    include_closed=False,
+                    include_refunded=False,
+                    start_from=start_from,
+                )
+
+            next_cursor, orders = await self._to_thread(_call)
+            for order in orders or []:
+                order_id = getattr(order, "id", None)
+                if order_id is None:
+                    continue
+                order_id = str(order_id).lstrip("#")
+                if order_id:
+                    result.append(order_id)
+
+            if not next_cursor:
+                break
+            next_cursor_str = str(next_cursor)
+            if next_cursor_str in seen_cursors:
+                # FunPay вернул тот же курсор второй раз — это либо баг
+                # на их стороне, либо мы уже видим финальный «эхо»-ответ;
+                # прерываем во избежание бесконечного цикла.
+                logger.warning(
+                    f"FunPay get_sells вернул повторный курсор "
+                    f"{next_cursor_str!r} — прекращаю пагинацию"
+                )
+                is_complete = False
+                truncated_reason = f"повторный курсор {next_cursor_str!r}"
+                break
+            seen_cursors.add(next_cursor_str)
+            cursor = next_cursor_str
+        else:
+            logger.warning(
+                f"FunPay get_sells достиг лимита {self._PAID_SALES_MAX_PAGES} "
+                "страниц пагинации — возможно зацикленный курсор"
+            )
+            is_complete = False
+            truncated_reason = (
+                f"достигнут лимит {self._PAID_SALES_MAX_PAGES} страниц"
+            )
+
+        return PaidSalesSnapshot(
+            ids=result,
+            is_complete=is_complete,
+            truncated_reason=truncated_reason,
+        )
+
+    async def get_recent_sales(
+        self,
+        *,
+        state: str = "paid",
+        max_pages: int = 1,
+    ) -> list[RecentSale]:
+        """Свежий список заказов с подробностями (для order discovery).
+
+        В отличие от ``get_paid_sales_snapshot``, который возвращает только
+        IDs (для матчинга в `sync_pending_confirmation`), этот метод даёт
+        достаточно полей, чтобы построить ``FunPayOrderEvent`` и пропустить
+        заказ через ``process_funpay_order``.
+
+        По умолчанию берём только первую страницу — discovery работает
+        каждые ~60с, и нам важна именно свежая верхушка ленты, а не вся
+        история. При желании ``max_pages`` можно увеличить, но не делаем
+        этого по умолчанию: лишняя пагинация — лишний шанс упереться
+        в rate-limit FunPay.
+
+        Никаких side-effects: только обёртка над ``account.get_sells``.
+        Не падает наружу при пустом ответе — возвращает [].
+
+        Поля OrderShortcut, на которые мы полагаемся:
+            id, status, buyer/buyer_username/buyer_id, price/amount/sum,
+            description, lot_id (когда есть). Все они опциональны, и при
+            отсутствии мы подставляем безопасные дефолты — это норма для
+            FunPayAPI, который часто не отдаёт lot_id в OrderShortcut.
+        """
+        result: list[RecentSale] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        pages = 0
+        max_pages_safe = max(1, min(int(max_pages), self._PAID_SALES_MAX_PAGES))
+
+        while pages < max_pages_safe:
+            pages += 1
+
+            def _call(start_from: str | None = cursor) -> tuple[Any, list[Any]]:
+                return self.account.get_sells(
+                    state=state,
+                    include_paid=(state == "paid"),
+                    include_closed=(state == "closed"),
+                    include_refunded=(state == "refunded"),
+                    start_from=start_from,
+                )
+
+            try:
+                next_cursor, orders = await self._to_thread(_call)
+            except Exception as exc:
+                logger.warning(
+                    f"FunPay get_recent_sales(state={state}, page={pages}) "
+                    f"упал: {type(exc).__name__}: {exc}"
+                )
+                break
+
+            for order in orders or []:
+                sale = _normalize_order_shortcut(order)
+                if sale is not None:
+                    result.append(sale)
+
+            if not next_cursor:
+                break
+            next_cursor_str = str(next_cursor)
+            if next_cursor_str in seen_cursors:
+                logger.debug(
+                    f"FunPay get_recent_sales: повторный курсор "
+                    f"{next_cursor_str!r}, прекращаю пагинацию"
+                )
+                break
+            seen_cursors.add(next_cursor_str)
+            cursor = next_cursor_str
+
+        return result
 
     # ----- Лоты -----
 
@@ -543,9 +760,31 @@ class FunPayClient:
             golden_key=gk,
             phpsessid=ps,
             user_agent=self.DEFAULT_USER_AGENT,
+            max_429_retries=self._settings.funpay_429_max_retries,
+            base_429_backoff_seconds=self._settings.funpay_429_base_backoff_seconds,
+            max_429_backoff_seconds=self._settings.funpay_429_max_backoff_seconds,
+            max_5xx_retries=self._settings.funpay_5xx_max_retries,
+            rate_max_concurrent=self._settings.funpay_rate_max_concurrent,
+            rate_min_interval_seconds=self._settings.funpay_rate_min_interval_seconds,
         )
         self._admin_client_cache = client
         return client
+
+    def get_and_reset_http_metrics(self) -> dict[str, int]:
+        """
+        Снимает агрегат HTTP-метрик FunPay и обнуляет счётчики.
+
+        Используется sync_stock и др. фоновыми циклами, чтобы залогировать
+        результат за один цикл — без этого rate-limit/retry-нагрузку
+        приходилось grep'ать в journalctl.
+
+        Возвращает dict с ключами: ok, retry_429, retry_5xx, exhausted.
+        Если admin-клиент ещё не инициализирован — все ключи нули.
+        """
+        cached = getattr(self, "_admin_client_cache", None)
+        if cached is None:
+            return {"ok": 0, "retry_429": 0, "retry_5xx": 0, "exhausted": 0}
+        return cached.get_and_reset_http_metrics()
 
     async def get_lot_fields(self, lot_id: int, node_id: int | None = None) -> Any:
         """
@@ -734,23 +973,30 @@ class FunPayClient:
         # Fallback: прямой HTTP POST через admin_http
         try:
             result = await self._admin.send_chat_message(chat_id, text)
-            if result.get("ok"):
-                logger.info(
-                    f"FunPay send_message OK [via admin_http fallback]: "
-                    f"chat={chat_id}, text={text_preview!r}"
-                )
-            else:
-                logger.error(
-                    f"FunPay send_message FAIL даже через fallback: "
-                    f"chat={chat_id}, result={result}"
-                )
-            return result
         except Exception as exc:
             logger.opt(exception=exc).error(
                 f"FunPay send_message: и FunPayAPI, и admin_http упали. "
                 f"chat={chat_id}, text={text_preview!r}, err={exc}"
             )
             raise
+
+        if result.get("ok"):
+            logger.info(
+                f"FunPay send_message OK [via admin_http fallback]: "
+                f"chat={chat_id}, text={text_preview!r}"
+            )
+            return result
+
+        # Аудит #2: admin_http вернул {"ok": False} — сообщение НЕ доставлено.
+        # Бросаем RuntimeError, чтобы вызывающий код (processor, chat handler)
+        # НЕ счёл это успехом и не пометил заказ как delivered.
+        logger.error(
+            f"FunPay send_message FAIL даже через fallback: "
+            f"chat={chat_id}, result={result}"
+        )
+        raise RuntimeError(
+            f"FunPay send_message failed via admin_http fallback: {result}"
+        )
 
     # ----- Диагностика -----
 
@@ -779,3 +1025,100 @@ class FunPayClient:
             else:
                 result[name] = type(value).__name__
         return result
+
+
+# ──────────────────────────── helpers ───────────────────────────────────
+
+
+def _shortcut_attr(obj: Any, *attrs: str) -> Any:
+    """Достаём первое непустое значение из набора атрибутов FunPay OrderShortcut."""
+    for attr in attrs:
+        value = getattr(obj, attr, None)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def _shortcut_status(order: Any) -> str:
+    """Извлекаем статус заказа из OrderShortcut: либо .status.value, либо строка."""
+    status = getattr(order, "status", None)
+    if status is None:
+        return ""
+    value = getattr(status, "value", None) or getattr(status, "name", None)
+    if value is not None:
+        return str(value).lower()
+    return str(status).lower()
+
+
+def _normalize_order_shortcut(order: Any) -> "RecentSale | None":
+    """Нормализуем FunPayAPI OrderShortcut в RecentSale.
+
+    Контракт максимально снисходителен: не падаем, если каких-то полей нет
+    (FunPayAPI меняется чаще, чем хотелось бы). Если нет id — заказ
+    бессмыслен, возвращаем None.
+    """
+    raw_id = _shortcut_attr(order, "id", "order_id", "ID")
+    if raw_id is None:
+        return None
+    order_id = str(raw_id).lstrip("#")
+    if not order_id:
+        return None
+
+    buyer = _shortcut_attr(order, "buyer", "buyer_username")
+    if buyer is not None and not isinstance(buyer, (int, str)):
+        buyer_username = getattr(buyer, "username", None)
+        buyer_user_id = getattr(buyer, "id", None)
+    elif isinstance(buyer, str):
+        buyer_username = buyer
+        buyer_user_id = None
+    else:
+        buyer_username = None
+        buyer_user_id = None
+
+    if buyer_username is None:
+        buyer_username = _shortcut_attr(order, "buyer_username", "username")
+    if buyer_user_id is None:
+        buyer_user_id = _shortcut_attr(order, "buyer_id", "user_id")
+
+    if buyer_username is not None:
+        buyer_username = str(buyer_username)
+    try:
+        buyer_user_id = int(buyer_user_id) if buyer_user_id is not None else None
+    except (TypeError, ValueError):
+        buyer_user_id = None
+
+    lot_id_raw = _shortcut_attr(order, "lot_id", "offer_id", "lot")
+    try:
+        funpay_lot_id = int(lot_id_raw) if lot_id_raw is not None else 0
+    except (TypeError, ValueError):
+        funpay_lot_id = 0
+
+    quantity_raw = _shortcut_attr(order, "amount", "quantity", "count")
+    try:
+        quantity = int(quantity_raw) if quantity_raw is not None else 1
+    except (TypeError, ValueError):
+        quantity = 1
+    quantity = max(1, quantity)
+
+    price_raw = _shortcut_attr(order, "price", "sum", "total")
+    try:
+        price_rub = float(price_raw) if price_raw is not None else None
+    except (TypeError, ValueError):
+        price_rub = None
+
+    description = _shortcut_attr(
+        order, "description", "short_description", "title", "full_description"
+    )
+    if description is not None and not isinstance(description, str):
+        description = str(description)
+
+    return RecentSale(
+        order_id=order_id,
+        status=_shortcut_status(order) or "unknown",
+        buyer_username=buyer_username,
+        buyer_user_id=buyer_user_id,
+        funpay_lot_id=funpay_lot_id,
+        quantity=quantity,
+        price_rub=price_rub,
+        description=description,
+    )

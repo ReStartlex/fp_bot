@@ -39,26 +39,42 @@ from src.db.repo import (
     assign_mapping_group,
     classify_lot_group,
     find_order_by_funpay_id,
-    list_mappings,
     list_lot_groups,
+    list_mappings,
+    list_pending_confirmation,
     upsert_mapping,
 )
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
+from src.orders.sync_paid import sync_pending_confirmation
 from src.mapping.rules import compute_pricing, estimate_profit_rub
 from src.mapping.safety import mapping_risk_warnings
 from src.ns import NSClient
 from src.ns.models import StockResponse
 from src.sync.fx import get_rate_breakdown
+from src.sync.lots_control import (
+    disable_all_mapped_lots,
+    enable_all_mapped_lots,
+)
 
 
 SyncTrigger = Callable[[], Awaitable[dict]]
 FunPayReconnect = Callable[[], Awaitable[dict]]
 OrderRetry = Callable[[str], Awaitable[dict]]
 
-# Таймауты: если NS/FunPay завис — бот не должен молчать вечно.
-NS_TIMEOUT_SECONDS = 15.0
-FP_TIMEOUT_SECONDS = 15.0
+# Таймауты для интерактивных команд из Telegram. Если NS/FunPay завис —
+# бот не должен молчать вечно: лучше быстро вернуть «timeout», чем заставлять
+# владельца смотреть на «обработка…» 15+ секунд. На медленный NS этого
+# достаточно: реальный _ensure_token+check_balance укладывается в 1-2с.
+NS_TIMEOUT_SECONDS = 6.0
+FP_TIMEOUT_SECONDS = 8.0
+
+# Кеш баланса NS для UI «📊 Статус» / «💰 Балансы». На каждый клик дёргать
+# NS нет смысла — баланс меняется только при заказах. 15с — компромисс:
+# мгновенный refresh после клика остаётся, но повторное открытие меню
+# не делает второй HTTP-запрос. Раздельный кеш для balance и stock,
+# потому что stock тяжелее и обновляется реже.
+NS_BALANCE_CACHE_TTL_SECONDS = 15.0
 
 
 MOSCOW_TZ = ZoneInfo("Europe/Moscow")
@@ -75,6 +91,94 @@ def _to_moscow(dt: datetime | None) -> datetime | None:
 def _format_dt(dt: datetime | None) -> str:
     msk = _to_moscow(dt)
     return "—" if msk is None else msk.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _split_lines_to_chunks(
+    *,
+    header_lines: list[str],
+    body_lines: list[str],
+    max_chars: int = 3500,
+) -> list[str]:
+    """
+    Склеить header + body в чанки ≤ max_chars (запас под Telegram 4096).
+
+    Гарантии:
+    - каждый чанк начинается с header (чтобы юзер не терялся);
+    - ни одна строка не режется посередине;
+    - если одна строка длиннее max_chars (теоретически невозможно для
+      наших данных — order_id 8 chars + username 24 chars + 30 chars текста),
+      она всё равно отправится одной строкой, даже превысив лимит
+      (Telegram отрежет на 4096, но это лучше, чем silently потерять
+      запись из списка).
+    """
+    if not body_lines:
+        return ["\n".join(header_lines)] if header_lines else []
+    header_text = "\n".join(header_lines)
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = len(header_text) + 1  # +1 на \n после header
+    for line in body_lines:
+        line_len = len(line) + 1
+        if current_lines and current_len + line_len > max_chars:
+            chunks.append(header_text + "\n" + "\n".join(current_lines))
+            current_lines = [line]
+            current_len = len(header_text) + 1 + line_len
+        else:
+            current_lines.append(line)
+            current_len += line_len
+    if current_lines:
+        chunks.append(header_text + "\n" + "\n".join(current_lines))
+    return chunks
+
+
+def _split_ids_to_copy_chunks(
+    ids: list[str],
+    *,
+    max_chars: int = 3500,
+) -> list[str]:
+    """
+    Склеить order_ids в строки «#ID, #ID, ...» с ограничением по длине.
+    Используется для блока «скопировать в саппорт».
+    """
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    SEP = ", "
+    for oid in ids:
+        token = f"#{oid}"
+        add_len = len(token) + (len(SEP) if current else 0)
+        if current and current_len + add_len > max_chars:
+            chunks.append(SEP.join(current))
+            current = [token]
+            current_len = len(token)
+        else:
+            current.append(token)
+            current_len += add_len
+    if current:
+        chunks.append(SEP.join(current))
+    return chunks
+
+
+def _parse_hours_arg(command_text: str | None, *, default: int) -> int:
+    """
+    Достать число часов из текста команды вида `/pending_confirm 12`.
+    Возвращает default если аргумента нет или он некорректен.
+    Clamping: 1..168 (1ч..1неделя), защита от очепяток вроде 100000.
+    """
+    if not command_text:
+        return default
+    parts = command_text.strip().split()
+    if len(parts) < 2:
+        return default
+    try:
+        hours = int(parts[1])
+    except (ValueError, TypeError):
+        return default
+    if hours < 1:
+        return 1
+    if hours > 168:
+        return 168
+    return hours
 
 
 def format_percent(value: float | int | None) -> str:
@@ -254,6 +358,8 @@ class TelegramBot:
         "/status — общий обзор\n"
         "/balance — баланс NS и FunPay\n"
         "/orders — последние 10 заказов\n"
+        "/pending_confirm [часы] — заказы старше Nч без подтверждения (для саппорта)\n"
+        "/sync_pending_confirm — синхронизировать /pending_confirm с FunPay (закрыть тихо подтверждённые)\n"
         "/sync — запустить синхронизацию\n"
         "/funpay_reconnect — переподключить FunPay\n"
         "\n"
@@ -271,12 +377,15 @@ class TelegramBot:
         "/clear_target — забыть выбранный целевой лот\n"
         "/calc &lt;funpay_lot_id&gt; — посчитать цены по маппингу\n"
         "/inspect_lot &lt;funpay_lot_id&gt; — заглянуть в LotFields\n"
+        "/lot_status &lt;funpay_lot_id&gt; — read-only диагностика: cache, capped, target\n"
         "\n"
         "<b>Глобальные настройки (без рестарта)</b>\n"
         "/settings — показать активные значения\n"
-        "/setdefault markup &lt;%|default&gt; — глобальная наценка\n"
+        "/setdefault markup &lt;%|default&gt; — глобальная наценка (FunPay)\n"
         "/setdefault premium &lt;%|default&gt; — премия к курсу USD\n"
         "/setdefault stockcap &lt;N|default&gt; — лимит остатков на FunPay\n"
+        "/setdefault shop_markup &lt;%|default&gt; — наценка TG-shop\n"
+        "/setdefault shop_referral &lt;%|default&gt; — % кэшбэка реф-системы\n"
         "/force_sync &lt;funpay_lot_id&gt; — диагностика одного лота\n"
         "/funpay_check — проверить FunPay-сессию (cookies)\n"
         "\n"
@@ -295,12 +404,20 @@ class TelegramBot:
         funpay_client: FunPayClient | None = None,
         funpay_reconnect: FunPayReconnect | None = None,
         order_retry: OrderRetry | None = None,
+        ns_client: NSClient | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._sync_trigger = sync_trigger
         self._funpay_client = funpay_client
         self._funpay_reconnect = funpay_reconnect
         self._order_retry = order_retry
+        # Долгоживущий NSClient процесса: разделяем токен (2ч TTL) с sync
+        # и order processor. Раньше каждый клик создавал свой NSClient,
+        # что означало новый login → новый сетевой круг, и команда «Баланс»
+        # отвечала по 3-5с вместо 0.5с. Если ns_client=None — fallback на
+        # одноразовый NSClient как раньше (этот режим оставлен для тестов
+        # и для случая, когда main.py ещё не успел проинициализироваться).
+        self._ns_client = ns_client
         self._bot: Bot | None = None
         self._dp: Dispatcher | None = None
         self._task: asyncio.Task | None = None
@@ -315,6 +432,10 @@ class TelegramBot:
         # кэш каталога NS на 60 секунд, чтобы не дёргать API на каждый клик
         self._stock_cache: tuple[float, StockResponse] | None = None
         self._stock_lock = asyncio.Lock()
+        # Короткий кеш для балансов NS: тик в 15с, формат "<balance>".
+        # Промахи закрываются вызовом NS, успех — сохраняется до TTL.
+        self._balance_cache: tuple[float, str] | None = None
+        self._balance_lock = asyncio.Lock()
 
     def update_funpay_client(self, fp: FunPayClient | None) -> None:
         self._funpay_client = fp
@@ -382,11 +503,14 @@ class TelegramBot:
             BotCommand(command="ns_search", description="🔍 Поиск NS"),
             BotCommand(command="sync", description="🔄 Синхронизация"),
             BotCommand(command="orders", description="📦 Последние заказы"),
+            BotCommand(command="pending_confirm", description="⏳ Заказы без подтв. (список для саппорта FunPay)"),
+            BotCommand(command="sync_pending_confirm", description="🔄 Sync /pending_confirm с FunPay (чистит фантомы)"),
             BotCommand(command="setmarkup", description="✏ Наценка одного маппинга"),
             BotCommand(command="reset_markups", description="♻ Сбросить наценку у всех маппингов"),
             BotCommand(command="setdefault", description="🎚 Глобальные настройки (markup/premium/stock)"),
             BotCommand(command="settings", description="🔧 Показать текущие настройки"),
             BotCommand(command="force_sync", description="🔬 Прогнать один лот с деталями"),
+            BotCommand(command="lot_status", description="🩹 Read-only: cache/capped/target лота"),
             BotCommand(command="funpay_check", description="🩺 Проверить FunPay-сессию"),
             BotCommand(command="funpay_reconnect", description="🔌 FunPay reconnect"),
             BotCommand(command="ping", description="🏓 Проверка связи"),
@@ -509,6 +633,18 @@ class TelegramBot:
                 return
             await self._do_problems(msg)
 
+        @dp.message(Command("pending_confirm"))
+        async def cmd_pending_confirm(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_pending_confirm(msg)
+
+        @dp.message(Command("sync_pending_confirm"))
+        async def cmd_sync_pending_confirm(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_sync_pending_confirm(msg)
+
         @dp.message(Command("stats"))
         async def cmd_stats(msg: Message) -> None:
             if not self._is_owner(msg):
@@ -581,6 +717,12 @@ class TelegramBot:
                 return
             await self._do_inspect_lot(msg)
 
+        @dp.message(Command("lot_status"))
+        async def cmd_lot_status(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_lot_status(msg)
+
         @dp.message(Command("setmarkup"))
         async def cmd_setmarkup(msg: Message) -> None:
             if not self._is_owner(msg):
@@ -649,6 +791,18 @@ class TelegramBot:
                     await cq.message.delete()
             await cq.answer()
 
+        @dp.callback_query(F.data == "sync_pending_confirm")
+        async def cb_sync_pending_confirm(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await cq.answer("Синхронизирую с FunPay...", show_alert=False)
+            # Создаём искусственный «msg»-контекст: _do_sync_pending_confirm
+            # читает только chat.id, поэтому достаточно cq.message.
+            if cq.message is None:
+                return
+            await self._do_sync_pending_confirm(cq.message)
+
         @dp.callback_query(F.data == "target:clear")
         async def cb_target_clear(cq: CallbackQuery) -> None:
             if not self._is_owner(cq):
@@ -716,6 +870,34 @@ class TelegramBot:
                 await cq.answer()
                 return
             await self._on_group_click(cq)
+
+        # Batch enable/disable всех маппингов: подтверждение через
+        # confirm_keyboard, фактическая работа — в _do_disable_all_lots
+        # / _do_enable_all_lots. См. src/sync/lots_control.py.
+        @dp.callback_query(F.data == "lots_off_confirm")
+        async def cb_lots_off_confirm(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await self._do_disable_all_lots(cq)
+
+        @dp.callback_query(F.data == "lots_on_confirm")
+        async def cb_lots_on_confirm(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await self._do_enable_all_lots(cq)
+
+        # Кнопки на алертах про manual_hold: hold:retry/done/show:<funpay_order_id>.
+        # Эти алерты приходят из processor._trigger_manual_hold и из reconciler
+        # для застрявших заказов. callback_data не session-based — несёт прямой
+        # funpay_order_id, чтобы alert не "протух" по rotation сессий.
+        @dp.callback_query(F.data.startswith("hold:"))
+        async def cb_hold(cq: CallbackQuery) -> None:
+            if not self._is_owner(cq):
+                await cq.answer()
+                return
+            await self._on_hold_click(cq)
 
     # ─────────────── общие хелперы ───────────────
 
@@ -827,6 +1009,19 @@ class TelegramBot:
     async def _plain_settings(self, msg: Message, text: str) -> None:
         await self._do_show_settings(self._slash_msg(msg, text))  # type: ignore[arg-type]
 
+    async def _ns_call(self, coro_factory, *, timeout: float):
+        """Унифицированный вызов NS через долгоживущий клиент или fallback.
+
+        Если App передал нам ``self._ns_client`` — используем его (нет
+        повторного login'а, токен живой до 2ч). Если нет — создаём
+        одноразовый. Это покрывает не только нормальный prod-режим,
+        но и unit-тесты, где TelegramBot создаётся без ns_client.
+        """
+        if self._ns_client is not None:
+            return await asyncio.wait_for(coro_factory(self._ns_client), timeout=timeout)
+        async with NSClient() as ns:
+            return await asyncio.wait_for(coro_factory(ns), timeout=timeout)
+
     async def _get_stock(self, *, force: bool = False) -> StockResponse:
         """NS-каталог с кэшем 60 секунд."""
         async with self._stock_lock:
@@ -835,22 +1030,39 @@ class TelegramBot:
                 ts, cached = self._stock_cache
                 if now - ts < 60.0:
                     return cached
-            async with NSClient() as ns:
-                stock = await asyncio.wait_for(ns.get_stock(), timeout=NS_TIMEOUT_SECONDS)
+            stock = await self._ns_call(
+                lambda ns: ns.get_stock(), timeout=NS_TIMEOUT_SECONDS
+            )
             self._stock_cache = (now, stock)
             return stock
 
-    async def _safe_ns_balance(self) -> str:
-        try:
-            async with NSClient() as ns:
-                bal = await asyncio.wait_for(
-                    ns.check_balance(), timeout=NS_TIMEOUT_SECONDS
+    async def _safe_ns_balance(self, *, force: bool = False) -> str:
+        """Баланс NS с коротким кешем 15с.
+
+        Кеш нужен, потому что владелец часто открывает «📊 Статус» и
+        «💰 Балансы» подряд — на каждый клик создавать новый round-trip
+        к ns.gifts бессмысленно. ``force=True`` пропускает кеш —
+        полезно для будущей кнопки «🔄 Обновить баланс».
+        """
+        async with self._balance_lock:
+            now = time.time()
+            if not force and self._balance_cache is not None:
+                ts, cached = self._balance_cache
+                if now - ts < NS_BALANCE_CACHE_TTL_SECONDS:
+                    return cached
+            try:
+                bal = await self._ns_call(
+                    lambda ns: ns.check_balance(), timeout=NS_TIMEOUT_SECONDS
                 )
-            return f"{bal.balance}"
-        except asyncio.TimeoutError:
-            return "<i>timeout</i>"
-        except Exception as exc:
-            return f"<i>n/a ({html.escape(str(exc))[:80]})</i>"
+                value = f"{bal.balance}"
+            except asyncio.TimeoutError:
+                # При timeout кеш НЕ обновляем, чтобы следующий клик
+                # сразу попробовал заново, а не висел 15с со старой ошибкой.
+                return "<i>timeout</i>"
+            except Exception as exc:
+                return f"<i>n/a ({html.escape(str(exc))[:80]})</i>"
+            self._balance_cache = (now, value)
+            return value
 
     async def _safe_fp_status(self) -> str:
         if self._funpay_client is None:
@@ -985,6 +1197,8 @@ class TelegramBot:
             await self._show_orders_via_cq(cq)
         elif action == ui.MENU_KIND_PROBLEMS:
             await self._show_problems_via_cq(cq)
+        elif action == ui.MENU_KIND_PENDING:
+            await self._show_pending_confirm_via_cq(cq)
         elif action == ui.MENU_KIND_STATS:
             await self._show_stats_via_cq(cq)
         elif action == ui.MENU_KIND_SYNC:
@@ -993,8 +1207,137 @@ class TelegramBot:
             await self._run_reconnect_via_cq(cq)
         elif action == ui.MENU_KIND_HELP:
             await self._edit_or_answer(cq, self.HELP_TEXT, reply_markup=ui.single_close_kb())
+        elif action == ui.MENU_KIND_LOTS_DISABLE_ALL:
+            await self._confirm_disable_all_lots(cq)
+        elif action == ui.MENU_KIND_LOTS_ENABLE_ALL:
+            await self._confirm_enable_all_lots(cq)
         else:
             await cq.answer(f"Неизвестная команда меню: {action}")
+
+    # ─────────────── batch enable/disable всех лотов ───────────────
+
+    async def _count_mapped_lots(self) -> tuple[int, int]:
+        """Возвращает (всего маппингов, активных). Дёшево, без I/O в FunPay."""
+        async with session_factory()() as session:
+            total = (await session.execute(
+                select(func.count()).select_from(Mapping)
+            )).scalar_one()
+            active = (await session.execute(
+                select(func.count())
+                .select_from(Mapping)
+                .where(Mapping.enabled.is_(True))
+            )).scalar_one()
+        return int(total or 0), int(active or 0)
+
+    @_guard
+    async def _confirm_disable_all_lots(self, cq: CallbackQuery) -> None:
+        total, active = await self._count_mapped_lots()
+        text = (
+            "🔴 <b>Выключить ВСЕ замапленные лоты?</b>\n\n"
+            f"Найдено маппингов: <b>{total}</b> "
+            f"(сейчас активных: <b>{active}</b>).\n\n"
+            "Что будет сделано:\n"
+            "  • <b>mapping.enabled = False</b> для всех маппингов в БД.\n"
+            "  • <b>save_lot(active=False, amount=0)</b> для каждого лота "
+            "на FunPay (с паузой ~400ms между запросами, чтобы не словить 429).\n\n"
+            "<i>Лоты сразу снимаются с продажи. Включить обратно можно одной "
+            "кнопкой «🟢 Включить все лоты» (после восстановления NS).</i>"
+        )
+        await self._edit_or_answer(
+            cq,
+            text,
+            reply_markup=ui.confirm_keyboard(
+                yes_data="lots_off_confirm",
+                yes_text="🔴 Да, выключить все",
+                no_text="✖ Отмена",
+            ),
+        )
+
+    @_guard
+    async def _confirm_enable_all_lots(self, cq: CallbackQuery) -> None:
+        total, active = await self._count_mapped_lots()
+        text = (
+            "🟢 <b>Включить ВСЕ замапленные лоты?</b>\n\n"
+            f"Найдено маппингов: <b>{total}</b> "
+            f"(сейчас активных: <b>{active}</b>).\n\n"
+            "Что будет сделано:\n"
+            "  • <b>mapping.enabled = True</b> для ВСЕХ маппингов "
+            "(включая ранее отключённые).\n"
+            "  • <b>Сброс diff-cache</b>, чтобы ближайший sync (≤30с) "
+            "сам поднял каждый лот с актуальной ценой/стоком.\n\n"
+            "<i>Реальная активация на FunPay произойдёт в течение одного "
+            "sync-цикла. Если нужно быстрее — после подтверждения нажми "
+            "«🔄 Синхронизация» в меню.</i>"
+        )
+        await self._edit_or_answer(
+            cq,
+            text,
+            reply_markup=ui.confirm_keyboard(
+                yes_data="lots_on_confirm",
+                yes_text="🟢 Да, включить все",
+                no_text="✖ Отмена",
+            ),
+        )
+
+    @_guard
+    async def _do_disable_all_lots(self, cq: CallbackQuery) -> None:
+        await cq.answer("Выключаю всё, подождите…")
+        try:
+            await self._edit_or_answer(
+                cq,
+                "⏳ Выключаю все лоты… это может занять до минуты на 30+ "
+                "маппингов (между save_lot ~400ms).",
+                reply_markup=None,
+            )
+        except Exception:
+            # Может упасть, если сообщение уже отредактировано (race с
+            # повторным кликом). Это не блокирует основную работу.
+            pass
+        result = await disable_all_mapped_lots(funpay_client=self._funpay_client)
+        text = (
+            "🔴 <b>Все лоты выключены</b>\n\n"
+            f"Маппингов всего: <b>{result.total}</b>\n"
+            f"В БД отключено: <b>{result.db_updated}</b>\n"
+            f"FunPay save_lot успешно: <b>{result.funpay_changed}</b>\n"
+            f"FunPay уже dead: <b>{result.funpay_already}</b>\n"
+            f"Ошибок: <b>{result.errors}</b>"
+        )
+        if result.errors:
+            err_ids = ", ".join(str(x) for x in result.error_lot_ids[:10])
+            more = (
+                f" и ещё {len(result.error_lot_ids) - 10}"
+                if len(result.error_lot_ids) > 10 else ""
+            )
+            text += (
+                f"\n\n⚠ Не удалось обновить на FunPay лоты: "
+                f"<code>{err_ids}</code>{more}.\n"
+                f"<i>В БД они уже выключены — sync не вернёт их в продажу. "
+                f"Зависшие на FunPay лоты подберёт zombie-reaper "
+                f"в течение ~10 минут.</i>"
+            )
+        await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
+
+    @_guard
+    async def _do_enable_all_lots(self, cq: CallbackQuery) -> None:
+        await cq.answer("Включаю всё…")
+        result = await enable_all_mapped_lots(funpay_client=self._funpay_client)
+        text = (
+            "🟢 <b>Все маппинги включены</b>\n\n"
+            f"Маппингов всего: <b>{result.total}</b>\n"
+            f"В БД активировано: <b>{result.db_updated}</b>\n\n"
+            "<i>Реальные цены/сток на FunPay поднимутся ближайшим "
+            "sync-циклом (≤30с). Хочешь сразу — нажми «🔄 Синхронизация» "
+            "в меню.</i>"
+        )
+        if result.errors:
+            err_ids = ", ".join(str(x) for x in result.error_lot_ids[:10])
+            text += (
+                f"\n\n⚠ Ошибок при сбросе diff-cache: <b>{result.errors}</b> "
+                f"(лоты: <code>{err_ids}</code>). "
+                f"Это не критично: sync всё равно их подберёт по штатному "
+                f"расписанию."
+            )
+        await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
 
     # ─────────────── пагинация (callback) ───────────────
 
@@ -1684,6 +2027,151 @@ class TelegramBot:
             )
             return
         await self._render_paginated_from_cmd(msg, kind="problems", sid=sid, page=0)
+
+    @_guard
+    async def _do_pending_confirm(self, msg: Message) -> None:
+        """
+        /pending_confirm [hours=24] — заказы status=delivered, прошло >Nh,
+        покупатель не нажал «подтвердить» (и саппорт тоже). С чанкингом
+        под Telegram limit 4096 chars (на больших списках).
+        """
+        hours = _parse_hours_arg(msg.text, default=24)
+        await self._render_pending_confirm(chat_id=msg.chat.id, hours=hours)
+
+    @_guard
+    async def _show_pending_confirm_via_cq(self, cq: CallbackQuery) -> None:
+        await self._render_pending_confirm(chat_id=cq.from_user.id, hours=24)
+
+    async def _render_pending_confirm(self, *, chat_id: int, hours: int) -> None:
+        orders = await self._collect_pending_confirm(hours=hours)
+
+        if not orders:
+            await self._send_view(
+                chat_id,
+                f"✅ Нет заказов, ожидающих подтверждения дольше {hours}ч.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        # Сборка человекочитаемого списка с разбиением на чанки.
+        # Telegram hard limit = 4096 chars; берём запас и режем по ~3500.
+        header = (
+            f"📋 Заказы старше {hours}ч без подтверждения "
+            f"({len(orders)} шт.)\n"
+            f"Готовый список для саппорта FunPay ниже.\n"
+            f"⚠ Если в списке есть заказы, которые саппорт FunPay уже "
+            f"подтвердил (тихо, без системки в чат) — нажми «🔄 Sync с "
+            f"FunPay» под последним сообщением. Это вычистит фантомы.\n"
+        )
+        now = datetime.utcnow()
+        item_lines = [
+            f"• #{o.funpay_order_id} — {o.buyer_username or '—'}, "
+            f"выдан {int((now - o.updated_at).total_seconds() // 3600)}ч назад"
+            for o in orders
+        ]
+
+        # Чанк 1+: разбиваем item_lines по ~3500 chars,
+        # последний чанк (без footer) + ВСЕГДА отдельным сообщением copy-block.
+        chunks = _split_lines_to_chunks(
+            header_lines=[header],
+            body_lines=item_lines,
+            max_chars=3500,
+        )
+
+        # Шлём все чанки списка. Кнопку закрытия — только на последний.
+        for idx, text in enumerate(chunks):
+            is_last_text_chunk = idx == len(chunks) - 1
+            reply_markup = ui.single_close_kb() if is_last_text_chunk else None
+            await self._send_view(chat_id, text, reply_markup=reply_markup)
+
+        # Copy-block: одним или несколькими отдельными сообщениями,
+        # без markdown-обёртки (раньше делали `...` — но если в чанке
+        # внутри случится backtick, parse_mode сломается; чистый
+        # plaintext всегда копируется через long-tap в Telegram).
+        copy_chunks = _split_ids_to_copy_chunks(
+            [o.funpay_order_id for o in orders],
+            max_chars=3500,
+        )
+        for idx, ids_text in enumerate(copy_chunks):
+            label = (
+                "📥 Скопировать в саппорт (long-tap → copy):"
+                if idx == 0
+                else f"📥 …продолжение ({idx + 1}/{len(copy_chunks)}):"
+            )
+            await self._send_view(
+                chat_id,
+                f"{label}\n{ids_text}",
+                reply_markup=(
+                    ui.pending_confirm_kb()
+                    if idx == len(copy_chunks) - 1
+                    else None
+                ),
+            )
+
+    async def _collect_pending_confirm(self, *, hours: int) -> list[Order]:
+        async with session_factory()() as session:
+            return await list_pending_confirmation(
+                session, older_than_hours=hours, limit=500
+            )
+
+    @_guard
+    async def _do_sync_pending_confirm(self, msg: Message) -> None:
+        """
+        /sync_pending_confirm — синхронизировать БД с реальным «Оплачен»
+        на FunPay. FunPay-саппорт подтверждает заказы по нашему запросу
+        тихо, без системного сообщения в чат, поэтому в БД они остаются
+        delivered+NULL. Эта команда чистит фантомы.
+        """
+        chat_id = msg.chat.id
+        if self._funpay_client is None:
+            await self._send_view(
+                chat_id,
+                "⚠ FunPay-клиент сейчас не подключён. Сначала "
+                "/funpay_reconnect, потом повтори команду.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        await self._send_view(
+            chat_id, "🔄 Синхронизирую с FunPay...", reply_markup=None
+        )
+        try:
+            stats = await sync_pending_confirmation(
+                funpay_client=self._funpay_client,
+                session_factory=session_factory,
+            )
+        except Exception as exc:
+            logger.opt(exception=exc).warning(
+                f"sync_pending_confirmation упал: {type(exc).__name__}: {exc}"
+            )
+            await self._send_view(
+                chat_id,
+                f"❌ Sync упал: <code>{type(exc).__name__}: {exc}</code>\n"
+                "Подробности в логах сервиса.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        snapshot_complete = stats.get("snapshot_complete", True)
+        warning_line = ""
+        if not snapshot_complete:
+            # Аудит #7: при неполном snapshot мы НЕ помечаем confirmed,
+            # чтобы не закрыть реально оплачённые заказы.
+            warning_line = (
+                "\n⚠️ <b>Snapshot FunPay НЕПОЛНЫЙ</b> "
+                f"(<code>{stats.get('truncated_reason', '?')}</code>) — "
+                "автоматическое подтверждение пропущено, чтобы не закрыть "
+                "реально оплачённые заказы. Запусти Sync ещё раз позже."
+            )
+        text = (
+            "✅ <b>Sync /pending_confirm с FunPay</b>\n"
+            f"• Сейчас «Оплачен» на FunPay: <b>{stats['paid_on_funpay']}</b>\n"
+            f"• В БД было delivered+NULL: <b>{stats['delivered_unconfirmed_in_db']}</b>\n"
+            f"• Помечено confirmed (закрыты тихо саппортом): <b>{stats['marked_confirmed']}</b>"
+            f"{warning_line}\n\n"
+            "Запусти /pending_confirm — список теперь должен соответствовать "
+            "тем заказам, которые реально ждут подтверждения."
+        )
+        await self._send_view(chat_id, text, reply_markup=ui.single_close_kb())
 
     @_guard
     async def _do_stats(self, msg: Message) -> None:
@@ -2958,13 +3446,16 @@ class TelegramBot:
             await msg.answer(
                 "Использование: <code>/setdefault &lt;param&gt; &lt;value|default&gt;</code>\n\n"
                 "Параметры:\n"
-                "  <b>markup</b> — глобальная наценка, % (0..200)\n"
+                "  <b>markup</b> — глобальная наценка FunPay, % (0..200)\n"
                 "  <b>premium</b> — премия к курсу USD, % (0..50)\n"
-                "  <b>stockcap</b> — лимит остатков на FunPay (1..100000)\n\n"
+                "  <b>stockcap</b> — лимит остатков на FunPay (1..100000)\n"
+                "  <b>shop_markup</b> — наценка TG-shop, % (0..100)\n"
+                "  <b>shop_referral</b> — % реф-кэшбэка (0..100)\n\n"
                 "Примеры:\n"
                 "<code>/setdefault markup 5</code>\n"
                 "<code>/setdefault premium 3</code>\n"
                 "<code>/setdefault stockcap 50</code>\n"
+                "<code>/setdefault shop_markup 10</code>\n"
                 "<code>/setdefault markup default</code> — вернуть к .env",
                 reply_markup=ui.single_close_kb(),
             )
@@ -2976,9 +3467,13 @@ class TelegramBot:
             set_global_markup_percent,
             set_premium_percent,
             set_stock_cap,
+            set_shop_markup_percent,
+            set_shop_referral_percent,
             get_global_markup_percent,
             get_premium_percent,
             get_stock_cap,
+            get_shop_markup_percent,
+            get_shop_referral_percent,
         )
 
         try:
@@ -3021,10 +3516,40 @@ class TelegramBot:
                     + ("(runtime override)" if eff != env_v else "(из .env)")
                 )
                 hint = "Лимит остатков для маппингов с stock_cap=NULL."
+            elif param in ("shop_markup", "shopmarkup"):
+                if raw in ("default", "none", "-", ""):
+                    await set_shop_markup_percent(None)
+                else:
+                    await set_shop_markup_percent(float(raw))
+                eff = await get_shop_markup_percent(self._settings)
+                env_v = self._settings.shop_markup_percent
+                shown = (
+                    f"<b>{eff:.2f}%</b> "
+                    + ("(runtime override)" if abs(eff - env_v) > 1e-9 else "(из .env)")
+                )
+                hint = (
+                    "Наценка для shop-каталога. Применится при следующем "
+                    f"sync каталога (≤{self._settings.shop_catalog_refresh_seconds}с)."
+                )
+            elif param in ("shop_referral", "shopreferral", "shop_ref"):
+                if raw in ("default", "none", "-", ""):
+                    await set_shop_referral_percent(None)
+                else:
+                    await set_shop_referral_percent(float(raw))
+                eff = await get_shop_referral_percent(self._settings)
+                env_v = self._settings.shop_referral_percent
+                shown = (
+                    f"<b>{eff:.2f}%</b> "
+                    + ("(runtime override)" if abs(eff - env_v) > 1e-9 else "(из .env)")
+                )
+                hint = (
+                    "% от каждой покупки реферала, который идёт на "
+                    "внутренний баланс пригласившего."
+                )
             else:
                 await msg.answer(
                     f"Неизвестный параметр «{param}». "
-                    "Доступные: markup, premium, stockcap.",
+                    "Доступные: markup, premium, stockcap, shop_markup, shop_referral.",
                     reply_markup=ui.single_close_kb(),
                 )
                 return
@@ -3053,15 +3578,32 @@ class TelegramBot:
         """Показать активные runtime-настройки и .env-исходники."""
         from src.config_runtime import (
             get_global_markup_percent, get_premium_percent, get_stock_cap,
+            get_shop_markup_percent, get_shop_referral_percent,
             get_overrides_snapshot,
         )
         eff_markup = await get_global_markup_percent(self._settings)
         eff_premium = await get_premium_percent(self._settings)
         eff_stock = await get_stock_cap(self._settings)
+        eff_shop_markup = await get_shop_markup_percent(self._settings)
+        eff_shop_referral = await get_shop_referral_percent(self._settings)
         overrides = await get_overrides_snapshot()
 
         def src(env_val, override_val):
             return "<i>override</i>" if override_val is not None else "<i>из .env</i>"
+
+        shop_line = ""
+        if self._settings.shop_enabled:
+            shop_line = (
+                "\n🛒 <b>TG-shop</b>\n"
+                f"   Наценка: <b>{eff_shop_markup:.2f}%</b> "
+                f"{src(self._settings.shop_markup_percent, overrides.get('shop_markup_percent'))}"
+                f" (в .env: {self._settings.shop_markup_percent}%)\n"
+                f"   Реф-кэшбэк: <b>{eff_shop_referral:.2f}%</b> "
+                f"{src(self._settings.shop_referral_percent, overrides.get('shop_referral_percent'))}"
+                f" (в .env: {self._settings.shop_referral_percent}%)\n"
+                f"   Обновление каталога: каждые "
+                f"<b>{self._settings.shop_catalog_refresh_seconds}с</b>\n"
+            )
 
         text = (
             "🔧 <b>Текущие настройки</b>\n\n"
@@ -3071,7 +3613,8 @@ class TelegramBot:
             f"     в .env: {self._settings.usd_rub_premium_percent}%\n"
             f"🏦 Вывод FunPay: <b>{self._settings.funpay_withdrawal_fee_percent:.2f}%</b> <i>из .env</i>\n"
             f"📦 Лимит остатков: <b>{eff_stock}</b> {src(self._settings.funpay_stock_cap, overrides['funpay_stock_cap'])}\n"
-            f"     в .env: {self._settings.funpay_stock_cap}\n\n"
+            f"     в .env: {self._settings.funpay_stock_cap}\n"
+            f"{shop_line}\n"
             f"⏱ Sync каждые: <b>{self._settings.sync_interval_seconds}с</b>\n"
             f"🔁 Discovery новых лотов: <b>{self._settings.new_lots_check_interval_seconds}с</b>\n\n"
             "Меняй на лету:\n"
@@ -3424,6 +3967,253 @@ class TelegramBot:
         await msg.answer(text, reply_markup=ui.single_close_kb())
 
     @_guard
+    async def _do_lot_status(self, msg: Message) -> None:
+        """
+        /lot_status <funpay_lot_id>
+
+        Read-only диагностика одного лота. В отличие от /force_sync:
+          * НЕ применяет изменения к FunPay (только show);
+          * НЕ зависит от FunPay-GET (если 429 — всё равно покажет cache state);
+          * показывает diff-cache: TTL fresh/stale, last_synced_*;
+          * показывает capped-indicator: NS_stock vs effective cap;
+          * подсказывает, что произойдёт на следующем sync-цикле.
+
+        Используется в кейсах вроде «лот показывает 99 уже долго»:
+        видно, либо это работа stock_cap (нормально), либо cache никогда
+        не stale'ется (баг).
+        """
+        parts = (msg.text or "").strip().split()
+        if len(parts) < 2:
+            await msg.answer(
+                "Использование: <code>/lot_status &lt;funpay_lot_id&gt;</code>\n\n"
+                "Read-only диагностика лота (без применения изменений).",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        try:
+            lot_id = int(parts[1])
+        except ValueError:
+            await msg.answer("funpay_lot_id должен быть числом")
+            return
+
+        from src.config_runtime import (
+            get_global_markup_percent, get_stock_cap,
+        )
+        from src.mapping.rules import compute_pricing
+        from src.sync.fx import get_rate_breakdown
+        from src.sync.stock_sync import _flatten_services
+
+        # 1. маппинг + group из БД
+        async with session_factory()() as session:
+            mapping = (await session.execute(
+                select(Mapping).where(Mapping.funpay_lot_id == lot_id)
+            )).scalar_one_or_none()
+            group = (
+                await session.get(LotGroup, mapping.group_id)
+                if mapping is not None and mapping.group_id is not None
+                else None
+            )
+
+        if mapping is None:
+            await msg.answer(
+                f"❌ Маппинга для лота <code>{lot_id}</code> нет.\n"
+                f"Используй /lots → 🎯 + /ns_search для создания.",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+
+        # 2. NS-сервис (без force, используем cache от get_stock — он
+        # обновляется catalog_sync каждые 90с, для read-only достаточно).
+        try:
+            stock = await self._get_stock(force=False)
+        except Exception as exc:
+            await msg.answer(
+                f"❌ NS get_stock упал: <code>{html.escape(str(exc))[:200]}</code>",
+                reply_markup=ui.single_close_kb(),
+            )
+            return
+        ns_svc = _flatten_services(stock).get(mapping.ns_service_id)
+
+        # 3. курс + наценка + cap (effective)
+        rate = await get_rate_breakdown(self._settings)
+        eff_markup = await get_global_markup_percent(self._settings)
+        eff_stock_cap = await get_stock_cap(self._settings)
+
+        # 4. target (без FunPay-GET — чисто на основе NS+rate+cap)
+        target = None
+        capped_note = ""
+        if ns_svc is not None:
+            target = compute_pricing(
+                ns_service=ns_svc,
+                mapping=mapping,
+                settings=self._settings,
+                fx_rate_usd_to_target=rate.effective,
+                default_markup=eff_markup,
+                default_stock_cap=eff_stock_cap,
+                group_markup_percent=group.markup_percent if group is not None else None,
+                group_stock_cap=group.stock_cap if group is not None else None,
+            )
+            raw_ns_stock = int(ns_svc.in_stock or 0)
+            if raw_ns_stock > target.stock and target.stock > 0:
+                capped_note = (
+                    f" ⚠ <b>capped</b>: NS={raw_ns_stock} > cap={target.stock}"
+                )
+
+        # 5. Diff-cache state
+        last_at = getattr(mapping, "last_synced_at", None)
+        last_price = getattr(mapping, "last_synced_price", None)
+        last_stock = getattr(mapping, "last_synced_stock", None)
+        last_active = getattr(mapping, "last_synced_active", None)
+        ttl = int(getattr(self._settings, "sync_stock_diff_cache_ttl_seconds", 300))
+
+        cache_status = "<i>never synced</i>"
+        cache_fresh = False
+        minutes_ago: float | None = None
+        if last_at is not None:
+            delta = (datetime.utcnow() - last_at).total_seconds()
+            minutes_ago = delta / 60.0
+            cache_fresh = delta < ttl
+            cache_status = (
+                f"{'🟢 fresh' if cache_fresh else '🟡 stale'} "
+                f"({minutes_ago:.1f} мин назад, TTL={ttl}с)"
+            )
+
+        # 6. Сравнение target vs last_synced (что бы произошло в fast-path)
+        cache_hit_predicted = False
+        if target is not None and cache_fresh and last_price is not None and \
+                last_stock is not None and last_active is not None:
+            target_active = target.stock > 0
+            if (
+                abs(float(last_price) - float(target.round_price())) <= 0.005
+                and int(last_stock) == int(target.stock)
+                and bool(last_active) == bool(target_active)
+            ):
+                cache_hit_predicted = True
+
+        # 7. Текущий FunPay state (опционально — может упасть 429)
+        funpay_line = "<i>FunPay GET не пробовали (read-only)</i>"
+        # Если кэш stale — реальное состояние ВАЖНО показать, иначе
+        # пользователь не поймёт почему cache fast-path skip'ает.
+        if not cache_fresh and self._funpay_client is not None:
+            try:
+                lf = await asyncio.wait_for(
+                    self._funpay_client.get_lot_fields(lot_id),
+                    timeout=FP_TIMEOUT_SECONDS,
+                )
+                fp_price = getattr(lf, "price", "?")
+                fp_amount = getattr(lf, "amount", "?")
+                fp_active = getattr(lf, "active", "?")
+                funpay_line = (
+                    f"<b>FunPay сейчас:</b> price=<code>{fp_price}</code>, "
+                    f"stock=<code>{fp_amount}</code>, "
+                    f"active=<code>{fp_active}</code>"
+                )
+            except Exception as exc:
+                funpay_line = (
+                    f"⚠ FunPay GET упал (читать продолжаем в фоне): "
+                    f"<code>{html.escape(str(exc))[:120]}</code>"
+                )
+
+        # 8. Выносим вердикт
+        # КРИТИЧНО: disabled mapping имеет приоритет над всем остальным.
+        # Симптом «99 застряло» в 95% случаев — это disabled mapping
+        # (sync игнорирует лот, FunPay сам считает stock после продаж).
+        # Обычно отключается через _emergency_disable_lot при failed заказе:
+        # см. src/orders/processor.py:1328 «Аудит #8». Если save_lot на
+        # FunPay тоже упал — получается half-disabled state: mapping
+        # отключён, но лот на FunPay активен и продаётся.
+        if not mapping.enabled:
+            verdict = (
+                "🚨 <b>MAPPING DISABLED</b> — sync_stock игнорирует этот "
+                "лот, обновления stock/цены не идут.\n"
+                "Скорее всего отключился автоматически после failed-заказа "
+                "(см. /pending_confirm и логи <code>_emergency_disable_lot</code>).\n"
+                "Включить можно через /mappings → 🟢 для этого лота."
+            )
+        elif target is None:
+            verdict = "❌ NS-сервис не найден в каталоге"
+        elif cache_hit_predicted:
+            verdict = (
+                "🟢 <b>Cache hit ожидается</b> — fast-path skip, "
+                "FunPay-GET не будет."
+            )
+        elif cache_fresh and target is not None:
+            verdict = (
+                "🟡 <b>Cache fresh, но target != last_synced</b> — "
+                "что-то случилось, но cache не пустим. "
+                "Дождёмся TTL или /force_sync."
+            )
+        else:
+            verdict = (
+                f"🔄 <b>Cache stale</b> — на следующем sync-цикле будет "
+                f"FunPay-GET + потенциальный save_lot."
+            )
+
+        # 9. Сборка ответа
+        ns_line = (
+            f"🛒 <b>NS:</b> {html.escape(ns_svc.service_name[:60])} "
+            f"(${ns_svc.price:.4f}, in_stock={ns_svc.in_stock})"
+            if ns_svc is not None
+            else "🛒 <b>NS:</b> сервис не найден в каталоге!"
+        )
+        markup_origin = (
+            f"mapping {mapping.markup_percent}%"
+            if mapping.markup_percent is not None else f"global {eff_markup}%"
+        )
+        cap_origin = (
+            f"mapping {mapping.stock_cap}"
+            if mapping.stock_cap is not None
+            else (
+                f"group {group.stock_cap}"
+                if group is not None and group.stock_cap is not None
+                else f"global {eff_stock_cap}"
+            )
+        )
+
+        target_block = (
+            (
+                f"<b>Target (что бот хочет на FunPay):</b>\n"
+                f"  price: <b>{target.round_price()} "
+                f"{target.currency.value}</b>\n"
+                f"  stock: <b>{target.stock}</b>{capped_note}\n"
+            )
+            if target is not None else
+            "<b>Target:</b> не вычислен (нет NS-сервиса)\n"
+        )
+
+        cache_block = (
+            f"<b>Diff-cache (last save_lot success):</b>\n"
+            f"  price: <code>{last_price}</code>\n"
+            f"  stock: <code>{last_stock}</code>\n"
+            f"  active: <code>{last_active}</code>\n"
+            f"  status: {cache_status}\n"
+        )
+
+        # При disabled mapping выводим disabled-маркер в шапке (а не
+        # как чисто read-only поле) — чтобы оператор сразу видел диагноз.
+        enabled_line = (
+            f"⏸ <b>enabled=False</b>"
+            if not mapping.enabled
+            else f"enabled=<code>True</code>"
+        )
+
+        text = (
+            f"🩹 <b>lot_status #{lot_id}</b>\n"
+            f"<i>{html.escape(mapping.label or '—')[:70]}</i>\n\n"
+            f"📌 ns_service_id=<code>{mapping.ns_service_id}</code>, "
+            f"{enabled_line}\n"
+            f"📈 markup: {markup_origin}\n"
+            f"📦 cap: {cap_origin}\n"
+            f"💱 USD/RUB: <b>{rate.effective:.4f}</b>\n\n"
+            f"{ns_line}\n\n"
+            f"{target_block}\n"
+            f"{cache_block}\n"
+            f"{funpay_line}\n\n"
+            f"{verdict}"
+        )
+        await msg.answer(text, reply_markup=ui.single_close_kb())
+
+    @_guard
     async def _do_map(self, msg: Message) -> None:
         parts = (msg.text or "").strip().split()
         if len(parts) < 3:
@@ -3716,6 +4506,96 @@ class TelegramBot:
             await session.commit()
         await cq.answer("Отмечено как выданное вручную", show_alert=False)
         await self._show_problems_via_cq(cq)
+
+    async def _on_hold_click(self, cq: CallbackQuery) -> None:
+        """
+        Обработчик кнопок на алерте manual_hold_required.
+
+        Форматы:
+            hold:retry:<funpay_order_id>  → force-retry через self._order_retry
+            hold:done:<funpay_order_id>   → пометить delivered (ручная выдача)
+            hold:show:<funpay_order_id>   → показать детали (текст алерта)
+        """
+        raw = (cq.data or "")
+        parts = raw.split(":", 2)
+        if len(parts) != 3:
+            await cq.answer("Неверный формат", show_alert=True)
+            return
+        _, action, funpay_order_id = parts
+        funpay_order_id = funpay_order_id.strip()
+        if not funpay_order_id:
+            await cq.answer("Пустой order_id", show_alert=True)
+            return
+
+        async with session_factory()() as session:
+            order = await find_order_by_funpay_id(session, funpay_order_id)
+        if order is None:
+            await cq.answer("Заказ не найден в БД", show_alert=True)
+            return
+
+        if action == "retry":
+            if self._order_retry is None:
+                await cq.answer("Retry не подключён", show_alert=True)
+                return
+            if order.status not in ("pins_ready", "manual_hold"):
+                await cq.answer(
+                    f"Retry недоступен: статус {order.status}", show_alert=True
+                )
+                return
+            await cq.answer("Пробую доставить повторно…", show_alert=False)
+            result = await self._order_retry(funpay_order_id)
+            text = (
+                f"🔁 <b>Retry заказа</b>\n"
+                f"FunPay: <code>{html.escape(funpay_order_id)}</code>\n"
+                f"Результат: <code>{html.escape(str(result))[:800]}</code>"
+            )
+            await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
+            return
+
+        if action == "done":
+            # Идемпотентно: если уже delivered, ничего не ломаем.
+            if order.status == "delivered":
+                await cq.answer("Уже отмечен как delivered", show_alert=False)
+                return
+            if order.status != "manual_hold":
+                await cq.answer(
+                    f"Доступно только для manual_hold (сейчас {order.status})",
+                    show_alert=True,
+                )
+                return
+            async with session_factory()() as session:
+                db_order = await find_order_by_funpay_id(session, funpay_order_id)
+                if db_order is None:
+                    await cq.answer("Заказ исчез", show_alert=True)
+                    return
+                db_order.status = "delivered"
+                db_order.error = (
+                    "manual_delivered: оператор подтвердил ручную выдачу из alert'a"
+                )
+                await session.commit()
+            await cq.answer("Отмечено как выданное вручную", show_alert=False)
+            return
+
+        if action == "show":
+            text = (
+                f"ℹ️ <b>Детали заказа</b>\n"
+                f"FunPay: <code>{html.escape(funpay_order_id)}</code>\n"
+                f"NS: <code>{html.escape(order.ns_custom_id or '—')}</code>\n"
+                f"Статус: <code>{html.escape(order.status)}</code>\n"
+                f"Покупатель: {html.escape(order.buyer_username or '—')}\n"
+                f"Лот FunPay: <code>{order.funpay_lot_id}</code>\n"
+                f"Кол-во: {order.quantity}\n"
+                f"Цена FunPay: {order.funpay_price_rub or '—'}\n"
+                f"Цена NS: {order.ns_price_usd or '—'}\n"
+                f"Создан: <code>{order.created_at.isoformat(timespec='seconds')}</code>\n"
+                f"Обновлён: <code>{order.updated_at.isoformat(timespec='seconds')}</code>\n"
+                f"Описание: <code>{html.escape((order.description or '—')[:240])}</code>\n"
+                f"Ошибка: <code>{html.escape((order.error or '—')[:400])}</code>"
+            )
+            await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
+            return
+
+        await cq.answer(f"Неизвестное действие: {action}", show_alert=True)
 
     @_guard
     async def _act_problem_force_sync(self, cq: CallbackQuery, item) -> None:

@@ -75,6 +75,28 @@ class Settings(BaseSettings):
     sync_min_margin_percent: float = Field(default=1.0)
     sync_max_price_change_percent: float = Field(default=50.0, ge=0)
     sync_reserve_pending_orders: bool = True
+
+    # === Diff-based sync_stock cache ===
+    # sync_stock каждый цикл проверяет 47 лотов и делает 47 GET к
+    # FunPay (`get_lot_fields`). Но 46 из 47 не меняются между циклами
+    # (в проде стабильно `updated=1`). Эти GET зря тратят rate-limit.
+    #
+    # Решение: запоминаем последний успешный sync (`mappings.last_synced_*`)
+    # и пропускаем FunPay-запросы, если NS-target совпадает с cache.
+    # Раз в TTL делаем «полный» цикл — на случай если кто-то правил цены
+    # на FunPay вручную через их UI (наш cache мог разъехаться).
+    #
+    # Эффект: ожидаемо снижение GET'ов в ~10-15 раз → 429 пропадает
+    # как класс. Управляется отдельным флагом, чтобы можно было
+    # быстро откатить через .env (без передеплоя), если что.
+    sync_stock_diff_cache_enabled: bool = True
+    # 120 сек = 2 минуты. Раньше было 300с, но из-за этого после ручных
+    # правок цен на FunPay UI или после _emergency_disable_lot со «сбоем
+    # save_lot» расхождение могло прожить до 5 минут — клиенты в этом
+    # окне покупали лот не по той цене, или вообще видели количество=0
+    # уже после восстановления. 120с — компромисс: всё ещё ×4-5 экономия
+    # rate-limit'а, но окно неконсистентности коротко и предсказуемо.
+    sync_stock_diff_cache_ttl_seconds: int = Field(default=120, ge=30, le=3600)
     # Комиссия FunPay для оценки цены клиента: чисто справочно для /calc.
     # Не влияет на то, какую цену мы записываем (мы пишем цену продавца, FunPay
     # сам добавит комиссию). Реальная комиссия зависит от категории.
@@ -93,6 +115,44 @@ class Settings(BaseSettings):
     telegram_proxy_username: SecretStr | None = None
     telegram_proxy_password: SecretStr | None = None
 
+    # === Phase 1: TG-shop ===
+    # Отдельный бот для покупателей (не путать с owner-ботом выше).
+    # Если shop_enabled=true, но shop_telegram_bot_token не задан, shop
+    # стартует в дегенерированном режиме (бот не запускается, БД остаётся
+    # рабочей — admin API всё ещё может что-то прочитать).
+    shop_enabled: bool = False
+    shop_telegram_bot_token: SecretStr | None = None
+    # Markup для shop-цен. Дешевле FunPay-площадки (~13% сверху), даёт нам
+    # комфортную маржу 8% против ~2% net на FunPay (после комиссий и вывода).
+    # Может быть переопределён через RuntimeSetting key=shop_markup_percent.
+    shop_markup_percent: float = Field(default=8.0, ge=0, le=100)
+    # 1% от покупки реферала → на внутренний баланс пригласившего.
+    # Может быть переопределён через RuntimeSetting key=shop_referral_percent.
+    shop_referral_percent: float = Field(default=1.0, ge=0, le=100)
+    # Как часто обновлять shop_catalog_cache из NS.get_stock(). NS-каталог
+    # сам по себе меняется медленно (часы), но цены/наличие — каждые
+    # 1-2 минуты. 90с — sweet spot: пользователь не видит "out of stock"
+    # после первого захода, и нагрузка на NS API ничтожна (1 запрос в 90с).
+    shop_catalog_refresh_seconds: int = Field(default=90, ge=30, le=3600)
+
+    # ─── Sprint 3: CryptoBot (Crypto Pay API) ──────────────────────────
+    # Включает интеграцию с @CryptoBot для пополнения внутреннего баланса.
+    # Если токен не задан — кнопка «🪙 CryptoBot» в боте остаётся stub-ом.
+    # Токен получить: @CryptoBot → /pay → «Create App» → «API Token».
+    cryptobot_api_token: SecretStr | None = None
+    # Testnet (@CryptoTestnetBot) — для отладки без реальных платежей.
+    cryptobot_testnet: bool = False
+    # Лимиты для пополнения (защита от случайных огромных сумм).
+    cryptobot_min_topup_rub: int = Field(default=100, ge=10, le=100000)
+    cryptobot_max_topup_rub: int = Field(default=100000, ge=100, le=1000000)
+    # Как часто polling-воркер опрашивает getInvoices(status="paid").
+    # Polling — fallback на случай если webhook недоступен (без nginx/SSL).
+    # При наличии webhook'а можно увеличить до 600с для экономии лимитов.
+    cryptobot_polling_seconds: int = Field(default=30, ge=10, le=3600)
+    # TTL invoice'а в секундах (1 час по умолчанию). Дольше — выше шанс
+    # дубль-оплаты; короче — юзер может не успеть оплатить.
+    cryptobot_invoice_ttl_seconds: int = Field(default=3600, ge=300, le=86400)
+
     web_api_enabled: bool = False
     web_api_host: str = "127.0.0.1"
     web_api_port: int = Field(default=8080, ge=1, le=65535)
@@ -102,6 +162,61 @@ class Settings(BaseSettings):
     log_dir: str = "logs"
 
     funpay_update_rate_limit_per_second: float = Field(default=1.0, gt=0)
+
+    # Поведение при HTTP 429 от FunPay (rate-limit). Применяется ко всем
+    # обращениям FunPayAdminClient: GET /lots/offerEdit, GET /chat/,
+    # POST /lots/offerSave, POST /runner/.
+    #
+    # Логика:
+    #   sleep_before_retry = Retry-After (если прислан и парсится как число)
+    #                        иначе  min(base * 2^attempt, max)
+    #
+    # Зачем: в горячий момент (массовый sync_stock или ответ FunPay при
+    # пике трафика) FunPay начинает выкидывать 429. Без ретраев это
+    # выливалось в `FunPay save_lot(...) NOT OK: http=429` и заставляло
+    # стоковый sync пропускать лот целиком (полный slot терялся).
+    # Терпеливый exponential backoff с уважением Retry-After разруливает
+    # это без потерь.
+    funpay_429_max_retries: int = Field(default=4, ge=0, le=10)
+    funpay_429_base_backoff_seconds: float = Field(default=1.0, gt=0, le=30.0)
+    funpay_429_max_backoff_seconds: float = Field(default=30.0, gt=0, le=120.0)
+
+    # Поведение GET-запросов при 5xx Bad Gateway / Service Unavailable /
+    # Gateway Timeout от FunPay (видимая проблема: лог 23.05.2026 показал
+    # массовые `get_lot_fields ... 502 Server Error: Bad Gateway`,
+    # из-за чего sync_stock пропускал лоты целиком).
+    #
+    # Применяется только к GET (идемпотентные). POST 5xx (save_lot,
+    # send_message) НЕ ретраится автоматически: для send_message это
+    # риск двойной отправки сообщения. base/max backoff общие с
+    # funpay_429_*. Сетевые ошибки (ConnectionError и т.п.) тоже
+    # используют этот счётчик, потому что семантически они равны
+    # "сервер недоступен".
+    #
+    # 5xx у FunPay обычно transient и рассасывается за 1-5 секунд,
+    # поэтому 2 retries (всего 3 попытки) достаточно: 1s, 2s — суммарно
+    # ~3 секунды задержки. Если FunPay лежит дольше — лучше пропустить
+    # лот и попробовать в следующем sync-цикле через 30 секунд.
+    funpay_5xx_max_retries: int = Field(default=2, ge=0, le=10)
+
+    # === Глобальный rate-limit на исходящие FunPay-запросы ===
+    # Предотвращает 429 ДО их возникновения, вместо того чтобы только
+    # реагировать после. Применяется к GET и POST одновременно
+    # (общий счётчик).
+    #
+    # Видимая в проде проблема (23.05.2026, через несколько секунд
+    # после старта): на одном offerEdit URL мы получали 429 → 429 →
+    # 200, на 4 разных URL подряд. Это значит FunPay активно нас
+    # ограничивает при текущем стиле массовых запросов из
+    # sync_stock + chat-watcher.
+    #
+    # max_concurrent: сколько HTTP-запросов могут идти одновременно.
+    #   4 — консервативно (asyncio thread pool обычно 6-10, оставляем
+    #   запас на другие thread-вызовы: SQLite, обработчики и т.п.).
+    # min_interval_seconds: минимальная пауза между ЛЮБЫМИ двумя
+    #   запросами. 0.1 = max 10 RPS даже при concurrent=1.
+    funpay_rate_max_concurrent: int = Field(default=4, ge=1, le=32)
+    funpay_rate_min_interval_seconds: float = Field(default=0.1, ge=0.0, le=10.0)
     ns_retry_attempts: int = Field(default=3, ge=1)
     ns_retry_delay_seconds: float = Field(default=5.0, gt=0)
     ns_order_poll_interval_seconds: float = Field(default=5.0, gt=0)
@@ -109,7 +224,53 @@ class Settings(BaseSettings):
     order_reconcile_enabled: bool = True
     order_reconcile_interval_seconds: int = Field(default=120, ge=30)
     order_reconcile_stale_after_seconds: int = Field(default=60, ge=0)
+
+    # Zombie-lot reaper: после _emergency_disable_lot мы отключаем mapping
+    # в БД, но save_lot(active=False) на FunPay мог упасть (например 429).
+    # Получается half-disabled state: sync_stock игнорирует, лот на FunPay
+    # активен и продаётся со старым stock'ом. Reaper находит такие лоты
+    # и пытается deactivate'нуть снова каждые N секунд.
+    zombie_lot_reaper_enabled: bool = True
+    zombie_lot_reaper_interval_seconds: int = Field(default=600, ge=60)
+    # Лимит лотов за один прогон — не больше N save_lot вызовов,
+    # чтобы не вызвать r429 burst если зомби накопились пачкой.
+    zombie_lot_reaper_max_per_run: int = Field(default=5, ge=1, le=50)
+
+    # ─── Sprint 6: Telegram Mini App ────────────────────────────────────
+    # URL Mini App, который шоп-бот будет открывать через WebAppInfo.
+    # Должен быть HTTPS и доступен из Telegram (cloudflare tunnel / nginx).
+    # Пример: "https://neurodrop.ru/app". Если None — Menu Button не
+    # регистрируется, Mini App не доступен через бота.
+    shop_webapp_url: str | None = None
+    # Список CORS origin'ов для разработки Mini App.
+    # В проде обычно пусто (Mini App обслуживается тем же доменом, что и API).
+    # Локально: ["http://localhost:5173"] для Vite dev server'а.
+    shop_webapp_cors_origins: list[str] | None = None
+
+    # ─── Sprint 5: Shop delivery worker ─────────────────────────────────
+    # Воркер делает create_order/pay_order/wait_completion для shop_orders
+    # в статусе paid/delivering. Inline-runner запустится сразу после
+    # buy_confirm, но этот worker — safety net на случай если inline
+    # упал, или если заказ в delivering завис (timeout) и нужно retry.
+    shop_delivery_poll_seconds: int = Field(default=60, ge=10, le=3600)
+    # Максимум заказов за один прогон воркера. Безопасный default = 5,
+    # чтобы не молотить NS API большой пачкой при накоплении.
+    shop_delivery_max_per_run: int = Field(default=5, ge=1, le=50)
     order_reconcile_max_per_run: int = Field(default=10, ge=1, le=100)
+
+    # Жёсткий лимит на ПОЛНЫЙ цикл received→delivered. По истечении бот:
+    #   1) переводит заказ в manual_hold (а не failed), чтобы заказ
+    #      остался виден в /problems и доступен для ручного retry;
+    #   2) аварийно выключает FunPay-лот (чтобы новые покупки не ушли
+    #      в ту же ловушку);
+    #   3) шлёт в Telegram алерт с кнопками "Retry/Выдано вручную/Детали".
+    # Главная задача — не оставлять покупателя без выдачи бесконечно
+    # ("после получения денег покупатель должен получить товар или
+    # увидеть оператора в адекватные сроки"), и одновременно не дать
+    # боту "догнать" оператора, если тот уже выдал товар вручную.
+    # Диапазон 5..30 мин: меньше — слишком агрессивно для медленных
+    # NS-выдач, больше — покупатель долго ждёт без обратной связи.
+    order_delivery_hard_timeout_seconds: int = Field(default=600, ge=300, le=1800)
 
     chat_autogreeting_enabled: bool = True
     chat_greeting_cooldown_hours: int = Field(default=24, ge=1)
@@ -143,6 +304,51 @@ class Settings(BaseSettings):
     # повторные одинаковые сообщения вроде "!помощь" -> "!помощь", когда
     # preview визуально не меняется.
     funpay_active_chats_poll_limit: int = Field(default=5, ge=0, le=20)
+    # Размер LRU-дедупа watcher'а (по message_id или (chat_id, author, text)).
+    # Старый дефолт 1024 на активном аккаунте мог переполниться и тогда
+    # старое сообщение, выпавшее из deque, повторно срабатывало после
+    # очередного poll'а. 4096 запасом покрывает сутки активной торговли
+    # (~30 чатов × ~10 сообщений × 12 polls/min).
+    funpay_watcher_dedup_cache_size: int = Field(default=4096, ge=128, le=65536)
+
+    # === Order discovery poll (3-й канал доставки заказов) ===
+    # listen-loop FunPayAPI выключен по умолчанию (см. выше) и в любом
+    # случае нестабилен. Системные сообщения «оплачен заказ #...» из
+    # poll-loop в ChatHandler НЕ создают Order — он только помечает
+    # ChatState. Получается, что часть заказов выпадает: NS-покупка
+    # не запускается, владелец не получает «✅ Заказ выполнен».
+    #
+    # Этот воркер раз в N секунд тянет свежий список paid-заказов через
+    # account.get_sells(state="paid") и для каждого, которого нет в БД,
+    # поднимает FunPayOrderEvent и зовёт process_funpay_order. Это даёт
+    # ленивый, но надёжный 3-й канал, не зависящий от listen() и
+    # обработки системных сообщений в чате.
+    funpay_order_discovery_enabled: bool = True
+    funpay_order_discovery_interval_seconds: int = Field(default=60, ge=15, le=600)
+    # Лимит новых заказов за один прогон — защита от NS-burst, если
+    # вдруг скопилось много пропущенных. Заказы свыше лимита подберёт
+    # следующий тик.
+    funpay_order_discovery_max_per_run: int = Field(default=10, ge=1, le=50)
+
+    # === NS health watchdog ===
+    # Периодический «жив ли NS?» с алертами в Telegram. Раньше падение
+    # NS было видно только через 6-часовой heartbeat и провал sync — то
+    # есть владелец узнавал поздно, заказы уже копились в `failed`.
+    #
+    # Логика: каждые N секунд один лёгкий check_balance. Если несколько
+    # подряд провалов — алерт «🚨 NS лежит N мин, выключи лоты». На
+    # восстановлении — «✅ NS жив, можно включать».
+    ns_health_watchdog_enabled: bool = True
+    ns_health_watchdog_interval_seconds: int = Field(default=90, ge=30, le=600)
+    # Сколько подряд провалов до первого алерта. 3 при интервале 90с =
+    # ~4.5 минуты — даёт NS шанс быть просто медленным, и не флудит
+    # на одно «моргание сети».
+    ns_health_watchdog_alert_after_failures: int = Field(default=3, ge=1, le=10)
+    # Таймаут одного check_balance внутри watchdog'а. 5с — компромисс:
+    # хватает на медленный NS, но не повисает на дохлой сети.
+    ns_health_watchdog_check_timeout_seconds: float = Field(
+        default=5.0, ge=1.0, le=30.0
+    )
 
     @field_validator("ns_api_secret")
     @classmethod

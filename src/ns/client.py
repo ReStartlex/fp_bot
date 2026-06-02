@@ -210,11 +210,26 @@ class NSClient:
                 response_body=r.text,
                 path=path,
             )
-            # 5xx ретраим, 4xx — нет
-            if 500 <= r.status_code < 600 and attempt < self._settings.ns_retry_attempts:
-                logger.warning(f"NS {r.status_code}, retry через {self._settings.ns_retry_delay_seconds}с")
+            # Аудит #6: 429 (rate limit) и 5xx — retriable.
+            # 4xx (кроме 429) — нет, это наша ошибка.
+            is_retriable = (
+                r.status_code == 429 or 500 <= r.status_code < 600
+            )
+            if is_retriable and attempt < self._settings.ns_retry_attempts:
+                # Учитываем Retry-After (число секунд) если NS его прислал.
+                retry_after_header = r.headers.get("Retry-After", "")
+                try:
+                    delay = float(retry_after_header) if retry_after_header else 0.0
+                except ValueError:
+                    delay = 0.0
+                if delay <= 0:
+                    delay = float(self._settings.ns_retry_delay_seconds)
+                logger.warning(
+                    f"NS {r.status_code}, retry через {delay:.1f}с "
+                    f"(attempt {attempt}/{self._settings.ns_retry_attempts})"
+                )
                 last_exc = err
-                await asyncio.sleep(self._settings.ns_retry_delay_seconds)
+                await asyncio.sleep(delay)
                 continue
             raise err
         # сюда не доходим, но на всякий
@@ -276,12 +291,26 @@ class NSClient:
         data = await self._request("GET", f"/api/v2/order_info/{custom_id}")
         return OrderInfo.model_validate(data)
 
-    async def wait_order_completion(self, custom_id: str) -> OrderInfo:
+    async def wait_order_completion(
+        self,
+        custom_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> OrderInfo:
         """
         Опрашивает order_info пока заказ не дойдёт до финального статуса.
         Бросает NSOrderTimeoutError если не успел.
+
+        timeout_seconds: переопределить ns_order_timeout_seconds из настроек.
+        Нужно, когда внешний pipeline хочет уложиться в свой более жёсткий
+        лимит (например, order_delivery_hard_timeout_seconds).
         """
-        deadline = time.time() + self._settings.ns_order_timeout_seconds
+        effective_timeout = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else self._settings.ns_order_timeout_seconds
+        )
+        deadline = time.time() + effective_timeout
         while time.time() < deadline:
             info = await self.order_info(custom_id)
             status = info.status_enum
@@ -290,7 +319,7 @@ class NSClient:
             await asyncio.sleep(self._settings.ns_order_poll_interval_seconds)
         raise NSOrderTimeoutError(
             f"Заказ {custom_id} не завершился за "
-            f"{self._settings.ns_order_timeout_seconds}с"
+            f"{effective_timeout:.0f}с"
         )
 
 

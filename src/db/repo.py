@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import (
@@ -152,6 +152,73 @@ async def set_lot_group_markup(
     return group
 
 
+async def update_mapping_last_synced(
+    session: AsyncSession,
+    *,
+    mapping_id: int,
+    price: float,
+    stock: int,
+    active: bool,
+) -> None:
+    """
+    Запомнить последний успешно подтверждённый sync для diff-cache.
+
+    Вызывается ТОЛЬКО после успешного save_lot (или после verified GET,
+    подтвердившего что FunPay уже == target). НЕ вызывается при
+    SaveLotFailed — иначе на следующем цикле фаст-патч может молча
+    пропустить retry. Это критично для корректности.
+
+    Используется fast-path'ом в run_sync_once: если NS-target совпадает
+    с (last_synced_price, last_synced_stock, last_synced_active) и
+    last_synced_at моложе TTL — пропускаем FunPay-запрос целиком.
+    """
+    await session.execute(
+        sa_update(Mapping)
+        .where(Mapping.id == mapping_id)
+        .values(
+            last_synced_price=float(price),
+            last_synced_stock=int(stock),
+            last_synced_active=bool(active),
+            last_synced_at=datetime.utcnow(),
+        )
+    )
+
+
+async def invalidate_mapping_cache_for_funpay_lot(
+    session: AsyncSession,
+    *,
+    funpay_lot_id: int,
+) -> int:
+    """
+    Сбросить diff-cache для одного лота (last_synced_at -> NULL).
+
+    Зачем. FunPay при продаже САМ внутренне списывает сток с лота
+    (100 → 97), не дожидаясь нашего save_lot. NS-сток тоже снизился,
+    но `target = min(NS, cap=100)` всё ещё 100, поэтому diff-cache
+    видит `target == last_synced` и пропускает FunPay-запрос —
+    в итоге FunPay-сток так и торчит на 97, не возвращается к 100.
+
+    Решение: при обработке заказа в OrderProcessor мы знаем какой
+    funpay_lot_id «потрогали», и явно инвалидируем его кеш. Следующий
+    sync-цикл (≤30с) видит last_synced_at=NULL → cache miss → реальный
+    FunPay GET → видит 97 ≠ 100 → save_lot(100).
+
+    Возвращает кол-во затронутых строк (обычно 1, или 0 если по
+    funpay_lot_id маппинга нет — заказ с лота, который ещё не
+    замаплен; это норма, не ошибка).
+
+    Намеренно НЕ обнуляем `last_synced_price/stock/active` — это
+    просто метаданные «последнего известного состояния», они
+    игнорируются если `last_synced_at` IS NULL.
+    """
+    result = await session.execute(
+        sa_update(Mapping)
+        .where(Mapping.funpay_lot_id == int(funpay_lot_id))
+        .values(last_synced_at=None)
+    )
+    return result.rowcount or 0
+
+
 # ---------- FX rates ----------
 
 async def save_fx_rate(
@@ -226,6 +293,7 @@ async def create_order(
     chat_id: int | None,
     quantity: int,
     funpay_price_rub: float | None,
+    description: str | None = None,
 ) -> Order:
     obj = Order(
         funpay_order_id=funpay_order_id,
@@ -236,6 +304,7 @@ async def create_order(
         chat_id=chat_id,
         quantity=quantity,
         funpay_price_rub=funpay_price_rub,
+        description=description,
         status="received",
     )
     session.add(obj)
@@ -253,7 +322,91 @@ async def update_order(session: AsyncSession, order: Order, **fields: Any) -> Or
     return order
 
 
-ACTIVE_ORDER_STATUSES = ("received", "ns_created", "ns_paid", "pins_ready", "manual_hold")
+# Литералы для confirmed_by — единое место правды.
+CONFIRMED_BY_BUYER = "buyer"   # покупатель сам нажал «подтвердить» на FunPay
+CONFIRMED_BY_ADMIN = "admin"   # саппорт FunPay подтвердил по нашему запросу (после 24ч)
+CONFIRMED_BY_VALUES = frozenset({CONFIRMED_BY_BUYER, CONFIRMED_BY_ADMIN})
+
+
+async def mark_order_confirmed(
+    session: AsyncSession,
+    *,
+    funpay_order_id: str,
+    confirmed_by: str,
+) -> tuple[Order | None, bool]:
+    """
+    Записать подтверждение успешного выполнения заказа от FunPay.
+
+    Идемпотентно: повторный вызов с тем же `funpay_order_id` НЕ
+    перетирает первое подтверждение (важно: бывает что FunPay шлёт
+    дубль системного сообщения, и нам не нужно «перетирать» buyer
+    подтверждением на admin или наоборот, чтобы /pending_confirm
+    показывал честную статистику).
+
+    Возвращает `(order, was_first_confirmation)`:
+      - `order`: Order если найден; None если заказ не найден в БД
+        (e.g. был выдан до развёртывания бота, или это не наш заказ).
+      - `was_first_confirmation`: True если этот вызов реально пометил
+        заказ как confirmed (был первым); False если заказ уже был
+        подтверждён ранее (повтор от FunPay). Для `order is None`
+        флаг = False — мы не знаем, дубль это или нет, а handler
+        интерпретирует «известный + не первое подтверждение» как
+        запрет на отправку повторного reply.
+    """
+    if confirmed_by not in CONFIRMED_BY_VALUES:
+        raise ValueError(
+            f"mark_order_confirmed: invalid confirmed_by={confirmed_by!r}, "
+            f"допустимо: {sorted(CONFIRMED_BY_VALUES)}"
+        )
+    order = await find_order_by_funpay_id(session, funpay_order_id)
+    if order is None:
+        return None, False
+    # Идемпотентность: если уже подтверждён — не трогаем (сохраняем
+    # «первое» подтверждение, оно более точное).
+    if order.confirmed_at is None:
+        order.confirmed_at = datetime.utcnow()
+        order.confirmed_by = confirmed_by
+        await session.flush()
+        return order, True
+    return order, False
+
+
+async def list_pending_confirmation(
+    session: AsyncSession,
+    *,
+    older_than_hours: int = 24,
+    limit: int = 200,
+) -> list[Order]:
+    """
+    Заказы, которые мы выдали (status=delivered) более `older_than_hours`
+    часов назад, но покупатель так и не нажал «подтвердить» (и админ
+    тоже). Это именно те заказы, которые нужно отправить в саппорт
+    FunPay для ручного подтверждения.
+
+    Сортируем по `updated_at` от старых к новым — чтобы в выгрузке
+    первыми были самые «горящие» (по которым уже точно прошёл срок).
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=older_than_hours)
+    stmt = (
+        select(Order)
+        .where(Order.status == "delivered")
+        .where(Order.confirmed_at.is_(None))
+        .where(Order.updated_at <= cutoff)
+        .order_by(Order.updated_at, Order.id)
+        .limit(limit)
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+ACTIVE_ORDER_STATUSES = (
+    "received",
+    "ns_created",
+    "ns_paid",
+    "pins_ready",
+    "delivering",
+    "manual_hold",
+)
 
 
 async def reserved_quantities_by_service(
@@ -282,7 +435,11 @@ async def list_reconcilable_orders(
     cutoff = datetime.utcnow() - timedelta(seconds=stale_after_seconds)
     stmt = (
         select(Order)
-        .where(Order.status.in_(("ns_created", "ns_paid", "pins_ready")))
+        # Аудит #5: добавили `received` — crash после create_order в БД,
+        # но до NS-pipeline. Без этого заказ висел навсегда.
+        .where(Order.status.in_(
+            ("received", "ns_created", "ns_paid", "pins_ready", "delivering")
+        ))
         .where(Order.updated_at <= cutoff)
         .order_by(Order.updated_at, Order.id)
         .limit(limit)
@@ -344,13 +501,26 @@ async def get_or_create_chat_state(
     chat_id: int,
     buyer_username: str | None,
 ) -> ChatState:
+    """
+    Атомарно вернуть chat_state, создав его при необходимости.
+
+    Используем INSERT OR IGNORE (SQLite ON CONFLICT DO NOTHING), чтобы
+    параллельные таски watcher-а (listen + poll отдают одно сообщение
+    через разные ключи дедупа) не падали с UNIQUE constraint при
+    одновременном INSERT для нового чата.
+    """
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    insert_stmt = (
+        sqlite_insert(ChatState)
+        .values(chat_id=chat_id, buyer_username=buyer_username)
+        .on_conflict_do_nothing(index_elements=[ChatState.chat_id])
+    )
+    await session.execute(insert_stmt)
+
     stmt = select(ChatState).where(ChatState.chat_id == chat_id)
-    state = (await session.execute(stmt)).scalar_one_or_none()
-    if state is None:
-        state = ChatState(chat_id=chat_id, buyer_username=buyer_username)
-        session.add(state)
-        await session.flush()
-    elif buyer_username and state.buyer_username != buyer_username:
+    state = (await session.execute(stmt)).scalar_one()
+    if buyer_username and state.buyer_username != buyer_username:
         state.buyer_username = buyer_username
         await session.flush()
     return state
@@ -361,6 +531,38 @@ async def mark_greeted(session: AsyncSession, state: ChatState) -> None:
 
     state.greeted_at = datetime.utcnow()
     await session.flush()
+
+
+async def mark_greeted_if_due(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    cooldown: timedelta,
+) -> bool:
+    """
+    Атомарно отметить chat_state.greeted_at = now() ТОЛЬКО если предыдущее
+    приветствие было давно (>= cooldown назад) или его ещё не было.
+
+    Возвращает True, если строка была обновлена (этот таск — первый в
+    cooldown-окне и должен отправить приветствие), False иначе (значит
+    другой таск уже зарезервировал отправку — молчим, иначе будет дубль
+    в чате).
+
+    Защищает от race-condition между параллельными вызовами `_maybe_greet`
+    для одного и того же сообщения, которое watcher продublirovал через
+    оба канала (listen-loop с text-key + poll-loop с id-key).
+    """
+    now = datetime.utcnow()
+    cutoff = now - cooldown
+    result = await session.execute(
+        sa_update(ChatState)
+        .where(ChatState.chat_id == chat_id)
+        .where(
+            (ChatState.greeted_at.is_(None)) | (ChatState.greeted_at < cutoff)
+        )
+        .values(greeted_at=now)
+    )
+    return (result.rowcount or 0) > 0
 
 
 async def mark_help_requested(session: AsyncSession, state: ChatState) -> None:
