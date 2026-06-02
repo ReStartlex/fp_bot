@@ -15,6 +15,7 @@ from src.db.models import (
     LotGroup,
     Mapping,
     Order,
+    PendingTelegramAlert,
     SyncRun,
 )
 from src.mapping.groups import (
@@ -575,8 +576,40 @@ async def mark_help_requested(session: AsyncSession, state: ChatState) -> None:
 
 async def mark_paid_order_seen(session: AsyncSession, state: ChatState) -> None:
     """Запомнить, что в чате было системное сообщение об оплате заказа."""
-    state.last_paid_order_at = datetime.utcnow()
+    now = datetime.utcnow()
+    state.last_paid_order_at = now
+    # Бот уже «поздоровался» через order_received/delivery — pre-purchase
+    # greeting после оплаты не нужен.
+    state.greeted_at = now
     await session.flush()
+
+
+async def chat_has_recent_order_context(
+    session: AsyncSession,
+    *,
+    chat_id: int,
+    within: timedelta,
+) -> bool:
+    """
+    True если в чате недавно была коммерческая активность (активный заказ
+    или недавно созданный/обновлённый заказ). Используется, чтобы не
+    слать greeting_pre_purchase после покупки или во время выдачи.
+    """
+    if within.total_seconds() <= 0:
+        within = timedelta(hours=24)
+
+    active = await list_active_orders_for_chat(session, chat_id=chat_id)
+    if active:
+        return True
+
+    cutoff = datetime.utcnow() - within
+    stmt = (
+        select(Order.id)
+        .where(Order.chat_id == chat_id)
+        .where(Order.created_at >= cutoff)
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
 
 
 async def mark_manual_intervention(session: AsyncSession, state: ChatState) -> None:
@@ -635,3 +668,96 @@ async def list_chat_cursors(
 ) -> list[FunpayChatCursor]:
     stmt = select(FunpayChatCursor)
     return list((await session.execute(stmt)).scalars().all())
+
+
+# ---------- Zombie reaper anti-spam ----------
+
+
+async def mark_zombie_reaper_notified(
+    session: AsyncSession,
+    *,
+    mapping_id: int,
+) -> None:
+    await session.execute(
+        sa_update(Mapping)
+        .where(Mapping.id == mapping_id)
+        .values(zombie_reaper_notified_at=datetime.utcnow())
+    )
+
+
+async def clear_zombie_reaper_notified(
+    session: AsyncSession,
+    *,
+    mapping_id: int,
+) -> None:
+    await session.execute(
+        sa_update(Mapping)
+        .where(Mapping.id == mapping_id)
+        .values(zombie_reaper_notified_at=None)
+    )
+
+
+# ---------- Pending Telegram alerts ----------
+
+
+async def enqueue_pending_telegram_alert(
+    session: AsyncSession,
+    *,
+    text: str,
+    parse_mode: str = "HTML",
+    reply_markup_json: str | None = None,
+    retry_after_seconds: float = 30.0,
+) -> PendingTelegramAlert:
+    obj = PendingTelegramAlert(
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup_json=reply_markup_json,
+        retry_count=0,
+        next_retry_at=datetime.utcnow() + timedelta(seconds=retry_after_seconds),
+    )
+    session.add(obj)
+    await session.flush()
+    return obj
+
+
+async def list_due_pending_telegram_alerts(
+    session: AsyncSession,
+    *,
+    limit: int = 20,
+) -> list[PendingTelegramAlert]:
+    now = datetime.utcnow()
+    stmt = (
+        select(PendingTelegramAlert)
+        .where(PendingTelegramAlert.next_retry_at <= now)
+        .order_by(PendingTelegramAlert.next_retry_at, PendingTelegramAlert.id)
+        .limit(limit)
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def reschedule_pending_telegram_alert(
+    session: AsyncSession,
+    alert: PendingTelegramAlert,
+    *,
+    error: str,
+    base_backoff_seconds: float = 30.0,
+    max_backoff_seconds: float = 3600.0,
+) -> None:
+    alert.retry_count += 1
+    delay = min(
+        base_backoff_seconds * (2 ** (alert.retry_count - 1)),
+        max_backoff_seconds,
+    )
+    alert.next_retry_at = datetime.utcnow() + timedelta(seconds=delay)
+    alert.last_error = error[:500]
+    await session.flush()
+
+
+async def delete_pending_telegram_alert(
+    session: AsyncSession,
+    alert_id: int,
+) -> None:
+    obj = await session.get(PendingTelegramAlert, alert_id)
+    if obj is not None:
+        await session.delete(obj)
+        await session.flush()

@@ -70,6 +70,14 @@ class Mapping(Base):
     last_synced_active: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     last_synced_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
+    # Zombie-reaper anti-spam: когда последний раз уведомляли оператора
+    # о деактивации этого disabled-маппинга. Сбрасывается, когда FunPay-лот
+    # подтверждён dead (active=False, amount=0), чтобы при новом «зомби»
+    # эпизоде снова прислать одно уведомление.
+    zombie_reaper_notified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
 
@@ -83,6 +91,26 @@ class FxRate(Base):
     rate: Mapped[float] = mapped_column(Float, nullable=False)
     source: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+
+
+class PendingTelegramAlert(Base):
+    """
+    Очередь Telegram-уведомлений, которые не удалось доставить из-за
+    сетевой ошибки (ConnectTimeout и т.п.). Фоновый worker повторяет
+    отправку с backoff — важные алерты (заказы) не теряются молча.
+    """
+    __tablename__ = "pending_telegram_alerts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    parse_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="HTML")
+    reply_markup_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    next_retry_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
 
 
 class SyncRun(Base):

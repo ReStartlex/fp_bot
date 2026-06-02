@@ -14,7 +14,7 @@ from src.db.repo import (
 )
 from src.mapping.rules import PricingResult
 from src.ns.models import Service
-from src.sync.stock_sync import _risk_skip_reason, _service_with_reserved_stock
+from src.sync.stock_sync import _apply_min_ns_stock_gate, _risk_skip_reason, _service_with_reserved_stock
 
 
 @pytest.fixture()
@@ -40,6 +40,44 @@ def test_reserved_stock_never_goes_negative():
 
     assert adjusted.in_stock == 0
     assert service.in_stock == 2
+
+
+def test_min_ns_stock_gate_zeros_low_stock():
+    service = Service(
+        service_id=20,
+        service_name="Apple 2 USD",
+        price=2.0,
+        currency="USD",
+        in_stock=2,
+    )
+    gated = _apply_min_ns_stock_gate(service, min_to_sell=3)
+    assert gated.in_stock == 0
+    assert service.in_stock == 2
+
+
+def test_min_ns_stock_gate_keeps_stock_at_threshold():
+    service = Service(
+        service_id=20,
+        service_name="Apple 2 USD",
+        price=2.0,
+        currency="USD",
+        in_stock=3,
+    )
+    gated = _apply_min_ns_stock_gate(service, min_to_sell=3)
+    assert gated.in_stock == 3
+
+
+def test_min_ns_stock_gate_after_reserved():
+    service = Service(
+        service_id=20,
+        service_name="Apple 2 USD",
+        price=2.0,
+        currency="USD",
+        in_stock=4,
+    )
+    reserved = _service_with_reserved_stock(service, reserved=2)
+    gated = _apply_min_ns_stock_gate(reserved, min_to_sell=3)
+    assert gated.in_stock == 0
 
 
 def test_guardrail_blocks_low_margin():

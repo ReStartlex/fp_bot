@@ -158,6 +158,11 @@ def _migrate_sqlite_schema(sync_conn) -> None:
         if "last_synced_at" not in columns:
             sync_conn.execute(text("ALTER TABLE mappings ADD COLUMN last_synced_at DATETIME"))
             logger.info("init_db: добавлена колонка mappings.last_synced_at")
+        if "zombie_reaper_notified_at" not in columns:
+            sync_conn.execute(
+                text("ALTER TABLE mappings ADD COLUMN zombie_reaper_notified_at DATETIME")
+            )
+            logger.info("init_db: добавлена колонка mappings.zombie_reaper_notified_at")
     if "orders" in tables:
         columns = {col["name"] for col in inspector.get_columns("orders")}
         for name in ("fx_rate_at_sale", "profit_rub", "profit_margin_percent"):

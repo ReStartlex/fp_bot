@@ -300,6 +300,17 @@ class App:
                 coalesce=True,
             )
 
+        if self.settings.telegram_enabled and self.tg is not None:
+            self.scheduler.add_job(
+                self._safe_telegram_pending_flush,
+                "interval",
+                seconds=self.settings.telegram_pending_flush_interval_seconds,
+                id="telegram_pending_flush",
+                next_run_time=datetime.now() + timedelta(seconds=45),
+                max_instances=1,
+                coalesce=True,
+            )
+
         # Order discovery: 3-й канал доставки заказов (listen-loop выключен,
         # poll-loop не обрабатывает ORDER-события). Раз в N секунд берёт
         # paid-заказы со страницы /orders/trade и для отсутствующих в БД
@@ -840,7 +851,8 @@ class App:
             f"zombie reaper: checked={result.checked} "
             f"already_dead={result.already_dead} "
             f"deactivated={result.deactivated} "
-            f"errors={result.errors}"
+            f"errors={result.errors} "
+            f"notify_suppressed={result.notify_suppressed}"
         )
 
         if result.errors > 0:
@@ -975,6 +987,15 @@ class App:
             await self.tg.send(text)
         except Exception as exc:
             logger.debug(f"_notify_owner_safe: {exc}")
+
+    async def _safe_telegram_pending_flush(self) -> None:
+        """Повторная доставка Telegram-сообщений из SQLite-очереди."""
+        if self.tg is None or not self.tg.enabled:
+            return
+        try:
+            await self.tg.flush_pending_alerts()
+        except Exception as exc:
+            logger.warning(f"telegram pending flush упал: {exc}")
 
     # ---------- Health ----------
 

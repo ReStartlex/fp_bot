@@ -24,6 +24,10 @@ Reaper периодически проверяет disabled-маппинги и,
   - не больше max_per_run save_lot за один прогон (защита от 429 burst);
   - метрики через ReaperResult, Telegram-уведомление при успешной reap.
 
+Anti-spam: уведомление оператору — не чаще одного раза на «эпизод зомби»
+(пока лот не подтверждён dead). Состояние хранится в БД
+(mappings.zombie_reaper_notified_at), переживает рестарт.
+
 Запускается через APScheduler-job `zombie_lot_reaper` (default 600с).
 Отдельно от sync_stock, потому что:
   - sync_stock фильтрует enabled=True (своя забота);
@@ -40,6 +44,10 @@ from sqlalchemy import select
 
 from src.config import Settings
 from src.db.models import Mapping
+from src.db.repo import (
+    clear_zombie_reaper_notified,
+    mark_zombie_reaper_notified,
+)
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
 
@@ -55,6 +63,8 @@ class ReaperResult:
     deactivated: int = 0
     # FunPay GET или save_lot упал.
     errors: int = 0
+    # Уведомление оператору подавлено (уже уведомляли в этом эпизоде).
+    notify_suppressed: int = 0
 
     @property
     def reaped(self) -> bool:
@@ -92,6 +102,18 @@ def _set_lot_dead(lot_fields: object) -> None:
         lot_fields.active = False
     if hasattr(lot_fields, "amount"):
         lot_fields.amount = 0
+
+
+async def _persist_zombie_notified(mapping_id: int) -> None:
+    async with session_factory()() as session:
+        await mark_zombie_reaper_notified(session, mapping_id=mapping_id)
+        await session.commit()
+
+
+async def _persist_zombie_cleared(mapping_id: int) -> None:
+    async with session_factory()() as session:
+        await clear_zombie_reaper_notified(session, mapping_id=mapping_id)
+        await session.commit()
 
 
 async def reap_zombie_lots_once(
@@ -145,11 +167,12 @@ async def reap_zombie_lots_once(
         return result
 
     # 2. Для каждого: GET → возможно save_lot.
-    reaped_labels: list[str] = []
+    notify_labels: list[str] = []
     for mapping in mappings:
         result.checked += 1
         lot_id = mapping.funpay_lot_id
         label = mapping.label or f"lot {lot_id}"
+        already_notified = mapping.zombie_reaper_notified_at is not None
 
         try:
             lot_fields = await funpay_client.get_lot_fields(lot_id)
@@ -165,6 +188,14 @@ async def reap_zombie_lots_once(
                 f"zombie reaper: lot {lot_id} ({label}) уже dead, skip"
             )
             result.already_dead += 1
+            if already_notified:
+                try:
+                    await _persist_zombie_cleared(mapping.id)
+                except Exception as exc:
+                    logger.warning(
+                        f"zombie reaper: не удалось сбросить notified_at "
+                        f"для mapping {mapping.id}: {exc}"
+                    )
             continue
 
         # Лот active — надо deactivate.
@@ -174,7 +205,17 @@ async def reap_zombie_lots_once(
                 f"will be deactivated (active=False, amount=0)"
             )
             result.deactivated += 1
-            reaped_labels.append(f"#{lot_id} {label}")
+            if not already_notified:
+                notify_labels.append(f"#{lot_id} {label}")
+                try:
+                    await _persist_zombie_notified(mapping.id)
+                except Exception as exc:
+                    logger.warning(
+                        f"zombie reaper: не удалось записать notified_at "
+                        f"для mapping {mapping.id}: {exc}"
+                    )
+            else:
+                result.notify_suppressed += 1
             continue
 
         try:
@@ -196,18 +237,29 @@ async def reap_zombie_lots_once(
             f"(half-disabled state устранён)"
         )
         result.deactivated += 1
-        reaped_labels.append(f"#{lot_id} {label}")
+        if not already_notified:
+            notify_labels.append(f"#{lot_id} {label}")
+            try:
+                await _persist_zombie_notified(mapping.id)
+            except Exception as exc:
+                logger.warning(
+                    f"zombie reaper: не удалось записать notified_at "
+                    f"для mapping {mapping.id}: {exc}"
+                )
+        else:
+            result.notify_suppressed += 1
 
-    # 3. Уведомление оператору при успешной reap.
-    if result.reaped and notify_owner is not None:
-        lots_text = "\n  ".join(reaped_labels[:10])
+    # 3. Уведомление оператору — только для лотов, по которым ещё не
+    # уведомляли в текущем «эпизоде зомби».
+    if notify_labels and notify_owner is not None:
+        lots_text = "\n  ".join(notify_labels[:10])
         more = (
-            f"\n…и ещё {len(reaped_labels) - 10}"
-            if len(reaped_labels) > 10 else ""
+            f"\n…и ещё {len(notify_labels) - 10}"
+            if len(notify_labels) > 10 else ""
         )
         try:
             await notify_owner(
-                f"🧟 <b>Zombie-reaper deactivated {result.deactivated} лот(ов):</b>\n  "
+                f"🧟 <b>Zombie-reaper deactivated {len(notify_labels)} лот(ов):</b>\n  "
                 f"{lots_text}{more}\n\n"
                 "Это были disabled-маппинги, у которых лот на FunPay был "
                 "ещё активен после failed-заказа. Теперь они сняты с продажи. "

@@ -68,6 +68,19 @@ def _service_with_reserved_stock(service: Service, reserved: int) -> Service:
     return service.model_copy(update={"in_stock": max(0, service.in_stock - reserved)})
 
 
+def _apply_min_ns_stock_gate(service: Service, min_to_sell: int) -> Service:
+    """
+    Safety stock: если у NS остаток ниже порога — считаем товар недоступным.
+
+    FunPay не позволяет нормально выставить «0 = нет товара», поэтому при
+    маленьком NS-остатке sync должен деактивировать лот, а не держать
+    quantity=1–2 и ловить Refunded после продажи.
+    """
+    if service.in_stock < min_to_sell:
+        return service.model_copy(update={"in_stock": 0})
+    return service
+
+
 def _risk_skip_reason(
     *,
     target: PricingResult,
@@ -523,6 +536,9 @@ async def sync_once(
             if ns_service is not None:
                 reserved = reserved_by_service.get(mapping.ns_service_id, 0)
                 ns_service = _service_with_reserved_stock(ns_service, reserved)
+                ns_service = _apply_min_ns_stock_gate(
+                    ns_service, settings.sync_min_ns_stock_to_sell
+                )
 
             # === Diff-cache fast-path ===
             # Если NS-target совпадает с last_synced и last_synced свежий —

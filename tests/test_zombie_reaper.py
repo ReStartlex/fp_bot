@@ -381,3 +381,69 @@ def test_reaper_result_reaped_property():
     assert ReaperResult(deactivated=1).reaped is True
     assert ReaperResult(deactivated=0, already_dead=5).reaped is False
     assert ReaperResult(errors=3).reaped is False
+
+
+async def test_reap_does_not_spam_notify_on_second_run(db_factory):
+    """
+    Если по lot_id уже уведомляли (zombie_reaper_notified_at), а лот всё
+    ещё «зомби» — второй прогон не шлёт повторное уведомление.
+    """
+    from datetime import datetime
+
+    from src.db.models import Mapping
+
+    settings = _settings()
+    async with db_factory() as s:
+        m = await upsert_mapping(
+            s, funpay_lot_id=69300023, ns_service_id=20,
+            enabled=False, label="Apple Gift Card | USA | 2 USD",
+        )
+        m.zombie_reaper_notified_at = datetime.utcnow()
+        await s.commit()
+
+    fp = _FakeFP({69300023: _FakeLot(69300023, active=True, amount=99)})
+    notifications: list[str] = []
+
+    async def notify(text: str) -> None:
+        notifications.append(text)
+
+    result = await reap_zombie_lots_once(
+        funpay_client=fp, settings=settings, notify_owner=notify,
+    )
+    assert result.deactivated == 1
+    assert result.notify_suppressed == 1
+    assert notifications == []
+
+
+async def test_reap_notifies_again_after_lot_confirmed_dead(db_factory):
+    """
+    После подтверждения dead (active=False, amount=0) notified_at сбрасывается.
+    Если лот снова «ожил» — уведомление приходит один раз.
+    """
+    from datetime import datetime
+
+    settings = _settings()
+    async with db_factory() as s:
+        m = await upsert_mapping(
+            s, funpay_lot_id=100, ns_service_id=42,
+            enabled=False, label="zombie",
+        )
+        m.zombie_reaper_notified_at = datetime.utcnow()
+        await s.commit()
+
+    fp = _FakeFP({100: _FakeLot(100, active=False, amount=0)})
+    notifications: list[str] = []
+
+    async def notify(text: str) -> None:
+        notifications.append(text)
+
+    await reap_zombie_lots_once(
+        funpay_client=fp, settings=settings, notify_owner=notify,
+    )
+    assert notifications == []
+
+    fp.lots[100] = _FakeLot(100, active=True, amount=50)
+    await reap_zombie_lots_once(
+        funpay_client=fp, settings=settings, notify_owner=notify,
+    )
+    assert len(notifications) == 1

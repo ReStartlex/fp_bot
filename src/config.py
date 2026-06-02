@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     sync_min_margin_percent: float = Field(default=1.0)
     sync_max_price_change_percent: float = Field(default=50.0, ge=0)
     sync_reserve_pending_orders: bool = True
+    # Минимальный остаток NS для продажи на FunPay. Если у поставщика
+    # in_stock < этого порога — sync выставляет stock=0 и деактивирует лот.
+    # Default 3 = «продаём только если на NS ≥3 шт» (не держим лот при 0–2).
+    sync_min_ns_stock_to_sell: int = Field(default=3, ge=1)
 
     # === Diff-based sync_stock cache ===
     # sync_stock каждый цикл проверяет 47 лотов и делает 47 GET к
@@ -109,6 +113,13 @@ class Settings(BaseSettings):
     telegram_chat_id: int | None = None
     telegram_enabled: bool = True
     telegram_use_proxy: bool = False
+    # Сколько раз повторить sendMessage при сетевой ошибке до постановки в очередь.
+    telegram_send_max_retries: int = Field(default=3, ge=1, le=8)
+    telegram_send_retry_base_seconds: float = Field(default=1.0, gt=0, le=30.0)
+    # Backoff для pending_telegram_alerts (SQLite-очередь недоставленных).
+    telegram_pending_retry_base_seconds: float = Field(default=30.0, gt=0, le=3600.0)
+    telegram_pending_flush_interval_seconds: int = Field(default=60, ge=15, le=600)
+    telegram_pending_max_per_flush: int = Field(default=20, ge=1, le=100)
     telegram_proxy_type: ProxyType = ProxyType.SOCKS5
     telegram_proxy_host: str | None = None
     telegram_proxy_port: int | None = None
