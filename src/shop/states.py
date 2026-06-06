@@ -39,6 +39,19 @@ class TopupState(StatesGroup):
     waiting_for_custom_amount = State()
 
 
+class SupportState(StatesGroup):
+    """
+    Юзер тапнул «🆘 Поддержка» → бот попросил описать проблему → мы ждём
+    следующее сообщение и пересылаем его владельцу (owner_notify), а юзеру
+    подтверждаем доставку. Одно сообщение = один тикет (как и поиск),
+    после пересылки state очищается.
+
+    Тап по кнопке reply-меню в этом состоянии НЕ пересылается оператору
+    (handler отфильтрован по ~F.text.in_(MENU_BUTTONS)) — это навигация.
+    """
+    waiting_for_message = State()
+
+
 class BuyState(StatesGroup):
     """
     Sprint 5 — checkout flow.

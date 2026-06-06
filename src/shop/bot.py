@@ -106,7 +106,14 @@ from src.shop.payments.cryptobot import (
     CryptoBotClient,
     CryptoBotError,
 )
-from src.shop.states import BuyState, SearchState, TopupState
+from src.shop.states import BuyState, SearchState, SupportState, TopupState
+
+
+# Тексты reply-кнопок главного меню — в состоянии «поддержка» тап по ним
+# означает навигацию, а не текст для оператора (см. _on_support_message).
+MENU_BUTTONS = frozenset(
+    {BTN_CATALOG, BTN_SEARCH, BTN_BALANCE, BTN_ORDERS, BTN_REF, BTN_SUPPORT, BTN_CANCEL}
+)
 
 
 # Сколько результатов поиска отдаём максимум (в FSM и inline-query).
@@ -144,8 +151,9 @@ HELP_TEXT = (
     "/help — эта справка\n\n"
     "💎 <b>Inline-поиск:</b> в любом чате Telegram набери "
     "<code>@neirodropi_bot слово</code> — увидишь подсказки прямо во встроенном UI.\n\n"
-    f"🌐 Сайт: <code>{SITE_URL}</code> (скоро откроется)\n\n"
-    "💡 <i>Магазин в режиме раннего доступа: оплата подключается в ближайшие дни.</i>"
+    f"🌐 Сайт: <code>{SITE_URL}</code>\n\n"
+    "💡 <i>Оплата работает: пополни баланс (CryptoBot) и покупай — "
+    "коды приходят моментально.</i>"
 )
 
 
@@ -380,6 +388,15 @@ class ShopBot:
             self._on_search_query, StateFilter(SearchState.waiting_for_query),
         )
 
+        # FSM: «жду сообщение для поддержки». Тап по reply-кнопке меню сюда
+        # НЕ попадает (отфильтровано ~F.text.in_), он провалится в matcher'ы
+        # меню ниже (которые сами очистят state).
+        dp.message.register(
+            self._on_support_message,
+            StateFilter(SupportState.waiting_for_message),
+            ~F.text.in_(MENU_BUTTONS),
+        )
+
         # Reply-buttons из главного меню (matches по точному тексту).
         # Регистрируем ПОСЛЕ FSM-хендлера, чтобы FSM выигрывал по приоритету.
         dp.message.register(self._on_catalog_cmd, F.text == BTN_CATALOG)
@@ -526,7 +543,7 @@ class ShopBot:
             "• Реферальная программа: 1% кэшбэк с покупок друзей",
             "• Поддержка 24/7 — отвечаем быстро",
             "",
-            f"🌐 Сайт скоро откроется: <code>{SITE_URL}</code>",
+            f"🌐 Наш сайт: <code>{SITE_URL}</code>",
             "",
             "👇 <i>Жми кнопки в меню внизу — это быстрее команд.</i>",
         ])
@@ -1659,23 +1676,79 @@ class ShopBot:
         await message.answer("⬇", reply_markup=main_menu_keyboard())
 
     async def _on_support_cmd(self, message: Message, state: FSMContext) -> None:
-        await state.clear()
+        await state.set_state(SupportState.waiting_for_message)
         await message.answer(
             f"🆘 <b>Поддержка {BRAND}</b>\n\n"
-            "Опиши проблему в этот чат — оператор увидит сообщение и ответит "
-            "лично. В период бета-доступа отвечаем в течение нескольких часов.\n\n"
+            "Опиши проблему <b>одним сообщением</b> в этот чат — оператор "
+            "получит его и ответит лично сюда же. В период бета-доступа "
+            "отвечаем в течение нескольких часов.\n\n"
             "<b>Частые вопросы</b>\n"
-            "• <i>Когда откроется оплата?</i> — на днях. Подключаем "
-            "CryptoBot (комиссия ~3%), Telegram Stars и оплату картой/СБП.\n"
-            "• <i>Безопасно ли?</i> — да: оплата только через официальные шлюзы. "
-            "Доставка ключей моментальная после оплаты.\n"
-            "• <i>Откуда товары?</i> — у проверенного поставщика (NS.gifts), "
-            "тот же, что у топовых FunPay-продавцов.\n"
+            "• <i>Безопасно ли?</i> — да: оплата только через официальные шлюзы, "
+            "доставка ключей моментальная после оплаты.\n"
+            "• <i>Откуда товары?</i> — у проверенного поставщика (NS.gifts).\n"
             "• <i>Что с кэшбэком?</i> — 1% от покупок друзей идёт на твой "
-            "внутренний баланс, балансом можно оплачивать заказы.\n\n"
-            f"🌐 Сайт: <code>{SITE_URL}</code>",
-            reply_markup=main_menu_keyboard(),
+            "внутренний баланс, им можно оплачивать заказы.\n\n"
+            f"🌐 Сайт: <code>{SITE_URL}</code>\n\n"
+            "<i>Чтобы выйти без отправки — нажми «Отмена».</i>",
+            reply_markup=cancel_keyboard(),
         )
+
+    async def _on_support_message(
+        self, message: Message, state: FSMContext,
+    ) -> None:
+        """
+        Юзер в SupportState прислал текст проблемы → пересылаем владельцу
+        и подтверждаем доставку. Это закрывает баг, когда «Поддержка»
+        обещала ответ, но оператору ничего не приходило.
+        """
+        await state.clear()
+        from_user = message.from_user
+        if from_user is None:
+            return
+
+        body = (message.text or message.caption or "").strip()
+        if not body:
+            body = "[вложение без текста]"
+
+        delivered = False
+        if self._owner_notify is not None:
+            uname = (
+                f"@{html.escape(from_user.username)}"
+                if from_user.username else "(без username)"
+            )
+            name = html.escape(from_user.first_name or "покупатель")
+            reply_hint = (
+                f"Ответить: напиши {uname} в личку."
+                if from_user.username
+                else "У покупателя нет username — ответ дойдёт, когда он напишет снова."
+            )
+            try:
+                await self._owner_notify(
+                    f"🆘 <b>Поддержка — новое обращение</b>\n"
+                    f"От: {name} {uname} "
+                    f"(tg_id=<code>{from_user.id}</code>)\n\n"
+                    f"{html.escape(body)}\n\n"
+                    f"<i>{reply_hint}</i>"
+                )
+                delivered = True
+            except Exception as exc:
+                logger.warning(f"shop support owner_notify failed: {exc}")
+        else:
+            logger.warning("shop support: owner_notify is None — обращение не доставлено")
+
+        if delivered:
+            await message.answer(
+                "✅ <b>Сообщение отправлено оператору.</b>\n\n"
+                "Ответим в течение нескольких часов (в период беты) — "
+                "прямо сюда, в этот чат. Можешь продолжать пользоваться магазином.",
+                reply_markup=main_menu_keyboard(),
+            )
+        else:
+            await message.answer(
+                "⚠️ Не получилось отправить сообщение оператору автоматически.\n"
+                f"Напиши нам напрямую — мы на связи. 🌐 <code>{SITE_URL}</code>",
+                reply_markup=main_menu_keyboard(),
+            )
 
     async def _on_cancel_cmd(
         self, message: Message, state: FSMContext,
