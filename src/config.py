@@ -169,6 +169,25 @@ class Settings(BaseSettings):
     web_api_port: int = Field(default=8080, ge=1, le=65535)
     web_api_token: SecretStr | None = None
 
+    # ─── Сайт neurodrop.ru: веб-сессии (Telegram Login) ─────────────────
+    # Секрет для подписи session-cookie сайта. Если не задан — выводится
+    # детерминированно из shop_telegram_bot_token (sha256), чтобы работало
+    # без отдельной настройки; задавай явно, если хочешь инвалидировать все
+    # сессии независимо от смены токена бота.
+    web_session_secret: SecretStr | None = None
+    # Время жизни веб-сессии. 30 дней по умолчанию — покупатель не
+    # перелогинивается на каждый заход.
+    site_session_ttl_seconds: int = Field(
+        default=30 * 24 * 3600, ge=3600, le=365 * 24 * 3600
+    )
+    # secure-флаг cookie. В проде (https neurodrop.ru) обязателен True;
+    # для локальной разработки/тестов по http выставляй False.
+    site_cookie_secure: bool = True
+    # Максимальный возраст data из Telegram Login Widget (anti-replay).
+    # После верификации мы выдаём свою долгоживущую сессию, поэтому само
+    # окно логина можно держать коротким — 1 час.
+    site_login_max_age_seconds: int = Field(default=3600, ge=60, le=86400)
+
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_dir: str = "logs"
 

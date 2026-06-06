@@ -11,7 +11,9 @@ from fastapi.staticfiles import StaticFiles
 
 from src.api.auth import require_api_auth
 from src.api.cryptobot_webhook import router as cryptobot_router
+from src.api.public_router import router as public_router
 from src.api.shop_router import router as shop_router
+from src.api.site_router import router as site_router
 from src.config import Settings, get_settings
 from src.db.session import close_db, init_db
 from src.logging_setup import setup_logging
@@ -100,6 +102,14 @@ def create_app() -> FastAPI:
     # Sprint 6: Mini App router — авторизация через Telegram initData
     # (X-Telegram-Init-Data header), отдельная от admin Bearer token.
     app.include_router(shop_router)
+
+    # Публичный API витрины neurodrop.ru — без авторизации, только чтение
+    # каталога. Используется SSR-фронтом сайта и поисковыми роботами.
+    app.include_router(public_router)
+
+    # Авторизованный API сайта (Telegram Login → cookie/Bearer сессия):
+    # личный кабинет, заказы, checkout. Единый ShopUser/баланс с ботом.
+    app.include_router(site_router)
 
     # Раздаём Mini App build artifacts: src/web/miniapp/* → /app/*
     # (npm run build кладёт сюда index.html + assets/).

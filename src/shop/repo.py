@@ -702,6 +702,68 @@ async def list_similar_services(
 
 
 # ════════════════════════════════════════════════════════════════════════
+#                    Public site (neurodrop.ru) catalog helpers
+# ════════════════════════════════════════════════════════════════════════
+# Используются публичным (без авторизации) API витрины сайта: главная,
+# счётчики, sitemap.xml. Все запросы read-only и работают по тем же
+# фильтрам (enabled + in_stock>0), что и UI бота/Mini App.
+
+
+@dataclass(frozen=True)
+class CatalogTotals:
+    """Сводка каталога для главной страницы сайта и health-индикатора."""
+    products_in_stock: int       # сервисов с in_stock>0 (enabled)
+    groups_count: int            # уникальных брендов/групп (по group_slug)
+    categories_count: int        # уникальных NS-категорий
+    updated_at: datetime | None  # самый свежий fetched_at в каталоге
+
+
+async def get_catalog_totals(session: AsyncSession) -> CatalogTotals:
+    """Агрегаты по витрине одним набором дешёвых COUNT'ов."""
+    base = (
+        ShopCatalogCache.enabled.is_(True),
+        ShopCatalogCache.in_stock > 0,
+    )
+    products = int((await session.execute(
+        select(func.count(ShopCatalogCache.ns_service_id)).where(*base)
+    )).scalar() or 0)
+    groups = int((await session.execute(
+        select(func.count(func.distinct(ShopCatalogCache.group_slug)))
+        .where(*base, ShopCatalogCache.group_slug.is_not(None))
+    )).scalar() or 0)
+    categories = int((await session.execute(
+        select(func.count(func.distinct(ShopCatalogCache.category_id))).where(*base)
+    )).scalar() or 0)
+    updated_at = (await session.execute(
+        select(func.max(ShopCatalogCache.fetched_at)).where(*base)
+    )).scalar()
+    return CatalogTotals(
+        products_in_stock=products,
+        groups_count=groups,
+        categories_count=categories,
+        updated_at=updated_at,
+    )
+
+
+async def list_active_service_ids(
+    session: AsyncSession,
+) -> list[tuple[int, datetime]]:
+    """(ns_service_id, fetched_at) всех продаваемых сейчас услуг — для sitemap.xml."""
+    stmt = (
+        select(ShopCatalogCache.ns_service_id, ShopCatalogCache.fetched_at)
+        .where(
+            ShopCatalogCache.enabled.is_(True),
+            ShopCatalogCache.in_stock > 0,
+        )
+        .order_by(ShopCatalogCache.ns_service_id)
+    )
+    return [
+        (int(sid), fetched)
+        for sid, fetched in (await session.execute(stmt)).all()
+    ]
+
+
+# ════════════════════════════════════════════════════════════════════════
 #                    Phase 1: payments (CryptoBot и далее)
 # ════════════════════════════════════════════════════════════════════════
 # ShopPayment — независимый объект, отслеживающий жизненный цикл одной
