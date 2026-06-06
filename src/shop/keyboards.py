@@ -619,8 +619,7 @@ def balance_keyboard(
       покупки друга) — пригласи друзей в 👥 Рефералы.</i>
 
     Кнопки:
-      [ 🪙 CryptoBot ]  [ ⭐ Telegram Stars ]
-      [ 💳 Картой / СБП ]
+      [ 🪙 Пополнить (CryptoBot) ]
       [ 📊 История операций ]
       [ 👥 Пригласить друзей ]
     """
@@ -643,11 +642,8 @@ def balance_keyboard(
         )
 
     rows: list[list[InlineKeyboardButton]] = [
-        [
-            InlineKeyboardButton(text="🪙 CryptoBot", callback_data="topup:crypto"),
-            InlineKeyboardButton(text="⭐ Stars", callback_data="topup:stars"),
-        ],
-        [InlineKeyboardButton(text="💳 Картой / СБП", callback_data="topup:card")],
+        [InlineKeyboardButton(text="🪙 Пополнить (CryptoBot)",
+                              callback_data="topup:crypto")],
         [InlineKeyboardButton(text="📊 История операций",
                               callback_data="bal_hist:0")],
         [InlineKeyboardButton(text="👥 Пригласить друзей", callback_data="ref")],

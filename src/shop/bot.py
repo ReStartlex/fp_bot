@@ -420,12 +420,6 @@ class ShopBot:
         dp.callback_query.register(
             self._on_cb_topup_crypto, F.data == "topup:crypto",
         )
-        dp.callback_query.register(
-            self._on_cb_topup_stars, F.data == "topup:stars",
-        )
-        dp.callback_query.register(
-            self._on_cb_topup_card, F.data == "topup:card",
-        )
         # Sprint 3: CryptoBot top-up flow
         dp.callback_query.register(
             self._on_cb_topup_amount, F.data.startswith("tp_amt:"),
@@ -1585,18 +1579,6 @@ class ShopBot:
             first_name=cb.from_user.first_name,
         )
         await self._safe_edit(cb, text=text, markup=markup)
-
-    async def _on_cb_topup_stars(self, cb: CallbackQuery) -> None:
-        await cb.answer(
-            "⭐ Telegram Stars подключаются в ближайшие дни.",
-            show_alert=True,
-        )
-
-    async def _on_cb_topup_card(self, cb: CallbackQuery) -> None:
-        await cb.answer(
-            "💳 Оплата картой / СБП будет позже — после CryptoBot и Stars.",
-            show_alert=True,
-        )
 
     # ─────────────── referrals ───────────────
 

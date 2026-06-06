@@ -323,8 +323,9 @@ def test_balance_keyboard_has_topup_buttons():
     )
     callbacks = [b.callback_data for row in kb.inline_keyboard for b in row]
     assert "topup:crypto" in callbacks
-    assert "topup:stars" in callbacks
-    assert "topup:card" in callbacks
+    # Stars / Карта были заглушками-тупиками — убраны до реального подключения.
+    assert "topup:stars" not in callbacks
+    assert "topup:card" not in callbacks
     assert "bal_hist:0" in callbacks
     assert "ref" in callbacks
 
