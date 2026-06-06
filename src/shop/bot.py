@@ -99,14 +99,25 @@ from src.shop.repo import (
     parse_referral_payload,
     search_services,
 )
-from src.shop.checkout import CheckoutOutcome, attempt_checkout_via_balance
+from src.shop.checkout import (
+    CheckoutOutcome,
+    attempt_checkout_via_balance,
+    validate_and_build_fields,
+    _service_requires_fields,
+)
 from src.shop.delivery import deliver_shop_order_once
 from src.config_runtime import get_shop_referral_percent
 from src.shop.payments.cryptobot import (
     CryptoBotClient,
     CryptoBotError,
 )
-from src.shop.states import BuyState, SearchState, SupportState, TopupState
+from src.shop.states import (
+    BuyState,
+    FieldEntryState,
+    SearchState,
+    SupportState,
+    TopupState,
+)
 
 
 # Тексты reply-кнопок главного меню — в состоянии «поддержка» тап по ним
@@ -394,6 +405,13 @@ class ShopBot:
         dp.message.register(
             self._on_support_message,
             StateFilter(SupportState.waiting_for_message),
+            ~F.text.in_(MENU_BUTTONS),
+        )
+
+        # FSM: пошаговый ввод полей товара (ID игрока, email и т.п.).
+        dp.message.register(
+            self._on_field_entry,
+            StateFilter(FieldEntryState.collecting),
             ~F.text.in_(MENU_BUTTONS),
         )
 
@@ -730,6 +748,19 @@ class ShopBot:
             await self._safe_edit(cb, text=text, markup=markup)
             return
 
+        # Товар требует доп. поля (ID игрока, email и т.п.) — собираем их
+        # пошагово, и только потом покажем экран подтверждения.
+        requires, schema = _service_requires_fields(svc)
+        if requires:
+            await state.set_state(FieldEntryState.collecting)
+            await state.update_data(
+                buy_sid=sid, field_schema=schema or [],
+                field_idx=0, field_values={},
+            )
+            await cb.answer()
+            await self._ask_field(cb.message, schema or [], 0)
+            return
+
         # Запомним sid в FSM, чтобы при «Подтвердить» взять тот же svc
         await state.set_state(BuyState.awaiting_confirmation)
         await state.update_data(buy_sid=sid)
@@ -761,9 +792,9 @@ class ShopBot:
             await cb.answer("Битая ссылка", show_alert=True)
             return
 
-        # State используем только для гигиены — никаких критических данных
-        # из FSM мы не берём (sid из callback_data — единственный источник
-        # правды).
+        # Значения доп. полей собраны в FieldEntryState (если товар их требует).
+        data = await state.get_data()
+        field_values = data.get("buy_field_values")
         await state.clear()
 
         # Atomic checkout
@@ -777,6 +808,7 @@ class ShopBot:
             )
             result = await attempt_checkout_via_balance(
                 session, user_id=user.id, ns_service_id=sid,
+                field_values=field_values,
             )
             if result.outcome != CheckoutOutcome.OK:
                 await session.rollback()
@@ -805,8 +837,8 @@ class ShopBot:
             return
         if result.outcome == CheckoutOutcome.REQUIRES_FIELDS:
             await cb.answer(
-                "Для этого товара нужны дополнительные данные. "
-                "Эта функция появится позже — обратись в 🆘 Поддержку.",
+                "Сначала заполни данные для товара — нажми «Купить» "
+                "в карточке и заполни поля.",
                 show_alert=True,
             )
             return
@@ -863,6 +895,88 @@ class ShopBot:
                 await cb.message.delete()
         except Exception:
             pass
+
+    async def _ask_field(self, message: Message | None, schema: list, idx: int) -> None:
+        """Просит ввести значение для schema[idx]."""
+        if message is None or idx >= len(schema):
+            return
+        f = schema[idx]
+        label = f.get("name") or f.get("key") or "значение"
+        required = f.get("required", True)
+        lines = [
+            f"📝 <b>Шаг {idx + 1} из {len(schema)}</b>",
+            f"Введи: <b>{html.escape(str(label))}</b>",
+        ]
+        enum = f.get("enum")
+        if enum:
+            lines.append(
+                "Варианты: " + ", ".join(html.escape(str(e)) for e in enum)
+            )
+        if not required:
+            lines.append("<i>Необязательное — отправь «-», чтобы пропустить.</i>")
+        await message.answer("\n".join(lines), reply_markup=cancel_keyboard())
+
+    async def _on_field_entry(self, message: Message, state: FSMContext) -> None:
+        """Пошаговый сбор значений полей товара перед подтверждением покупки."""
+        if message.from_user is None:
+            return
+        data = await state.get_data()
+        schema = data.get("field_schema") or []
+        idx = int(data.get("field_idx", 0))
+        values = dict(data.get("field_values", {}))
+        if not schema or idx >= len(schema):
+            await state.clear()
+            await message.answer(
+                "Что-то пошло не так — начни покупку заново.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        f = schema[idx]
+        key = f.get("key")
+        required = f.get("required", True)
+        raw = (message.text or "").strip()
+        if raw == "-" and not required:
+            pass  # пропуск необязательного поля
+        else:
+            _, err = validate_and_build_fields([f], {key: raw})
+            if err is not None:
+                await message.answer(
+                    f"⚠️ {err}\nПопробуй ещё раз или нажми «Отмена».",
+                    reply_markup=cancel_keyboard(),
+                )
+                return
+            values[key] = raw
+
+        idx += 1
+        await state.update_data(field_idx=idx, field_values=values)
+        if idx < len(schema):
+            await self._ask_field(message, schema, idx)
+            return
+
+        # Все поля собраны → экран подтверждения покупки.
+        sid = data.get("buy_sid")
+        async with session_factory()() as session:
+            user, _ = await get_or_create_user(
+                session,
+                telegram_user_id=message.from_user.id,
+                telegram_username=message.from_user.username,
+                first_name=message.from_user.first_name,
+            )
+            svc = await get_catalog_service(session, ns_service_id=sid)
+            await session.commit()
+        if svc is None:
+            await state.clear()
+            await message.answer(
+                "Товар стал недоступен.", reply_markup=main_menu_keyboard(),
+            )
+            return
+        await state.set_state(BuyState.awaiting_confirmation)
+        await state.update_data(buy_sid=sid, buy_field_values=values)
+        text, markup = checkout_confirm_keyboard(
+            svc=svc, user_balance_kopecks=user.balance_kopecks,
+        )
+        await message.answer(text, reply_markup=markup)
 
     async def _on_cb_orders_page(self, cb: CallbackQuery) -> None:
         """`orders:N` — пагинация в истории заказов."""

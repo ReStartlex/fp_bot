@@ -52,6 +52,18 @@ class SupportState(StatesGroup):
     waiting_for_message = State()
 
 
+class FieldEntryState(StatesGroup):
+    """
+    Товар требует доп. поля для NS-выдачи (ID игрока, email и т.п.).
+    После «Купить» бот пошагово спрашивает каждое поле схемы и валидирует
+    ввод; когда все поля собраны — показывает экран подтверждения покупки.
+
+    FSM-data: buy_sid, field_schema (list), field_idx (int), field_values (dict).
+    Тап по кнопке меню в этом состоянии отменяет ввод (навигация).
+    """
+    collecting = State()
+
+
 class BuyState(StatesGroup):
     """
     Sprint 5 — checkout flow.

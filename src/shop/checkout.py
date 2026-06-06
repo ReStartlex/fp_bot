@@ -20,6 +20,7 @@ Sprint 5 — checkout flow для shop-бота.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -72,6 +73,7 @@ class CheckoutResult:
     deficit_kopecks: int = 0
     # Для REQUIRES_FIELDS
     required_fields: list[dict[str, Any]] | None = None
+    field_error: str | None = None
 
 
 def _service_requires_fields(svc: ShopCatalogCache) -> tuple[bool, list[dict[str, Any]] | None]:
@@ -104,11 +106,72 @@ def _service_requires_fields(svc: ShopCatalogCache) -> tuple[bool, list[dict[str
     return False, None
 
 
+def validate_and_build_fields(
+    schema: list[dict[str, Any]],
+    values: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """
+    Сверяет введённые значения со схемой полей NS и собирает список
+    {key, value} для create_order. Возвращает (поля, None) при успехе или
+    (None, человеко-читаемая_ошибка) при проблеме.
+
+    Валидация: required-присутствие, enum-членство, regex, числовой тип +
+    min/max. Необязательные пустые поля просто пропускаются.
+    """
+    values = values or {}
+    built: list[dict[str, Any]] = []
+    for f in schema:
+        if not isinstance(f, dict):
+            continue
+        key = f.get("key")
+        if not key:
+            continue
+        label = f.get("name") or key
+        required = f.get("required", True)
+        raw = values.get(key)
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            if required:
+                return None, f"Заполни поле «{label}»."
+            continue
+        val: Any = raw.strip() if isinstance(raw, str) else raw
+
+        enum = f.get("enum")
+        if enum and str(val) not in [str(e) for e in enum]:
+            return None, (
+                f"Поле «{label}»: допустимые значения — {', '.join(map(str, enum))}."
+            )
+
+        rgx = f.get("regex")
+        if rgx:
+            try:
+                if not re.fullmatch(rgx, str(val)):
+                    return None, f"Поле «{label}» заполнено в неверном формате."
+            except re.error:
+                pass  # битый regex в схеме — не блокируем покупку
+
+        ftype = (f.get("type") or "").lower()
+        if ftype in ("int", "integer", "number", "float", "numeric"):
+            try:
+                num = float(val)
+            except (ValueError, TypeError):
+                return None, f"Поле «{label}» должно быть числом."
+            mn, mx = f.get("min"), f.get("max")
+            if mn is not None and num < mn:
+                return None, f"Поле «{label}»: минимум {mn}."
+            if mx is not None and num > mx:
+                return None, f"Поле «{label}»: максимум {mx}."
+            val = int(num) if ftype in ("int", "integer") and num.is_integer() else num
+
+        built.append({"key": key, "value": val})
+    return built, None
+
+
 async def attempt_checkout_via_balance(
     session: AsyncSession,
     *,
     user_id: int,
     ns_service_id: int,
+    field_values: dict[str, Any] | None = None,
 ) -> CheckoutResult:
     """
     Полный atomic checkout для оплаты из внутреннего баланса.
@@ -149,13 +212,25 @@ async def attempt_checkout_via_balance(
     if (svc.in_stock or 0) <= 0:
         return CheckoutResult(outcome=CheckoutOutcome.OUT_OF_STOCK)
 
-    # 3. Fields requirement (Sprint 5: ещё не реализован UI ввода)
+    # 3. Fields requirement: если товар требует поля (ID игрока, email и т.п.) —
+    # собираем их у пользователя. Без значений возвращаем схему (фронт/бот
+    # отрисуют форму), со значениями — валидируем и кладём в заказ.
     requires_fields, schema = _service_requires_fields(svc)
+    order_fields_json = "[]"
     if requires_fields:
-        return CheckoutResult(
-            outcome=CheckoutOutcome.REQUIRES_FIELDS,
-            required_fields=schema,
-        )
+        if not field_values:
+            return CheckoutResult(
+                outcome=CheckoutOutcome.REQUIRES_FIELDS,
+                required_fields=schema,
+            )
+        built, field_err = validate_and_build_fields(schema or [], field_values)
+        if field_err is not None:
+            return CheckoutResult(
+                outcome=CheckoutOutcome.REQUIRES_FIELDS,
+                required_fields=schema,
+                field_error=field_err,
+            )
+        order_fields_json = json.dumps(built, ensure_ascii=False)
 
     price = int(svc.rub_price_kopecks or 0)
     if price <= 0:
@@ -182,7 +257,7 @@ async def attempt_checkout_via_balance(
         user_id=user.id,
         ns_service_id=svc.ns_service_id,
         ns_service_name=svc.service_name,
-        fields_json=svc.fields_json or "[]",
+        fields_json=order_fields_json,
         quantity=1,
         total_rub_kopecks=price,
         ns_price_usd=svc.ns_price_usd,

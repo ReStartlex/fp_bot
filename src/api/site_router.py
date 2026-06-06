@@ -96,6 +96,7 @@ class TopupResponse(BaseModel):
 
 class SiteCheckoutRequest(BaseModel):
     ns_service_id: int
+    field_values: dict[str, Any] | None = None
 
 
 class SiteCheckoutResponse(BaseModel):
@@ -105,6 +106,9 @@ class SiteCheckoutResponse(BaseModel):
     need_kopecks: int | None = None
     have_kopecks: int | None = None
     deficit_kopecks: int | None = None
+    # Для requires_fields: схема полей и текст ошибки валидации.
+    required_fields: list[dict[str, Any]] | None = None
+    field_error: str | None = None
 
 
 class SiteOrderOut(BaseModel):
@@ -304,6 +308,7 @@ async def site_checkout(
     async with session_factory()() as session:
         result = await attempt_checkout_via_balance(
             session, user_id=user.id, ns_service_id=body.ns_service_id,
+            field_values=body.field_values,
         )
         if result.outcome == CheckoutOutcome.OK:
             await session.commit()
@@ -322,6 +327,12 @@ async def site_checkout(
             need_kopecks=result.need_kopecks,
             have_kopecks=result.have_kopecks,
             deficit_kopecks=result.deficit_kopecks,
+        )
+    if result.outcome == CheckoutOutcome.REQUIRES_FIELDS:
+        return SiteCheckoutResponse(
+            outcome="requires_fields",
+            required_fields=result.required_fields,
+            field_error=result.field_error,
         )
     return SiteCheckoutResponse(outcome=result.outcome.value)
 
