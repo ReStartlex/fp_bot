@@ -1718,9 +1718,8 @@ class ShopBot:
             )
             name = html.escape(from_user.first_name or "покупатель")
             reply_hint = (
-                f"Ответить: напиши {uname} в личку."
-                if from_user.username
-                else "У покупателя нет username — ответ дойдёт, когда он напишет снова."
+                f"Ответить: /shop_reply {from_user.id} <текст> "
+                f"(или напиши {uname} в личку)."
             )
             try:
                 await self._owner_notify(

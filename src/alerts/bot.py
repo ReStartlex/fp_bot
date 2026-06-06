@@ -26,7 +26,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from loguru import logger
 from sqlalchemy import desc, func, select
@@ -418,6 +418,10 @@ class TelegramBot:
         # одноразовый NSClient как раньше (этот режим оставлен для тестов
         # и для случая, когда main.py ещё не успел проинициализироваться).
         self._ns_client = ns_client
+        # Колбэк отправки ответа покупателю в shop-бот (см. /shop_reply).
+        # Выставляется из main.py после старта shop-бота:
+        #   self.bot.set_shop_reply_sender(self.shop_bot.send_message_to_user)
+        self._shop_reply_sender: Callable[[int, str], Awaitable[None]] | None = None
         self._bot: Bot | None = None
         self._dp: Dispatcher | None = None
         self._task: asyncio.Task | None = None
@@ -439,6 +443,12 @@ class TelegramBot:
 
     def update_funpay_client(self, fp: FunPayClient | None) -> None:
         self._funpay_client = fp
+
+    def set_shop_reply_sender(
+        self, sender: Callable[[int, str], Awaitable[None]] | None,
+    ) -> None:
+        """Подключает отправку ответов покупателям через shop-бот (/shop_reply)."""
+        self._shop_reply_sender = sender
 
     @property
     def enabled(self) -> bool:
@@ -503,6 +513,7 @@ class TelegramBot:
             BotCommand(command="ns_search", description="🔍 Поиск NS"),
             BotCommand(command="sync", description="🔄 Синхронизация"),
             BotCommand(command="orders", description="📦 Последние заказы"),
+            BotCommand(command="shop_reply", description="💬 Ответить покупателю: /shop_reply <tg_id> текст"),
             BotCommand(command="pending_confirm", description="⏳ Заказы без подтв. (список для саппорта FunPay)"),
             BotCommand(command="sync_pending_confirm", description="🔄 Sync /pending_confirm с FunPay (чистит фантомы)"),
             BotCommand(command="setmarkup", description="✏ Наценка одного маппинга"),
@@ -531,6 +542,44 @@ class TelegramBot:
             else msg_or_cq.chat.id
         )
         return chat_id == owner
+
+    async def _do_shop_reply(self, msg: Message, args: str | None) -> None:
+        """
+        /shop_reply <tg_user_id> <текст> — ответить покупателю в shop-бот
+        на обращение из «🆘 Поддержка». tg_id берётся из уведомления.
+        """
+        if self._shop_reply_sender is None:
+            await msg.answer("⚠️ Shop-бот не запущен — ответить нельзя.")
+            return
+        parts = (args or "").strip().split(maxsplit=1)
+        if len(parts) < 2:
+            await msg.answer(
+                "Использование: <code>/shop_reply &lt;tg_id&gt; текст ответа</code>\n"
+                "tg_id — из уведомления «🆘 Поддержка»."
+            )
+            return
+        try:
+            tg_id = int(parts[0])
+        except ValueError:
+            await msg.answer("Первый аргумент должен быть числовым tg_id.")
+            return
+        text = parts[1].strip()
+        if not text:
+            await msg.answer("Пустой текст ответа.")
+            return
+        payload = (
+            "💬 <b>Ответ поддержки NeuroDrop</b>\n\n" + html.escape(text)
+        )
+        try:
+            await self._shop_reply_sender(tg_id, payload)
+        except Exception as exc:
+            await msg.answer(
+                "❌ Не удалось доставить покупателю: "
+                f"<code>{html.escape(str(exc)[:200])}</code>\n"
+                "Возможно, покупатель не открывал shop-бот."
+            )
+            return
+        await msg.answer(f"✅ Ответ отправлен покупателю <code>{tg_id}</code>.")
 
     # ─────────────── регистрация хэндлеров ───────────────
 
@@ -602,6 +651,12 @@ class TelegramBot:
                 self._menu_text(msg.chat.id),
                 reply_markup=ui.main_menu(self._target_label_for(msg.chat.id)),
             )
+
+        @dp.message(Command("shop_reply"))
+        async def cmd_shop_reply(msg: Message, command: CommandObject) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_shop_reply(msg, command.args)
 
         @dp.message(Command("status"))
         async def cmd_status(msg: Message) -> None:

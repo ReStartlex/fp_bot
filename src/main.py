@@ -160,6 +160,10 @@ class App:
             # APScheduler-воркер всё равно подберёт заказ на следующем тике.
             self.shop_bot._delivery_runner = self._shop_inline_deliver
             await self.shop_bot.start()
+            # Двусторонняя поддержка: owner-бот сможет отвечать покупателям
+            # командой /shop_reply <tg_id> <текст> через shop-бот.
+            if self.bot is not None:
+                self.bot.set_shop_reply_sender(self.shop_bot.send_message_to_user)
         except Exception as exc:
             logger.exception(f"Shop-бот не стартовал: {exc}")
             if self.tg is not None:
