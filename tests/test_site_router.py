@@ -284,6 +284,32 @@ async def test_webapp_auth_rejects_bad(client, db_factory):
     assert r.status_code == 401
 
 
+# ─── OAuth login (Google/Yandex) ───────────────────────────────────
+
+
+async def test_oauth_login_creates_session(client, db_factory):
+    r = client.post(
+        "/api/site/auth/oauth",
+        json={"provider": "google", "sub": "g-123", "email": "u@gmail.com",
+              "first_name": "Гость"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["telegram_user_id"] is None
+    assert body["token"]
+    assert "nd_session" in r.cookies
+    # сессия работает: /me доступен по этой cookie
+    me = client.get("/api/site/me")
+    assert me.status_code == 200
+
+
+async def test_oauth_login_rejects_unknown_provider(client, db_factory):
+    r = client.post(
+        "/api/site/auth/oauth", json={"provider": "vk", "sub": "1"},
+    )
+    assert r.status_code == 400
+
+
 async def test_topup_below_min_rejected(client, db_factory, monkeypatch):
     monkeypatch.setattr("src.api.site_router.CryptoBotClient", _FakeCryptoClient)
     client.post("/api/site/auth/telegram", json=make_login(555))

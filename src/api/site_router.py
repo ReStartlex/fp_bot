@@ -49,10 +49,11 @@ from src.shop.payments.cryptobot import CryptoBotClient, CryptoBotError
 from src.shop.repo import (
     create_topup_payment,
     get_balance_stats,
+    get_or_create_oauth_user,
     get_or_create_user,
     get_referral_stats,
     get_shop_order,
-    get_user_by_tg,
+    get_user_by_id,
     list_user_orders,
 )
 
@@ -67,7 +68,7 @@ COOKIE_NAME = "nd_session"
 
 class SiteMe(BaseModel):
     user_id: int
-    telegram_user_id: int
+    telegram_user_id: int | None
     username: str | None
     first_name: str | None
     photo_url: str | None = None
@@ -87,6 +88,13 @@ class LoginResponse(SiteMe):
 
 class WebAppAuthRequest(BaseModel):
     init_data: str
+
+
+class OAuthLoginRequest(BaseModel):
+    provider: str
+    sub: str
+    email: str | None = None
+    first_name: str | None = None
 
 
 class TopupRequest(BaseModel):
@@ -161,9 +169,9 @@ async def current_site_user(
     except SessionError as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, f"bad session: {exc}")
     async with session_factory()() as session:
-        user = await get_user_by_tg(
-            session, telegram_user_id=claims.telegram_user_id
-        )
+        # По user_id (а не telegram_user_id) — веб-аккаунты Google/Яндекс/email
+        # не имеют telegram_user_id.
+        user = await get_user_by_id(session, claims.user_id)
     if user is None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "user not found")
     if user.blocked:
@@ -304,6 +312,53 @@ async def auth_webapp(
     )
     me = await _build_me(user, settings)
     me["photo_url"] = init.user.photo_url or None
+    return LoginResponse(token=token, **me)
+
+
+@router.post("/auth/oauth", response_model=LoginResponse)
+async def auth_oauth(
+    response: Response,
+    body: OAuthLoginRequest,
+    x_internal_secret: str | None = Header(default=None, alias="X-Internal-Secret"),
+    settings: Settings = Depends(get_settings),
+):
+    """
+    Server-to-server вход через Google/Яндекс. Вызывается Next.js после
+    обмена OAuth-кода на профиль; API доверяет провайдеру/sub. Защита —
+    общий секрет (internal_auth_secret) + API слушает только localhost.
+    """
+    if not settings.shop_enabled:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "shop disabled")
+    secret = settings.internal_auth_secret
+    if secret is not None and x_internal_secret != secret.get_secret_value():
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "internal secret mismatch")
+    if body.provider not in ("google", "yandex"):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "unsupported provider")
+    if not body.sub:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "sub required")
+
+    async with session_factory()() as session:
+        user, _ = await get_or_create_oauth_user(
+            session, provider=body.provider, sub=body.sub,
+            email=body.email, first_name=body.first_name,
+        )
+        await session.commit()
+    if user.blocked:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "user is blocked")
+
+    token = issue_session_token(
+        user_id=user.id,
+        telegram_user_id=user.telegram_user_id or 0,
+        settings=settings,
+    )
+    response.set_cookie(
+        key=COOKIE_NAME, value=token,
+        max_age=settings.site_session_ttl_seconds,
+        httponly=True, secure=settings.site_cookie_secure,
+        samesite="lax", path="/",
+    )
+    me = await _build_me(user, settings)
+    me["photo_url"] = None
     return LoginResponse(token=token, **me)
 
 

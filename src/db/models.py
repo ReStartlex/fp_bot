@@ -282,10 +282,17 @@ class ShopUser(Base):
     __table_args__ = (UniqueConstraint("telegram_user_id", name="uq_shop_users_tg"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telegram_user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # nullable: пользователь сайта может войти не через Telegram, а через
+    # Google/Яндекс/email — тогда telegram_user_id отсутствует.
+    telegram_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     telegram_username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     first_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     language_code: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+
+    # Веб-вход (мульти-провайдер). Для Telegram-аккаунтов остаются None.
+    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    auth_provider: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    oauth_sub: Mapped[Optional[str]] = mapped_column(String(191), nullable=True)
 
     # Внутренний баланс (кэшбэк, рефуанды). Храним в копейках, чтобы
     # 1%-начисления не накапливали float-погрешность.

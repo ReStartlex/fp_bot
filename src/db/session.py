@@ -136,6 +136,31 @@ async def init_db() -> None:
         await session.commit()
 
 
+def _rebuild_shop_users(sync_conn) -> None:
+    """
+    Пересобирает shop_users: снимает NOT NULL с telegram_user_id и добавляет
+    email/auth_provider/oauth_sub (для веб-аккаунтов без Telegram). Все
+    существующие строки сохраняются (копируются общие колонки).
+    """
+    sync_conn.execute(text("ALTER TABLE shop_users RENAME TO shop_users_old"))
+    table = Base.metadata.tables["shop_users"]
+    table.create(sync_conn)
+    new_cols = [c.name for c in table.columns]
+    old_cols = {c["name"] for c in inspect(sync_conn).get_columns("shop_users_old")}
+    common = [c for c in new_cols if c in old_cols]
+    collist = ", ".join(common)
+    sync_conn.execute(
+        text(
+            f"INSERT INTO shop_users ({collist}) "
+            f"SELECT {collist} FROM shop_users_old"
+        )
+    )
+    sync_conn.execute(text("DROP TABLE shop_users_old"))
+    logger.info(
+        "init_db: shop_users пересобрана (telegram_user_id nullable + email/oauth)"
+    )
+
+
 def _migrate_sqlite_schema(sync_conn) -> None:
     """Мини-миграции для существующей SQLite-БД без Alembic."""
     inspector = inspect(sync_conn)
@@ -190,6 +215,26 @@ def _migrate_sqlite_schema(sync_conn) -> None:
                 text("ALTER TABLE chat_states ADD COLUMN manual_messages_count INTEGER DEFAULT 0")
             )
             logger.info("init_db: добавлена колонка chat_states.manual_messages_count")
+    if "shop_users" in tables:
+        cols = {c["name"]: c for c in inspector.get_columns("shop_users")}
+        tg_col = cols.get("telegram_user_id")
+        needs_rebuild = tg_col is not None and tg_col.get("nullable") is False
+        if needs_rebuild:
+            # SQLite не умеет снять NOT NULL через ALTER — пересобираем таблицу,
+            # чтобы поддержать веб-аккаунты без Telegram (telegram_user_id NULL)
+            # и добавить email/auth_provider/oauth_sub. Данные сохраняются.
+            _rebuild_shop_users(sync_conn)
+        else:
+            for name, ddl in (
+                ("email", "VARCHAR(255)"),
+                ("auth_provider", "VARCHAR(16)"),
+                ("oauth_sub", "VARCHAR(191)"),
+            ):
+                if name not in cols:
+                    sync_conn.execute(
+                        text(f"ALTER TABLE shop_users ADD COLUMN {name} {ddl}")
+                    )
+                    logger.info(f"init_db: добавлена колонка shop_users.{name}")
     if "shop_catalog_cache" in tables:
         # Phase 1 Sprint 2.1: группировка категорий по «базовому имени»
         # (см. src/shop/taxonomy.py).

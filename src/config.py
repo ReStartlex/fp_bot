@@ -187,6 +187,10 @@ class Settings(BaseSettings):
     # После верификации мы выдаём свою долгоживущую сессию, поэтому само
     # окно логина можно держать коротким — 1 час.
     site_login_max_age_seconds: int = Field(default=3600, ge=60, le=86400)
+    # Общий секрет между сайтом (Next.js) и API для server-to-server
+    # OAuth-логина (/api/site/auth/oauth). API слушает только localhost,
+    # это доп. защита. Если не задан — проверка не выполняется.
+    internal_auth_secret: SecretStr | None = None
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_dir: str = "logs"

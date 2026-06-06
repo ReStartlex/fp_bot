@@ -195,6 +195,65 @@ async def get_user_by_tg(
     return res.scalar_one_or_none()
 
 
+async def get_user_by_id(
+    session: AsyncSession, user_id: int
+) -> Optional[ShopUser]:
+    res = await session.execute(select(ShopUser).where(ShopUser.id == user_id))
+    return res.scalar_one_or_none()
+
+
+async def get_or_create_oauth_user(
+    session: AsyncSession,
+    *,
+    provider: str,
+    sub: str,
+    email: str | None = None,
+    first_name: str | None = None,
+) -> tuple[ShopUser, bool]:
+    """
+    Находит/создаёт веб-аккаунт по OAuth (Google/Яндекс). Поиск:
+      1. по (auth_provider, oauth_sub) — точное совпадение провайдера;
+      2. иначе по email (если задан) — связываем тот же e-mail с входом;
+      3. иначе создаём новый аккаунт без Telegram (telegram_user_id=None).
+    Возвращает (user, is_new).
+    """
+    res = await session.execute(
+        select(ShopUser).where(
+            ShopUser.auth_provider == provider,
+            ShopUser.oauth_sub == sub,
+        )
+    )
+    user = res.scalar_one_or_none()
+    if user is not None:
+        if email and not user.email:
+            user.email = email
+            await session.flush()
+        return user, False
+
+    if email:
+        res = await session.execute(
+            select(ShopUser).where(ShopUser.email == email)
+        )
+        existing = res.scalar_one_or_none()
+        if existing is not None:
+            if not existing.auth_provider:
+                existing.auth_provider = provider
+                existing.oauth_sub = sub
+            await session.flush()
+            return existing, False
+
+    user = ShopUser(
+        telegram_user_id=None,
+        first_name=first_name,
+        email=email,
+        auth_provider=provider,
+        oauth_sub=sub,
+    )
+    session.add(user)
+    await session.flush()
+    return user, True
+
+
 # ──────────────────────── Catalog cache ────────────────────────
 
 
