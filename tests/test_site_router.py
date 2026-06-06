@@ -36,6 +36,7 @@ def app_settings(monkeypatch):
     monkeypatch.setenv("SHOP_ENABLED", "true")
     monkeypatch.setenv("SHOP_TELEGRAM_BOT_TOKEN", BOT_TOKEN)
     monkeypatch.setenv("SITE_COOKIE_SECURE", "false")
+    monkeypatch.setenv("CRYPTOBOT_API_TOKEN", "123:CRYPTOTEST")
     import src.config as cfg
     monkeypatch.setattr(cfg, "_settings", None)
     yield
@@ -205,3 +206,49 @@ async def test_checkout_insufficient(client, db_factory):
 async def test_checkout_requires_auth(client, db_factory):
     resp = client.post("/api/site/checkout", json={"ns_service_id": 1})
     assert resp.status_code == 401
+
+
+# ─── Topup (CryptoBot) ─────────────────────────────────────────────
+
+
+class _FakeInvoice:
+    invoice_id = 777
+    pay_url = "https://t.me/CryptoBot?start=inv777"
+
+
+class _FakeCryptoClient:
+    def __init__(self, **kwargs):
+        pass
+
+    async def create_invoice(self, **kwargs):
+        return _FakeInvoice()
+
+
+async def test_topup_creates_invoice(client, db_factory, monkeypatch):
+    monkeypatch.setattr("src.api.site_router.CryptoBotClient", _FakeCryptoClient)
+    client.post("/api/site/auth/telegram", json=make_login(555))
+    resp = client.post("/api/site/topup", json={"amount_rub": 500})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["pay_url"].startswith("https://t.me/CryptoBot")
+    assert body["amount_kopecks"] == 50000
+    # ShopPayment(pending) создан
+    async with db_factory() as s:
+        from sqlalchemy import select
+        from src.db.models import ShopPayment
+        rows = (await s.execute(select(ShopPayment))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].provider == "cryptobot"
+        assert rows[0].amount_kopecks == 50000
+
+
+async def test_topup_requires_auth(client, db_factory):
+    resp = client.post("/api/site/topup", json={"amount_rub": 500})
+    assert resp.status_code == 401
+
+
+async def test_topup_below_min_rejected(client, db_factory, monkeypatch):
+    monkeypatch.setattr("src.api.site_router.CryptoBotClient", _FakeCryptoClient)
+    client.post("/api/site/auth/telegram", json=make_login(555))
+    resp = client.post("/api/site/topup", json={"amount_rub": 1})
+    assert resp.status_code == 422

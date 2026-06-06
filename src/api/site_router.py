@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from typing import Any
 
 from fastapi import (
@@ -30,7 +31,7 @@ from fastapi import (
     status,
 )
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.api.telegram_login import LoginAuthError, verify_login_widget
 from src.api.web_session import (
@@ -43,7 +44,9 @@ from src.config_runtime import get_shop_referral_percent
 from src.db.models import ShopUser
 from src.db.session import session_factory
 from src.shop.checkout import CheckoutOutcome, attempt_checkout_via_balance
+from src.shop.payments.cryptobot import CryptoBotClient, CryptoBotError
 from src.shop.repo import (
+    create_topup_payment,
     get_balance_stats,
     get_or_create_user,
     get_referral_stats,
@@ -79,6 +82,16 @@ class LoginResponse(SiteMe):
     # Токен дублируется в теле, чтобы Next.js мог сам поставить cookie
     # в браузере (когда API закрыт на localhost и недоступен напрямую).
     token: str
+
+
+class TopupRequest(BaseModel):
+    amount_rub: float = Field(..., gt=0)
+
+
+class TopupResponse(BaseModel):
+    pay_url: str
+    invoice_id: int
+    amount_kopecks: int
 
 
 class SiteCheckoutRequest(BaseModel):
@@ -311,6 +324,76 @@ async def site_checkout(
             deficit_kopecks=result.deficit_kopecks,
         )
     return SiteCheckoutResponse(outcome=result.outcome.value)
+
+
+@router.post("/topup", response_model=TopupResponse)
+async def site_topup(
+    body: TopupRequest,
+    user: ShopUser = Depends(current_site_user),
+    settings: Settings = Depends(get_settings),
+):
+    """
+    Создаёт счёт CryptoBot на пополнение внутреннего баланса.
+
+    Баланс зачислится автоматически фоновым CryptoBot-поллером (тот же,
+    что и для бота) после оплаты счёта — фронт поллит /me до изменения
+    баланса. Идемпотентность гарантирует UNIQUE(provider, invoice_id).
+    """
+    token = settings.cryptobot_api_token
+    if token is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "crypto payment not configured"
+        )
+    rub = body.amount_rub
+    if rub < settings.cryptobot_min_topup_rub:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"min topup is {settings.cryptobot_min_topup_rub} ₽",
+        )
+    if rub > settings.cryptobot_max_topup_rub:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"max topup is {settings.cryptobot_max_topup_rub} ₽",
+        )
+    amount_kopecks = int(round(rub * 100))
+
+    cli = CryptoBotClient(
+        api_token=token.get_secret_value(), testnet=settings.cryptobot_testnet,
+    )
+    try:
+        invoice = await cli.create_invoice(
+            amount_rub=Decimal(amount_kopecks) / Decimal(100),
+            description=f"Пополнение баланса NeuroDrop ({rub:g} ₽)",
+            payload=f"tg:{user.telegram_user_id}",
+            expires_in=settings.cryptobot_invoice_ttl_seconds,
+        )
+    except CryptoBotError as exc:
+        logger.warning(f"site topup createInvoice failed: {exc}")
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, "payment provider error"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"site topup createInvoice crashed: {exc}")
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, "payment provider unavailable"
+        )
+
+    async with session_factory()() as session:
+        await create_topup_payment(
+            session,
+            user_id=user.id,
+            provider="cryptobot",
+            provider_invoice_id=str(invoice.invoice_id),
+            amount_kopecks=amount_kopecks,
+            notify_telegram_id=user.telegram_user_id,
+        )
+        await session.commit()
+
+    return TopupResponse(
+        pay_url=invoice.pay_url,
+        invoice_id=invoice.invoice_id,
+        amount_kopecks=amount_kopecks,
+    )
 
 
 def _order_to_out(order) -> SiteOrderOut:
