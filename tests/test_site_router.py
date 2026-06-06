@@ -247,6 +247,43 @@ async def test_topup_requires_auth(client, db_factory):
     assert resp.status_code == 401
 
 
+# ─── Mini App auto-login (initData) ────────────────────────────────
+
+
+def make_webapp_init_data(user_id: int = 555) -> str:
+    import json as _json
+    from urllib.parse import urlencode as _ue
+    fields = {
+        "user": _json.dumps(
+            {"id": user_id, "first_name": f"User{user_id}",
+             "username": f"u{user_id}", "language_code": "ru"},
+            separators=(",", ":"),
+        ),
+        "auth_date": str(int(time.time())),
+    }
+    dcs = "\n".join(f"{k}={fields[k]}" for k in sorted(fields))
+    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    h = hmac.new(secret, dcs.encode(), hashlib.sha256).hexdigest()
+    return _ue({**fields, "hash": h})
+
+
+async def test_webapp_auth_logs_in(client, db_factory):
+    r = client.post(
+        "/api/site/auth/webapp", json={"init_data": make_webapp_init_data(555)},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["telegram_user_id"] == 555
+    assert "nd_session" in r.cookies
+
+
+async def test_webapp_auth_rejects_bad(client, db_factory):
+    r = client.post(
+        "/api/site/auth/webapp",
+        json={"init_data": "user=%7B%22id%22%3A1%7D&auth_date=1&hash=bad"},
+    )
+    assert r.status_code == 401
+
+
 async def test_topup_below_min_rejected(client, db_factory, monkeypatch):
     monkeypatch.setattr("src.api.site_router.CryptoBotClient", _FakeCryptoClient)
     client.post("/api/site/auth/telegram", json=make_login(555))

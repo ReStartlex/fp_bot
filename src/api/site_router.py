@@ -34,6 +34,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from src.api.telegram_login import LoginAuthError, verify_login_widget
+from src.api.webapp_auth import WebAppAuthError, verify_init_data
 from src.api.web_session import (
     SessionError,
     issue_session_token,
@@ -82,6 +83,10 @@ class LoginResponse(SiteMe):
     # Токен дублируется в теле, чтобы Next.js мог сам поставить cookie
     # в браузере (когда API закрыт на localhost и недоступен напрямую).
     token: str
+
+
+class WebAppAuthRequest(BaseModel):
+    init_data: str
 
 
 class TopupRequest(BaseModel):
@@ -248,6 +253,57 @@ async def auth_telegram(
     )
     me = await _build_me(user, settings)
     me["photo_url"] = tg.photo_url or None
+    return LoginResponse(token=token, **me)
+
+
+@router.post("/auth/webapp", response_model=LoginResponse)
+async def auth_webapp(
+    response: Response,
+    body: WebAppAuthRequest,
+    settings: Settings = Depends(get_settings),
+):
+    """
+    Авто-вход внутри Telegram Mini App по initData (без виджета).
+    Проверяем подпись initData ботовым токеном и выдаём ту же сессию,
+    что и обычный вход — аккаунт/баланс единые.
+    """
+    if not settings.shop_enabled:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "shop disabled")
+    bot_token = _shop_bot_token(settings)
+    try:
+        init = verify_init_data(body.init_data, bot_token=bot_token)
+    except WebAppAuthError as exc:
+        logger.debug(f"site webapp auth rejected: {exc}")
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED, f"init_data invalid: {exc}"
+        )
+
+    async with session_factory()() as session:
+        user, _ = await get_or_create_user(
+            session,
+            telegram_user_id=init.user.id,
+            telegram_username=init.user.username or None,
+            first_name=init.user.first_name or None,
+            language_code=init.user.language_code or None,
+        )
+        await session.commit()
+    if user.blocked:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "user is blocked")
+
+    token = issue_session_token(
+        user_id=user.id, telegram_user_id=user.telegram_user_id, settings=settings,
+    )
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        max_age=settings.site_session_ttl_seconds,
+        httponly=True,
+        secure=settings.site_cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+    me = await _build_me(user, settings)
+    me["photo_url"] = init.user.photo_url or None
     return LoginResponse(token=token, **me)
 
 
