@@ -481,3 +481,39 @@ class ShopCatalogCache(Base):
     fetched_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
     )
+
+
+class ShopTicket(Base):
+    """
+    Обращение в поддержку с сайта/бота. Позволяет владельцу быть поддержкой
+    для ЛЮБОГО пользователя, включая веб-аккаунты (Google/Яндекс), у которых
+    нет Telegram — переписка хранится в БД и видна в кабинете.
+    """
+    __tablename__ = "shop_tickets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Привязка к заказу (кнопка «Проблема с товаром»), если есть.
+    order_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    subject: Mapped[str] = mapped_column(String(200), nullable=False)
+    # open | closed
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="open")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class ShopTicketMessage(Base):
+    """Одно сообщение внутри тикета. sender: 'user' | 'operator'."""
+    __tablename__ = "shop_ticket_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ticket_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    sender: Mapped[str] = mapped_column(String(16), nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now()
+    )

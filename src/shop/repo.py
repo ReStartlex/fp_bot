@@ -22,6 +22,8 @@ from src.db.models import (
     ShopOrder,
     ShopPayment,
     ShopReferral,
+    ShopTicket,
+    ShopTicketMessage,
     ShopUser,
 )
 
@@ -823,6 +825,103 @@ async def list_active_service_ids(
         (int(sid), fetched)
         for sid, fetched in (await session.execute(stmt)).all()
     ]
+
+
+# ════════════════════════════════════════════════════════════════════════
+#                    Support tickets (обращения в поддержку)
+# ════════════════════════════════════════════════════════════════════════
+
+
+async def create_ticket(
+    session: AsyncSession,
+    *,
+    user_id: int,
+    subject: str,
+    first_message: str,
+    order_id: int | None = None,
+) -> ShopTicket:
+    """Создаёт тикет + первое сообщение пользователя."""
+    ticket = ShopTicket(
+        user_id=user_id,
+        order_id=order_id,
+        subject=subject[:200],
+        status="open",
+    )
+    session.add(ticket)
+    await session.flush()
+    session.add(ShopTicketMessage(
+        ticket_id=ticket.id, sender="user", text=first_message,
+    ))
+    await session.flush()
+    return ticket
+
+
+async def add_ticket_message(
+    session: AsyncSession,
+    *,
+    ticket_id: int,
+    sender: str,
+    text: str,
+) -> ShopTicketMessage | None:
+    """Добавляет сообщение в тикет. Возвращает None, если тикета нет."""
+    ticket = await session.get(ShopTicket, ticket_id)
+    if ticket is None:
+        return None
+    msg = ShopTicketMessage(ticket_id=ticket_id, sender=sender, text=text)
+    session.add(msg)
+    # Ответ оператора держит тикет открытым; сообщение юзера в закрытый —
+    # переоткрывает.
+    if sender == "user" and ticket.status == "closed":
+        ticket.status = "open"
+    await session.flush()
+    return msg
+
+
+async def get_ticket(
+    session: AsyncSession, ticket_id: int
+) -> Optional[ShopTicket]:
+    return await session.get(ShopTicket, ticket_id)
+
+
+async def list_ticket_messages(
+    session: AsyncSession, *, ticket_id: int
+) -> list[ShopTicketMessage]:
+    stmt = (
+        select(ShopTicketMessage)
+        .where(ShopTicketMessage.ticket_id == ticket_id)
+        .order_by(ShopTicketMessage.id.asc())
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def list_user_tickets(
+    session: AsyncSession, *, user_id: int
+) -> list[ShopTicket]:
+    stmt = (
+        select(ShopTicket)
+        .where(ShopTicket.user_id == user_id)
+        .order_by(ShopTicket.updated_at.desc(), ShopTicket.id.desc())
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def list_open_tickets(
+    session: AsyncSession, *, limit: int = 20
+) -> list[ShopTicket]:
+    stmt = (
+        select(ShopTicket)
+        .where(ShopTicket.status == "open")
+        .order_by(ShopTicket.updated_at.desc(), ShopTicket.id.desc())
+        .limit(limit)
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def close_ticket(session: AsyncSession, ticket_id: int) -> None:
+    ticket = await session.get(ShopTicket, ticket_id)
+    if ticket is not None:
+        ticket.status = "closed"
+        await session.flush()
 
 
 # ════════════════════════════════════════════════════════════════════════

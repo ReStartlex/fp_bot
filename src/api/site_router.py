@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import html
 import json
 from decimal import Decimal
 from typing import Any
@@ -43,18 +44,24 @@ from src.api.web_session import (
 from src.config import Settings, get_settings
 from src.config_runtime import get_shop_referral_percent
 from src.db.models import ShopUser
+from src.db.repo import enqueue_pending_telegram_alert
 from src.db.session import session_factory
 from src.shop.checkout import CheckoutOutcome, attempt_checkout_via_balance
 from src.shop.payments.cryptobot import CryptoBotClient, CryptoBotError
 from src.shop.repo import (
+    add_ticket_message,
+    create_ticket,
     create_topup_payment,
     get_balance_stats,
     get_or_create_oauth_user,
     get_or_create_user,
     get_referral_stats,
     get_shop_order,
+    get_ticket,
     get_user_by_id,
+    list_ticket_messages,
     list_user_orders,
+    list_user_tickets,
 )
 
 
@@ -141,6 +148,36 @@ class SiteOrdersPage(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class TicketCreateRequest(BaseModel):
+    subject: str
+    message: str
+    order_id: int | None = None
+
+
+class TicketMessageRequest(BaseModel):
+    message: str
+
+
+class TicketMessageOut(BaseModel):
+    sender: str
+    text: str
+    created_at: str
+
+
+class TicketOut(BaseModel):
+    id: int
+    subject: str
+    status: str
+    order_id: int | None
+    created_at: str
+    updated_at: str
+    messages: list[TicketMessageOut] | None = None
+
+
+class TicketListResponse(BaseModel):
+    tickets: list[TicketOut]
 
 
 # ─── Auth dependency ───────────────────────────────────────────────
@@ -516,6 +553,132 @@ async def site_topup(
         invoice_id=invoice.invoice_id,
         amount_kopecks=amount_kopecks,
     )
+
+
+def _ticket_to_out(t, messages=None) -> TicketOut:
+    return TicketOut(
+        id=t.id,
+        subject=t.subject,
+        status=t.status,
+        order_id=t.order_id,
+        created_at=t.created_at.isoformat() if t.created_at else "",
+        updated_at=t.updated_at.isoformat() if t.updated_at else "",
+        messages=(
+            [
+                TicketMessageOut(
+                    sender=m.sender,
+                    text=m.text,
+                    created_at=m.created_at.isoformat() if m.created_at else "",
+                )
+                for m in messages
+            ]
+            if messages is not None
+            else None
+        ),
+    )
+
+
+async def _notify_owner_ticket(
+    *, ticket_id: int, user: ShopUser, subject: str, message: str,
+) -> None:
+    """Кладёт уведомление о тикете в очередь — бот доставит владельцу."""
+    who = (
+        f"@{html.escape(user.telegram_username)}"
+        if user.telegram_username
+        else (html.escape(user.email) if user.email else f"uid {user.id}")
+    )
+    text = (
+        f"🆘 <b>Обращение #{ticket_id}</b> от {who}\n"
+        f"<b>{html.escape(subject)}</b>\n\n"
+        f"{html.escape(message[:1500])}\n\n"
+        f"<i>Ответить: <code>/ticket_reply {ticket_id} текст</code></i>"
+    )
+    try:
+        async with session_factory()() as session:
+            await enqueue_pending_telegram_alert(session, text=text)
+            await session.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"ticket owner notify enqueue failed: {exc}")
+
+
+@router.post("/tickets", response_model=TicketOut)
+async def create_ticket_endpoint(
+    body: TicketCreateRequest,
+    user: ShopUser = Depends(current_site_user),
+):
+    subject = (body.subject or "").strip() or "Обращение в поддержку"
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "message required")
+
+    order_id = body.order_id
+    async with session_factory()() as session:
+        # Привязку к заказу принимаем только если заказ принадлежит юзеру.
+        if order_id is not None:
+            order = await get_shop_order(session, order_id)
+            if order is None or order.user_id != user.id:
+                order_id = None
+        ticket = await create_ticket(
+            session, user_id=user.id, subject=subject,
+            first_message=message, order_id=order_id,
+        )
+        await session.commit()
+        msgs = await list_ticket_messages(session, ticket_id=ticket.id)
+        out = _ticket_to_out(ticket, msgs)
+
+    await _notify_owner_ticket(
+        ticket_id=out.id, user=user, subject=subject, message=message,
+    )
+    return out
+
+
+@router.get("/tickets", response_model=TicketListResponse)
+async def list_tickets_endpoint(
+    user: ShopUser = Depends(current_site_user),
+):
+    async with session_factory()() as session:
+        tickets = await list_user_tickets(session, user_id=user.id)
+    return TicketListResponse(tickets=[_ticket_to_out(t) for t in tickets])
+
+
+@router.get("/tickets/{ticket_id}", response_model=TicketOut)
+async def get_ticket_endpoint(
+    ticket_id: int,
+    user: ShopUser = Depends(current_site_user),
+):
+    async with session_factory()() as session:
+        ticket = await get_ticket(session, ticket_id)
+        if ticket is None or ticket.user_id != user.id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "ticket not found")
+        msgs = await list_ticket_messages(session, ticket_id=ticket_id)
+        return _ticket_to_out(ticket, msgs)
+
+
+@router.post("/tickets/{ticket_id}/messages", response_model=TicketOut)
+async def add_ticket_message_endpoint(
+    ticket_id: int,
+    body: TicketMessageRequest,
+    user: ShopUser = Depends(current_site_user),
+):
+    message = (body.message or "").strip()
+    if not message:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "message required")
+    async with session_factory()() as session:
+        ticket = await get_ticket(session, ticket_id)
+        if ticket is None or ticket.user_id != user.id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "ticket not found")
+        await add_ticket_message(
+            session, ticket_id=ticket_id, sender="user", text=message,
+        )
+        await session.commit()
+        ticket = await get_ticket(session, ticket_id)
+        msgs = await list_ticket_messages(session, ticket_id=ticket_id)
+        out = _ticket_to_out(ticket, msgs)
+
+    await _notify_owner_ticket(
+        ticket_id=ticket_id, user=user, subject=out.subject, message=message,
+    )
+    return out
 
 
 def _order_to_out(order) -> SiteOrderOut:

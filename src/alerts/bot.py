@@ -45,6 +45,12 @@ from src.db.repo import (
     upsert_mapping,
 )
 from src.db.session import session_factory
+from src.shop.repo import (
+    add_ticket_message,
+    get_ticket,
+    get_user_by_id,
+    list_open_tickets,
+)
 from src.funpay.client import FunPayClient
 from src.orders.sync_paid import sync_pending_confirmation
 from src.mapping.rules import compute_pricing, estimate_profit_rub
@@ -514,6 +520,8 @@ class TelegramBot:
             BotCommand(command="sync", description="🔄 Синхронизация"),
             BotCommand(command="orders", description="📦 Последние заказы"),
             BotCommand(command="shop_reply", description="💬 Ответить покупателю: /shop_reply <tg_id> текст"),
+            BotCommand(command="tickets", description="🆘 Открытые обращения с сайта"),
+            BotCommand(command="ticket_reply", description="✍ Ответ в обращение: /ticket_reply <id> текст"),
             BotCommand(command="pending_confirm", description="⏳ Заказы без подтв. (список для саппорта FunPay)"),
             BotCommand(command="sync_pending_confirm", description="🔄 Sync /pending_confirm с FunPay (чистит фантомы)"),
             BotCommand(command="setmarkup", description="✏ Наценка одного маппинга"),
@@ -542,6 +550,65 @@ class TelegramBot:
             else msg_or_cq.chat.id
         )
         return chat_id == owner
+
+    async def _do_tickets(self, msg: Message) -> None:
+        """Список открытых обращений (поддержка с сайта/бота)."""
+        async with session_factory()() as session:
+            tickets = await list_open_tickets(session, limit=15)
+        if not tickets:
+            await msg.answer("Открытых обращений нет. 🎉")
+            return
+        lines = ["🆘 <b>Открытые обращения</b>\n"]
+        for t in tickets:
+            order = f" (заказ #{t.order_id})" if t.order_id else ""
+            lines.append(
+                f"#{t.id} · {html.escape(t.subject[:60])}{order}\n"
+                f"   <code>/ticket_reply {t.id} текст</code>"
+            )
+        await msg.answer("\n".join(lines))
+
+    async def _do_ticket_reply(self, msg: Message, args: str | None) -> None:
+        """/ticket_reply <id> <текст> — ответ оператора в обращение."""
+        parts = (args or "").strip().split(maxsplit=1)
+        if len(parts) < 2:
+            await msg.answer(
+                "Использование: <code>/ticket_reply &lt;id&gt; текст ответа</code>"
+            )
+            return
+        try:
+            ticket_id = int(parts[0])
+        except ValueError:
+            await msg.answer("Первый аргумент — числовой id обращения.")
+            return
+        text = parts[1].strip()
+        async with session_factory()() as session:
+            ticket = await get_ticket(session, ticket_id)
+            if ticket is None:
+                await msg.answer(f"Обращение #{ticket_id} не найдено.")
+                return
+            await add_ticket_message(
+                session, ticket_id=ticket_id, sender="operator", text=text,
+            )
+            await session.commit()
+            buyer = await get_user_by_id(session, ticket.user_id)
+
+        pushed = False
+        if (
+            buyer is not None
+            and buyer.telegram_user_id
+            and self._shop_reply_sender is not None
+        ):
+            try:
+                await self._shop_reply_sender(
+                    buyer.telegram_user_id,
+                    f"💬 <b>Ответ поддержки</b> по обращению #{ticket_id}\n\n"
+                    f"{html.escape(text)}",
+                )
+                pushed = True
+            except Exception as exc:
+                logger.warning(f"ticket reply push failed: {exc}")
+        note = " (отправлено в Telegram)" if pushed else " (увидит на сайте)"
+        await msg.answer(f"✅ Ответ по #{ticket_id} сохранён{note}.")
 
     async def _do_shop_reply(self, msg: Message, args: str | None) -> None:
         """
@@ -657,6 +724,18 @@ class TelegramBot:
             if not self._is_owner(msg):
                 return
             await self._do_shop_reply(msg, command.args)
+
+        @dp.message(Command("tickets"))
+        async def cmd_tickets(msg: Message) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_tickets(msg)
+
+        @dp.message(Command("ticket_reply"))
+        async def cmd_ticket_reply(msg: Message, command: CommandObject) -> None:
+            if not self._is_owner(msg):
+                return
+            await self._do_ticket_reply(msg, command.args)
 
         @dp.message(Command("status"))
         async def cmd_status(msg: Message) -> None:

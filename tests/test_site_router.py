@@ -310,6 +310,52 @@ async def test_oauth_login_rejects_unknown_provider(client, db_factory):
     assert r.status_code == 400
 
 
+# ─── Support tickets ───────────────────────────────────────────────
+
+
+async def test_create_and_list_ticket(client, db_factory):
+    client.post("/api/site/auth/telegram", json=make_login(555))
+    r = client.post(
+        "/api/site/tickets",
+        json={"subject": "Не пришёл код", "message": "Помогите, пожалуйста"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "open"
+    assert body["messages"][0]["text"] == "Помогите, пожалуйста"
+    tid = body["id"]
+    lst = client.get("/api/site/tickets").json()
+    assert any(t["id"] == tid for t in lst["tickets"])
+    # уведомление владельцу поставлено в очередь
+    async with db_factory() as s:
+        from sqlalchemy import select
+        from src.db.models import PendingTelegramAlert
+        rows = (await s.execute(select(PendingTelegramAlert))).scalars().all()
+        assert len(rows) >= 1
+
+
+async def test_ticket_message_and_ownership(client, db_factory):
+    client.post("/api/site/auth/telegram", json=make_login(555))
+    tid = client.post(
+        "/api/site/tickets", json={"subject": "x", "message": "y"},
+    ).json()["id"]
+    r = client.post(
+        f"/api/site/tickets/{tid}/messages", json={"message": "ещё вопрос"},
+    )
+    assert r.status_code == 200
+    assert len(r.json()["messages"]) == 2
+    # чужой пользователь не видит тикет
+    fresh = TestClient(client.app)
+    fresh.post("/api/site/auth/telegram", json=make_login(999))
+    assert fresh.get(f"/api/site/tickets/{tid}").status_code == 404
+
+
+async def test_tickets_require_auth(client, db_factory):
+    assert client.post(
+        "/api/site/tickets", json={"subject": "x", "message": "y"},
+    ).status_code == 401
+
+
 async def test_topup_below_min_rejected(client, db_factory, monkeypatch):
     monkeypatch.setattr("src.api.site_router.CryptoBotClient", _FakeCryptoClient)
     client.post("/api/site/auth/telegram", json=make_login(555))
