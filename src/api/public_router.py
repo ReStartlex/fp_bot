@@ -175,13 +175,16 @@ async def public_category_services(
     response: Response,
     page: int = Query(0, ge=0),
     page_size: int = Query(40, ge=1, le=100),
+    sort: str = Query("price_asc"),
 ):
-    """Список номиналов внутри одной NS-категории (с пагинацией)."""
+    """Список номиналов внутри одной NS-категории (с пагинацией и сортировкой)."""
     response.headers["Cache-Control"] = _CATALOG_CACHE_CONTROL
     offset = page * page_size
+    sort = sort if sort in ("price_asc", "price_desc") else "price_asc"
     async with session_factory()() as session:
         rows, total = await list_services_in_category(
             session, category_id=category_id, limit=page_size, offset=offset,
+            sort=sort,
         )
     return PublicServicesPage(
         items=[_service_to_out(s) for s in rows],

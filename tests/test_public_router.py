@@ -118,6 +118,14 @@ async def test_category_services_pagination(client, db_factory):
     assert body["items"][0]["rub_price_kopecks"] == 40000  # сортировка по цене
 
 
+async def test_category_services_sort_desc(client, db_factory):
+    await _seed_apple(db_factory)
+    resp = client.get("/api/public/catalog/categories/10?sort=price_desc")
+    assert resp.status_code == 200
+    items = resp.json()["items"]
+    assert items[0]["rub_price_kopecks"] == 80000  # дороже сначала
+
+
 # ─── Service card ──────────────────────────────────────────────────
 
 

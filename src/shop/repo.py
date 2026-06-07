@@ -667,10 +667,11 @@ async def list_services_in_category(
     category_id: int,
     limit: int = 50,
     offset: int = 0,
+    sort: str = "price_asc",
 ) -> tuple[list[ShopCatalogCache], int]:
     """
-    Сервисы внутри одной категории, отсортированные по возрастанию цены.
-    Возвращает (rows, total_count) для pagination.
+    Сервисы внутри одной категории. sort: "price_asc" (по умолчанию) или
+    "price_desc". Возвращает (rows, total_count) для pagination.
     """
     where_clause = [
         ShopCatalogCache.enabled.is_(True),
@@ -686,13 +687,15 @@ async def list_services_in_category(
     )
     total = (await session.execute(count_stmt)).scalar_one()
 
+    price_order = (
+        ShopCatalogCache.rub_price_kopecks.desc()
+        if sort == "price_desc"
+        else ShopCatalogCache.rub_price_kopecks.asc()
+    )
     stmt = (
         select(ShopCatalogCache)
         .where(*where_clause)
-        .order_by(
-            ShopCatalogCache.rub_price_kopecks.asc(),
-            ShopCatalogCache.service_name.asc(),
-        )
+        .order_by(price_order, ShopCatalogCache.service_name.asc())
         .limit(limit)
         .offset(offset)
     )
