@@ -72,11 +72,15 @@ class _FakeFP:
     def __init__(self, lots: dict[int, _FakeLot] | None = None,
                  fail_on_get: set[int] | None = None,
                  fail_on_save: set[int] | None = None,
-                 save_returns_ok_false: set[int] | None = None):
+                 save_returns_ok_false: set[int] | None = None,
+                 save_silently_ignored: set[int] | None = None):
         self.lots = lots or {}
         self.fail_on_get = fail_on_get or set()
         self.fail_on_save = fail_on_save or set()
         self.save_returns_ok_false = save_returns_ok_false or set()
+        # Имитация реального поведения FunPay (инцидент 2026-06):
+        # save отвечает «успехом», но форма отброшена — лот остаётся active.
+        self.save_silently_ignored = save_silently_ignored or set()
         self.save_calls: list[tuple[int, bool, int]] = []
 
     async def get_lot_fields(self, lot_id: int):
@@ -95,13 +99,16 @@ class _FakeFP:
         self.save_calls.append(
             (lot_id, lot_fields.active, lot_fields.amount)
         )
+        if lot_id in self.save_silently_ignored:
+            # «откатываем» изменение — FunPay его не применил
+            lot_fields.active = True
         return {"ok": True}
 
 
 # ───────────────── Хелперы _is_lot_already_dead / _set_lot_dead ─────────────────
 
-def test_is_lot_already_dead_both_conditions():
-    """active=False и amount=0 → dead."""
+def test_is_lot_already_dead_inactive():
+    """active=False → dead (amount не учитывается)."""
     lot = _FakeLot(1, active=False, amount=0)
     assert _is_lot_already_dead(lot) is True
 
@@ -113,16 +120,19 @@ def test_is_lot_already_dead_active_true():
 
 
 def test_is_lot_already_dead_amount_positive():
-    """amount>0 → НЕ dead, даже если active=False (надо ещё раз save_lot)."""
+    """active=False, amount>0 → dead: FunPay не принимает amount=0,
+    у выключенного лота остаётся старое количество — это норма."""
     lot = _FakeLot(1, active=False, amount=99)
-    assert _is_lot_already_dead(lot) is False
+    assert _is_lot_already_dead(lot) is True
 
 
 def test_set_lot_dead_writes_attrs():
+    """Деактивация снимает active и НЕ трогает amount (FunPay
+    отбраковывает форму с amount=0)."""
     lot = _FakeLot(1, active=True, amount=99)
     _set_lot_dead(lot)
     assert lot.active is False
-    assert lot.amount == 0
+    assert lot.amount == 99
 
 
 # ───────────────── Reaper integration tests ─────────────────
@@ -145,7 +155,8 @@ async def test_reap_skips_when_no_disabled_mappings(db_factory):
 
 
 async def test_reap_deactivates_zombie_lot(db_factory):
-    """disabled mapping + FunPay лот active=True → save_lot(False, 0)."""
+    """disabled mapping + FunPay лот active=True → save_lot(active=False),
+    amount остаётся как был."""
     settings = _settings()
     async with db_factory() as s:
         await upsert_mapping(
@@ -161,7 +172,7 @@ async def test_reap_deactivates_zombie_lot(db_factory):
     assert result.deactivated == 1
     assert result.already_dead == 0
     assert result.errors == 0
-    assert fp.save_calls == [(100, False, 0)]
+    assert fp.save_calls == [(100, False, 99)]
 
 
 async def test_reap_idempotent_already_dead(db_factory):
@@ -184,7 +195,8 @@ async def test_reap_idempotent_already_dead(db_factory):
 
 
 async def test_reap_idempotent_active_false_but_amount_positive(db_factory):
-    """active=False но amount=99 → НЕ dead, надо deactivate."""
+    """active=False, amount=99 → dead: amount у выключенного лота не
+    обнуляем (FunPay не принимает amount=0), save_lot НЕ зовётся."""
     settings = _settings()
     async with db_factory() as s:
         await upsert_mapping(
@@ -196,8 +208,9 @@ async def test_reap_idempotent_active_false_but_amount_positive(db_factory):
     fp = _FakeFP({100: _FakeLot(100, active=False, amount=99)})
     result = await reap_zombie_lots_once(funpay_client=fp, settings=settings)
 
-    assert result.deactivated == 1
-    assert fp.save_calls == [(100, False, 0)]
+    assert result.deactivated == 0
+    assert result.already_dead == 1
+    assert fp.save_calls == []
 
 
 async def test_reap_respects_max_per_run(db_factory):
@@ -263,7 +276,7 @@ async def test_reap_get_failure_counts_as_error(db_factory):
 
     assert result.errors == 1
     assert result.deactivated == 1
-    assert fp.save_calls == [(101, False, 0)]
+    assert fp.save_calls == [(101, False, 10)]
 
 
 async def test_reap_save_failure_counts_as_error(db_factory):
@@ -299,6 +312,27 @@ async def test_reap_save_returns_ok_false_counts_as_error(db_factory):
     fp = _FakeFP(
         lots={100: _FakeLot(100, active=True, amount=99)},
         save_returns_ok_false={100},
+    )
+    result = await reap_zombie_lots_once(funpay_client=fp, settings=settings)
+    assert result.errors == 1
+    assert result.deactivated == 0
+
+
+async def test_reap_save_silently_ignored_counts_as_error(db_factory):
+    """FunPay ответил «успехом», но деактивацию не применил (лот всё ещё
+    active при verify-GET) → error++, deactivated НЕ инкрементится.
+    Раньше это часами логировалось как SUCCESS (инцидент 2026-06)."""
+    settings = _settings()
+    async with db_factory() as s:
+        await upsert_mapping(
+            s, funpay_lot_id=100, ns_service_id=42,
+            enabled=False, label="funpay lies",
+        )
+        await s.commit()
+
+    fp = _FakeFP(
+        lots={100: _FakeLot(100, active=True, amount=99)},
+        save_silently_ignored={100},
     )
     result = await reap_zombie_lots_once(funpay_client=fp, settings=settings)
     assert result.errors == 1

@@ -5,8 +5,9 @@
 
 Покрываем:
   1. disable_all: mapping.enabled = False для всех; save_lot вызывается
-     с active=False, amount=0; rate-limit delay = 0 в тестах.
-  2. disable_all: уже dead лоты (active=False, amount=0) → не save_lot,
+     с active=False (amount не трогаем — FunPay отбраковывает форму
+     с amount=0); rate-limit delay = 0 в тестах.
+  2. disable_all: уже dead лоты (active=False) → не save_lot,
      funpay_already += 1.
   3. disable_all: save_lot падает на части лотов → errors=N, остальные
      обрабатываются, mapping.enabled всё равно = False (для всех).
@@ -109,8 +110,11 @@ async def test_disable_all_marks_db_and_calls_save_lot(db_factory):
         rows = (await session.execute(select(Mapping))).scalars().all()
         assert all(not m.enabled for m in rows)
 
-    # FunPay: save_lot вызван с active=False, amount=0
-    assert sorted(fp.save_calls) == [(100, False, 0), (200, False, 0), (300, False, 0)]
+    # FunPay: save_lot вызван с active=False; amount НЕ тронут
+    # (FunPay отбраковывает форму с amount=0)
+    assert sorted(fp.save_calls) == [
+        (100, False, 99), (200, False, 99), (300, False, 99),
+    ]
 
 
 @pytest.mark.asyncio
@@ -127,7 +131,7 @@ async def test_disable_all_skips_already_dead(db_factory):
 
     assert result.funpay_already == 1
     assert result.funpay_changed == 1
-    assert fp.save_calls == [(20, False, 0)]
+    assert fp.save_calls == [(20, False, 5)]
 
 
 @pytest.mark.asyncio

@@ -201,7 +201,10 @@ async def _decide_for_one(
     will_update_price = should_update_price(
         current_price, new_price, settings.price_update_threshold_percent
     )
-    will_update_stock = current_stock != new_stock
+    # Сток обновляем только когда целевой сток > 0: FunPay не принимает
+    # amount=0 (форма молча отбраковывается сервером, save при этом
+    # отвечает «успехом»). «Нет товара» выражается ТОЛЬКО деактивацией.
+    will_update_stock = current_stock != new_stock and new_stock > 0
     will_deactivate = current_active and new_stock == 0
     will_activate = (not current_active) and new_stock > 0
 
@@ -385,10 +388,13 @@ async def _apply_decision(
     """
     lot_fields = await funpay_client.get_lot_fields(decision.funpay_lot_id)
 
-    # Принципы безопасной мутации: пишем только в известные атрибуты
+    # Принципы безопасной мутации: пишем только в известные атрибуты.
+    # При деактивации amount НЕ трогаем: FunPay отбраковывает форму с
+    # amount=0 и «успешно» ничего не сохраняет — лот оставался активным
+    # (инцидент 2026-06). Деактивация = только снять галочку active.
     if decision.will_update_price:
         _set_price(lot_fields, decision.target.round_price())
-    if decision.will_update_stock or decision.will_activate or decision.will_deactivate:
+    if decision.will_update_stock or decision.will_activate:
         _set_stock(lot_fields, decision.target.stock)
     if decision.will_deactivate:
         _set_active(lot_fields, False)
@@ -409,6 +415,18 @@ async def _apply_decision(
             f"save_lot({decision.funpay_lot_id}) не подтвердил успех: "
             f"http={http_status}, error={err}"
         )
+
+    # Verify-after-save для деактивации: FunPay умеет ответить «успехом»,
+    # не применив форму. Если не проверить — diff-cache запомнит
+    # active=False, и до истечения TTL sync будет считать лот выключенным,
+    # пока тот реально продаётся. Деактивации редки, лишний GET дёшев.
+    if decision.will_deactivate:
+        verify = await funpay_client.get_lot_fields(decision.funpay_lot_id)
+        if _extract_active(verify):
+            raise SaveLotFailed(
+                f"save_lot({decision.funpay_lot_id}) отчитался успехом, "
+                f"но лот на FunPay всё ещё активен (деактивация не применилась)"
+            )
 
 
 def _set_price(lot_fields: Any, price: float) -> None:

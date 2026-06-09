@@ -1073,11 +1073,19 @@ class FunPayAdminClient:
             j = None
         if isinstance(j, dict):
             result["json"] = j
-            # msg=ok — успех; msg=что-то ещё — ошибка от FunPay
+            # msg=ok — успех; msg=что-то ещё — ошибка от FunPay.
+            # ВАЖНО: FunPay умеет отвечать 200 + {"error": 1, "errors": {...}}
+            # при отбраковке формы (например amount=0) — msg при этом пустой.
+            # Раньше такой ответ считался успехом, и «деактивация» лота
+            # молча не применялась (инцидент 2026-06: zombie reaper часами
+            # «успешно» деактивировал один и тот же лот).
             msg = (j.get("msg") or "").strip().lower()
-            result["ok"] = (msg in ("", "ok", "success")) and r.ok
+            has_error_flag = bool(j.get("error")) or bool(j.get("errors"))
+            result["ok"] = (msg in ("", "ok", "success")) and r.ok and not has_error_flag
             if not result["ok"]:
-                result["funpay_error"] = j.get("msg") or j
+                result["funpay_error"] = (
+                    j.get("msg") or j.get("errors") or j.get("error") or j
+                )
             return result
         # HTML-ответ — успех, только если 200 и нет признаков ошибки
         if r.ok and "ошибк" not in r.text.lower():

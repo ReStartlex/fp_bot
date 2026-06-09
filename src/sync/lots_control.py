@@ -19,7 +19,8 @@
 
 * ``disable_all_mapped_lots`` — для каждого замапленного лота:
     1. ``mapping.enabled = False`` в БД (источник правды для sync_stock).
-    2. ``save_lot(active=False, amount=0)`` на FunPay.
+    2. ``save_lot(active=False)`` на FunPay (amount не трогаем — FunPay
+       отбраковывает форму с amount=0).
   Если save_lot упал — лот всё равно остаётся в БД disabled, его
   потом подберёт ``zombie_lot_reaper`` (он специально для этого
   случая).
@@ -94,19 +95,13 @@ async def _set_all_mappings_enabled(
 def _is_lot_in_state(lot_fields: object, *, active: bool) -> bool:
     """Проверяем: лот уже в целевом active-state?
 
-    Для disable ещё дополнительно требуем amount=0 (как _emergency_disable_lot
-    и zombie_reaper). Для enable amount не трогаем — sync_stock сам выставит
-    его на следующем тике.
+    Amount НЕ проверяем и не трогаем: FunPay не принимает amount=0
+    (форма молча отбраковывается сервером), поэтому у выключенного лота
+    остаётся старое количество — это нормально. Для enable amount
+    выставит sync_stock на следующем тике.
     """
     current_active = bool(getattr(lot_fields, "active", False))
-    if active:
-        return current_active
-    amount = getattr(lot_fields, "amount", 0)
-    try:
-        amount_int = int(amount) if amount is not None else 0
-    except (TypeError, ValueError):
-        amount_int = 0
-    return (not current_active) and amount_int == 0
+    return current_active if active else not current_active
 
 
 async def disable_all_mapped_lots(
@@ -119,7 +114,7 @@ async def disable_all_mapped_lots(
     Шаги
     -----
     1. ``mapping.enabled = False`` для всех маппингов (один UPDATE).
-    2. По очереди для каждого: ``save_lot(active=False, amount=0)``.
+    2. По очереди для каждого: ``save_lot(active=False)``.
     3. Между save_lot — задержка 400ms, чтобы не вызвать 429 от FunPay.
 
     Если save_lot упал — лот всё равно остаётся в БД disabled, чтобы
@@ -159,10 +154,10 @@ async def disable_all_mapped_lots(
             continue
 
         try:
+            # amount НЕ трогаем: FunPay отбраковывает форму с amount=0
+            # (см. _emergency_disable_lot / zombie_reaper).
             if hasattr(lot_fields, "active"):
                 lot_fields.active = False
-            if hasattr(lot_fields, "amount"):
-                lot_fields.amount = 0
             save_result = await funpay_client.save_lot(lot_fields)
             if isinstance(save_result, dict) and save_result.get("ok") is False:
                 raise RuntimeError(

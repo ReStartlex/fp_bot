@@ -59,21 +59,39 @@ class FakeFunPaySaveFails:
 
 
 class FakeFunPaySaveOK:
-    """save_lot успешно отключает."""
+    """save_lot успешно отключает.
+
+    Stateful: get_lot_fields возвращает один и тот же объект, чтобы
+    verify-after-save в _emergency_disable_lot видел применённое
+    изменение (active=False).
+    """
 
     def __init__(self):
         self.saved_lots = []
+        self._lots: dict[int, object] = {}
 
     async def get_lot_fields(self, lot_id: int):
-        class Lot:
-            def __init__(self, lot_id: int):
-                self.lot_id = lot_id
-                self.active = True
-                self.amount = 100
-        return Lot(lot_id)
+        if lot_id not in self._lots:
+            class Lot:
+                def __init__(self, lot_id: int):
+                    self.lot_id = lot_id
+                    self.active = True
+                    self.amount = 100
+            self._lots[lot_id] = Lot(lot_id)
+        return self._lots[lot_id]
 
     async def save_lot(self, lot_fields):
         self.saved_lots.append(lot_fields)
+        return {"ok": True}
+
+
+class FakeFunPaySaveSilentlyIgnored(FakeFunPaySaveOK):
+    """Реальное поведение FunPay из инцидента 2026-06: save отвечает
+    «успехом», но форму не применяет — лот остаётся active=True."""
+
+    async def save_lot(self, lot_fields):
+        self.saved_lots.append(lot_fields)
+        lot_fields.active = True  # FunPay «откатил» деактивацию
         return {"ok": True}
 
 
@@ -128,6 +146,35 @@ async def test_disables_both_funpay_and_db_on_happy_path(db_factory):
 
     assert ok is True
     assert len(fp.saved_lots) == 1
+    saved = fp.saved_lots[0]
+    assert saved.active is False
+    assert saved.amount == 100, (
+        "amount НЕ должен обнуляться: FunPay отбраковывает форму с "
+        "amount=0, деактивация = только снять active."
+    )
     mapping = await _get_mapping(db_factory, 8888)
+    assert mapping is not None
+    assert mapping.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_save_reported_ok_but_lot_still_active_is_failure(db_factory):
+    """Инцидент 2026-06: FunPay отвечает «успехом», не применив форму.
+    Verify-after-save должен поймать это: возврат False (алерт оператору),
+    mapping в БД всё равно disabled."""
+    await _make_enabled_mapping(db_factory, lot_id=9999)
+    fp = FakeFunPaySaveSilentlyIgnored()
+    tg = FakeTG()
+
+    ok = await proc._emergency_disable_lot(
+        9999, fp, tg, reason="NS вернул возврат/отмену: Refunded",
+        log=proc.logger,
+    )
+
+    assert ok is False, (
+        "Лот на FunPay остался активным — нельзя рапортовать успех."
+    )
+    assert len(tg.errors) == 1, "Оператор должен получить 🚨-алерт"
+    mapping = await _get_mapping(db_factory, 9999)
     assert mapping is not None
     assert mapping.enabled is False

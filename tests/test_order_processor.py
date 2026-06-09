@@ -140,6 +140,9 @@ class FakeFunPay:
         self._chat_by_name_id = chat_by_name_id
         self.saved_lots: list[Any] = []
         self.disabled_lots: list[int] = []
+        # stateful лоты: verify-after-save в _emergency_disable_lot
+        # перечитывает лот и должен видеть применённое active=False
+        self._lots: dict[int, Any] = {}
 
     async def send_message(self, chat_id: int, text: str):
         if self._fail or self._fail_times > 0:
@@ -148,13 +151,15 @@ class FakeFunPay:
         self.sent.append((chat_id, text))
 
     async def get_lot_fields(self, lot_id: int):
-        class Lot:
-            def __init__(self, lot_id: int):
-                self.lot_id = lot_id
-                self.active = True
-                self.amount = 100
-                self.price = 147
-        return Lot(lot_id)
+        if lot_id not in self._lots:
+            class Lot:
+                def __init__(self, lot_id: int):
+                    self.lot_id = lot_id
+                    self.active = True
+                    self.amount = 100
+                    self.price = 147
+            self._lots[lot_id] = Lot(lot_id)
+        return self._lots[lot_id]
 
     async def save_lot(self, lot_fields):
         self.saved_lots.append(lot_fields)

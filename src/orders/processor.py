@@ -1318,13 +1318,24 @@ async def _emergency_disable_lot(
 
     try:
         lot_fields = await funpay_client.get_lot_fields(funpay_lot_id)
+        # ВАЖНО: количество (amount) НЕ трогаем. FunPay не принимает
+        # amount=0 — раньше форма с нулём молча отбраковывалась сервером,
+        # save отвечал «успехом», и лот оставался активным (инцидент
+        # 2026-06-07, заказ V38FGNF1). Деактивация = только снять
+        # галочку «Активное», ровно как в UI.
         if hasattr(lot_fields, "active"):
             lot_fields.active = False
-        if hasattr(lot_fields, "amount"):
-            lot_fields.amount = 0
         result = await funpay_client.save_lot(lot_fields)
         if isinstance(result, dict) and result.get("ok") is False:
             raise RuntimeError(result)
+        # Verify-after-save: FunPay умеет ответить «успехом», не применив
+        # форму. Перечитываем лот и убеждаемся, что он реально выключен.
+        verify = await funpay_client.get_lot_fields(funpay_lot_id)
+        if bool(getattr(verify, "active", False)):
+            raise RuntimeError(
+                "save_lot отчитался успехом, но лот на FunPay всё ещё "
+                "активен (FunPay не применил деактивацию)"
+            )
         funpay_disabled = True
     except Exception as exc:
         funpay_error = str(exc)

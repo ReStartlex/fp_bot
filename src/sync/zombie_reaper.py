@@ -5,7 +5,7 @@ Zombie-lot reaper: устранение half-disabled state.
 
   1. Заказ failed (NS не выдал товар);
   2. _emergency_disable_lot отключает mapping в БД;
-  3. ОДНОВРЕМЕННО пытается save_lot(active=False, amount=0) на FunPay;
+  3. ОДНОВРЕМЕННО пытается save_lot(active=False) на FunPay;
   4. Этот save_lot падает (например, 429 burst);
   5. Получается рассогласование:
        * mapping.enabled = False (sync_stock игнорирует);
@@ -19,8 +19,9 @@ Reaper периодически проверяет disabled-маппинги и,
 Алгоритм:
   - читаем mappings WHERE enabled=False;
   - для каждого: GET FunPay lot_fields;
-    * если active=False и amount=0 → пропускаем (уже dead);
-    * иначе save_lot(active=False, amount=0);
+    * если active=False → пропускаем (уже dead);
+    * иначе save_lot(active=False) — amount НЕ трогаем (FunPay
+      отбраковывает форму с amount=0, см. инцидент 2026-06);
   - не больше max_per_run save_lot за один прогон (защита от 429 burst);
   - метрики через ReaperResult, Telegram-уведомление при успешной reap.
 
@@ -57,9 +58,9 @@ class ReaperResult:
     """Метрики одного прогона zombie reaper'а."""
     # Сколько disabled-маппингов посмотрели (limit max_per_run).
     checked: int = 0
-    # FunPay лот уже active=False, amount=0 — ничего не делаем.
+    # FunPay лот уже active=False — ничего не делаем.
     already_dead: int = 0
-    # Сделали save_lot(active=False, amount=0) успешно.
+    # Сделали save_lot(active=False) успешно (и verify подтвердил).
     deactivated: int = 0
     # FunPay GET или save_lot упал.
     errors: int = 0
@@ -80,28 +81,23 @@ def _is_lot_already_dead(lot_fields: object) -> bool:
     """
     Проверка: лот на FunPay уже в состоянии «deactivated»?
 
-    Считаем dead если оба условия:
-      * active=False (или поле отсутствует и считается False);
-      * amount=0 (или поле отсутствует и считается 0).
-
-    Если есть только одно условие (active=False но amount=99) — НЕ dead,
-    надо ещё раз save_lot чтобы привести в порядок.
+    Dead = active=False (или поле отсутствует). Amount НЕ проверяем:
+    FunPay не принимает amount=0, поэтому у выключенного лота остаётся
+    старое количество — это нормально. Раньше требование amount==0
+    делало состояние «dead» недостижимым, и reaper бесконечно
+    «деактивировал» один и тот же лот каждые 10 минут.
     """
-    active = getattr(lot_fields, "active", False)
-    amount = getattr(lot_fields, "amount", 0)
-    try:
-        amount_int = int(amount) if amount is not None else 0
-    except (TypeError, ValueError):
-        amount_int = 0
-    return (not active) and amount_int == 0
+    return not bool(getattr(lot_fields, "active", False))
 
 
 def _set_lot_dead(lot_fields: object) -> None:
-    """Выставляет active=False и amount=0 на объекте lot_fields (in-place)."""
+    """Выставляет active=False на объекте lot_fields (in-place).
+
+    Amount НЕ трогаем: форма с amount=0 молча отбраковывается FunPay,
+    и save «успешно» ничего не меняет (см. инцидент 2026-06).
+    """
     if hasattr(lot_fields, "active"):
         lot_fields.active = False
-    if hasattr(lot_fields, "amount"):
-        lot_fields.amount = 0
 
 
 async def _persist_zombie_notified(mapping_id: int) -> None:
@@ -202,7 +198,7 @@ async def reap_zombie_lots_once(
         if not settings.enable_real_actions:
             logger.info(
                 f"zombie reaper: DRY-RUN lot {lot_id} ({label}) "
-                f"will be deactivated (active=False, amount=0)"
+                f"will be deactivated (active=False)"
             )
             result.deactivated += 1
             if not already_notified:
@@ -224,6 +220,15 @@ async def reap_zombie_lots_once(
             if isinstance(save_result, dict) and save_result.get("ok") is False:
                 raise RuntimeError(
                     f"save_lot вернул ok=False: {save_result.get('funpay_error') or save_result}"
+                )
+            # Verify-after-save: FunPay умеет ответить «успехом», не
+            # применив форму. Без этой проверки reaper часами логировал
+            # SUCCESS по лоту, который так и оставался активным.
+            verify = await funpay_client.get_lot_fields(lot_id)
+            if not _is_lot_already_dead(verify):
+                raise RuntimeError(
+                    "save_lot отчитался успехом, но лот на FunPay "
+                    "всё ещё активен (деактивация не применилась)"
                 )
         except Exception as exc:
             logger.warning(
