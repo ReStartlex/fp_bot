@@ -185,11 +185,13 @@ class FakeTelegram:
         self.warnings: list[str] = []
         self.successes: list[dict] = []
         self.failures: list[dict] = []
+        self.manual_holds: list[dict] = []
 
     async def error(self, text: str): self.errors.append(text)
     async def warning(self, text: str): self.warnings.append(text)
     async def order_success(self, **kw): self.successes.append(kw)
     async def order_failure(self, **kw): self.failures.append(kw)
+    async def manual_hold_required(self, **kw): self.manual_holds.append(kw)
 
 
 # ─────────────── helpers ───────────────
@@ -513,6 +515,177 @@ async def test_order_without_lot_id_distinguishes_same_amount_by_currency(
     assert db_order is not None
     assert db_order.funpay_lot_id == 69406129
     assert db_order.ns_service_id == 196
+
+
+@pytest.mark.asyncio
+async def test_order_without_lot_id_ambiguous_goes_to_manual_hold(
+    db_session_factory, settings
+):
+    """
+    Описание совпадает с несколькими маппингами без явного отрыва →
+    НЕ угадываем (ложный матч = покупка не того товара на NS),
+    заказ уходит в manual_hold с алертом оператору.
+    """
+    await _make_mapping(
+        db_session_factory, lot_id=101, svc_id=1,
+        label="Apple Gift Card | USA",
+    )
+    await _make_mapping(
+        db_session_factory, lot_id=102, svc_id=2,
+        label="Apple Gift Card | TR",
+    )
+    ns = FakeNS(pay_pins=["SHOULD-NOT-BE-SOLD"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    event = FunPayOrderEvent(
+        funpay_order_id="fp-ambiguous",
+        funpay_lot_id=0,
+        buyer_username="alice",
+        buyer_user_id=42,
+        chat_id=555,
+        quantity=1,
+        funpay_price_rub=147.0,
+        # ни региона, ни номинала — отличить USA от TR невозможно
+        description="Подарочная карта Apple Gift",
+    )
+
+    result = await process_funpay_order(
+        event, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "manual_hold"
+    assert ns.paid_calls == 0, "НЕЛЬЗЯ покупать на NS при неоднозначном матче"
+    assert len(tg.manual_holds) == 1
+    assert tg.manual_holds[0]["stage"] == "resolve_mapping"
+    db_order = await _order(db_session_factory, "fp-ambiguous")
+    assert db_order is not None
+    assert db_order.status == "manual_hold"
+
+
+@pytest.mark.asyncio
+async def test_order_without_lot_id_no_single_mapping_fallback(
+    db_session_factory, settings
+):
+    """
+    Раньше: если включён ровно ОДИН маппинг, заказ без lot_id с
+    нерелевантным описанием (ручная продажа, напр. CS2-скин)
+    привязывался к нему → покупка не того товара на NS.
+    Теперь: нет кандидатов → failed «нет маппинга», БЕЗ покупки.
+    """
+    await _make_mapping(
+        db_session_factory, lot_id=101, svc_id=1,
+        label="Apple Gift Card | USA | 2 USD",
+    )
+    ns = FakeNS(pay_pins=["SHOULD-NOT-BE-SOLD"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    event = FunPayOrderEvent(
+        funpay_order_id="fp-cs2-manual",
+        funpay_lot_id=0,
+        buyer_username="bob",
+        buyer_user_id=43,
+        chat_id=556,
+        quantity=1,
+        funpay_price_rub=5000.0,
+        description="M4A1-S | Чёрный лотос, Продажа, Винтовка, 1 шт.",
+    )
+
+    result = await process_funpay_order(
+        event, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "failed"
+    assert ns.paid_calls == 0, (
+        "Заказ по немаппленному лоту НЕ должен покупать единственный "
+        "включённый NS-товар."
+    )
+
+
+@pytest.mark.asyncio
+async def test_order_without_lot_id_word_boundary_in_label_match(
+    db_session_factory, settings
+):
+    """
+    «200 robux» не должен матчиться внутри «1200 robux»: подстрочный
+    матч без границ слов мог привязать заказ на 1200 робуксов к лоту
+    на 200 (и наоборот). С границами слов выбирается точный лот.
+    """
+    await _make_mapping(
+        db_session_factory, lot_id=201, svc_id=11,
+        label="200 Robux Россия",
+    )
+    await _make_mapping(
+        db_session_factory, lot_id=202, svc_id=12,
+        label="1200 Robux Россия",
+    )
+    ns = FakeNS(pay_pins=["ROBUX-1200"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    event = FunPayOrderEvent(
+        funpay_order_id="fp-robux-1200",
+        funpay_lot_id=0,
+        buyer_username="alice",
+        buyer_user_id=42,
+        chat_id=555,
+        quantity=1,
+        funpay_price_rub=1100.0,
+        description="1200 Robux Россия, Robux",
+    )
+
+    result = await process_funpay_order(
+        event, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "delivered"
+    db_order = await _order(db_session_factory, "fp-robux-1200")
+    assert db_order is not None
+    assert db_order.funpay_lot_id == 202
+    assert db_order.ns_service_id == 12
+
+
+@pytest.mark.asyncio
+async def test_order_without_lot_id_nominal_conflict_veto(
+    db_session_factory, settings
+):
+    """
+    Вето по номиналу: заказ на «20 USD» не должен сматчиться с лотом
+    «2 USD», даже если остальные слова совпадают почти полностью.
+    """
+    await _make_mapping(
+        db_session_factory, lot_id=301, svc_id=21,
+        label="Apple Gift Card | USA | 2 USD",
+    )
+    await _make_mapping(
+        db_session_factory, lot_id=302, svc_id=22,
+        label="Apple Gift Card | USA | 20 USD",
+    )
+    ns = FakeNS(pay_pins=["APPLE-20-USD"])
+    fp = FakeFunPay()
+    tg = FakeTelegram()
+
+    event = FunPayOrderEvent(
+        funpay_order_id="fp-apple-20",
+        funpay_lot_id=0,
+        buyer_username="alice",
+        buyer_user_id=42,
+        chat_id=555,
+        quantity=1,
+        funpay_price_rub=1500.0,
+        description="Подарочная карта Apple 20 USD (США), USD, 20 USD",
+    )
+
+    result = await process_funpay_order(
+        event, settings=settings, ns_client=ns, funpay_client=fp, telegram=tg,
+    )
+
+    assert result["status"] == "delivered"
+    db_order = await _order(db_session_factory, "fp-apple-20")
+    assert db_order is not None
+    assert db_order.funpay_lot_id == 302
+    assert db_order.ns_service_id == 22
 
 
 @pytest.mark.asyncio

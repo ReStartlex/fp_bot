@@ -943,12 +943,22 @@ class FunPayAdminClient:
           /lots/offerEdit?node=NODE_ID&offer=LOT_ID&location=offer
         Если node_id известен — добавляем (быстрее находит). Иначе
         FunPay сам редиректит на нужную страницу.
+
+        Особый случай: lot_id=0 (или falsy) + node_id — форма СОЗДАНИЯ
+        нового лота (/lots/offerEdit?node=N без offer). Используется
+        importer'ом миграции NS→FunPay: заполняешь raw_fields и шлёшь
+        save_lot с offer_id=0 — FunPay создаёт новый лот.
         """
+        if not lot_id and node_id is None:
+            raise ValueError(
+                "get_lot_fields: для формы создания (lot_id=0) обязателен node_id"
+            )
         params = []
         if node_id is not None:
             params.append(f"node={int(node_id)}")
-        params.append(f"offer={int(lot_id)}")
-        params.append("location=offer")
+        if lot_id:
+            params.append(f"offer={int(lot_id)}")
+            params.append("location=offer")
         url = f"{self.BASE}/lots/offerEdit?" + "&".join(params)
 
         r = await asyncio.to_thread(self._sync_get, url)

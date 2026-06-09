@@ -80,6 +80,16 @@ class Settings(BaseSettings):
     # Default 3 = «продаём только если на NS ≥3 шт» (не держим лот при 0–2).
     sync_min_ns_stock_to_sell: int = Field(default=3, ge=1)
 
+    # === Сопоставление заказа без lot_id по описанию ===
+    # FunPay часто не отдаёт lot_id в OrderShortcut — тогда заказ матчится
+    # с маппингом по тексту описания (_resolve_mapping). Цена ложного
+    # матча — покупка НЕ ТОГО товара на NS и выдача неправильного кода.
+    # min_score — минимальный score лучшего кандидата для автовыбора;
+    # min_gap — обязательный отрыв от второго кандидата. Если гейт не
+    # пройден — заказ уходит в manual_hold (оператор выбирает руками).
+    order_match_min_score: int = Field(default=20, ge=0)
+    order_match_min_gap: int = Field(default=10, ge=0)
+
     # === Diff-based sync_stock cache ===
     # sync_stock каждый цикл проверяет 47 лотов и делает 47 GET к
     # FunPay (`get_lot_fields`). Но 46 из 47 не меняются между циклами

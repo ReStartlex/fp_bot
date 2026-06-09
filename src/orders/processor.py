@@ -114,6 +114,54 @@ def _text_tokens(value: str | None) -> set[str]:
     }
 
 
+# Валютные токены для вето-проверки (см. _tokens_conflict). Набор шире,
+# чем в mapping/safety.py — здесь цена ошибки выше (реальная покупка).
+_CURRENCY_TOKENS = {
+    "usd", "eur", "try", "rub", "kzt", "uah", "gbp", "pln",
+    "brl", "inr", "ars", "idr", "myr", "php", "thb", "vnd",
+}
+
+# Числовые токены длиннее — это скорее ID/артикул, чем номинал.
+_NOMINAL_MAX_LEN = 5
+
+
+def _tokens_conflict(desc_tokens: set[str], source_tokens: set[str]) -> bool:
+    """
+    Вето: описание заказа и кандидат-маппинг ЯВНО противоречат друг
+    другу по валюте или номиналу.
+
+    Если в описании есть валюта (usd) и у кандидата есть валюта (eur),
+    и они не пересекаются — это не «слабое совпадение», это ДРУГОЙ
+    товар. То же с числами (2 USD vs 20 USD). Такой кандидат
+    исключается до скоринга, чтобы он не выиграл за счёт общих слов
+    («apple», «gift card» и т.п.).
+    """
+    desc_cur = desc_tokens & _CURRENCY_TOKENS
+    src_cur = source_tokens & _CURRENCY_TOKENS
+    if desc_cur and src_cur and desc_cur.isdisjoint(src_cur):
+        return True
+    desc_num = {
+        t for t in desc_tokens if t.isdigit() and len(t) <= _NOMINAL_MAX_LEN
+    }
+    src_num = {
+        t for t in source_tokens if t.isdigit() and len(t) <= _NOMINAL_MAX_LEN
+    }
+    if desc_num and src_num and desc_num.isdisjoint(src_num):
+        return True
+    return False
+
+
+def _is_word_substring(needle: str, haystack: str) -> bool:
+    """
+    Подстрока с границами слов: «200 robux» НЕ матчится внутри
+    «1200 robux» (без паддинга обычный `in` находил такое и мог
+    привязать заказ на 1200 робуксов к лоту на 200).
+    """
+    if not needle or not haystack:
+        return False
+    return f" {needle} " in f" {haystack} "
+
+
 def _mapping_match_score(
     *,
     description: str | None,
@@ -124,7 +172,10 @@ def _mapping_match_score(
     if not desc_norm:
         return 0
 
+    desc_tokens = _text_tokens(description)
     score = 0
+    sources_present = 0
+    sources_vetoed = 0
     for source, exact_bonus in (
         (mapping.label, 100),
         (known_title, 120),
@@ -132,16 +183,43 @@ def _mapping_match_score(
         source_norm = _norm_text(source)
         if not source_norm:
             continue
-        if source_norm in desc_norm or desc_norm in source_norm:
+        sources_present += 1
+        source_tokens = _text_tokens(source)
+        # Вето: конфликт валюты/номинала — источник не участвует в score.
+        if _tokens_conflict(desc_tokens, source_tokens):
+            sources_vetoed += 1
+            continue
+        if _is_word_substring(source_norm, desc_norm) or _is_word_substring(
+            desc_norm, source_norm
+        ):
             score += exact_bonus
-        common = _text_tokens(description) & _text_tokens(source)
+        common = desc_tokens & source_tokens
         score += len(common) * 10
         # Совпавшие числа вроде 2/5/10 USD особенно важны для Apple cards.
         score += sum(15 for token in common if token.isdigit())
+
+    # Все доступные источники противоречат описанию → кандидат исключён.
+    if sources_present > 0 and sources_vetoed == sources_present:
+        return 0
     return score
 
 
-async def _resolve_mapping(event: FunPayOrderEvent, log) -> Mapping | None:
+@dataclass
+class AmbiguousMatch:
+    """
+    Описание заказа похоже сразу на несколько маппингов — автоматический
+    выбор запрещён (цена ошибки = покупка не того товара на NS).
+
+    Возвращается из _resolve_mapping вместо Mapping; вызывающий код
+    обязан перевести заказ в manual_hold и показать кандидатов оператору.
+    """
+    candidates: list[str]  # человекочитаемые строки для алерта
+    reason: str
+
+
+async def _resolve_mapping(
+    event: FunPayOrderEvent, log, settings: Settings | None = None
+) -> Mapping | AmbiguousMatch | None:
     async with session_factory()() as session:
         if event.funpay_lot_id > 0:
             result = await session.execute(
@@ -167,15 +245,38 @@ async def _resolve_mapping(event: FunPayOrderEvent, log) -> Mapping | None:
 
     desc = _norm_text(event.description)
     if desc:
+        # Label-стадия: точное вхождение label'а в описание (с границами
+        # слов — «200 robux» больше не матчится внутри «1200 robux»).
+        # Если подошло НЕСКОЛЬКО label'ов — раньше брался первый по
+        # порядку выборки (лотерея), теперь это manual_hold.
+        label_matches: list[Mapping] = []
         for mapping in enabled:
             label = _norm_text(mapping.label)
-            if label and (label in desc or desc in label):
-                log.warning(
-                    f"FunPay order без lot_id сопоставлен по label: "
-                    f"order={event.funpay_order_id}, label={mapping.label!r}, "
-                    f"lot={mapping.funpay_lot_id}"
-                )
-                return mapping
+            if label and (
+                _is_word_substring(label, desc) or _is_word_substring(desc, label)
+            ):
+                label_matches.append(mapping)
+        if len(label_matches) == 1:
+            mapping = label_matches[0]
+            log.warning(
+                f"FunPay order без lot_id сопоставлен по label: "
+                f"order={event.funpay_order_id}, label={mapping.label!r}, "
+                f"lot={mapping.funpay_lot_id}"
+            )
+            return mapping
+        if len(label_matches) > 1:
+            candidates = [
+                f"lot {m.funpay_lot_id} ({m.label})" for m in label_matches[:5]
+            ]
+            log.error(
+                f"FunPay order без lot_id: описание совпало сразу с "
+                f"{len(label_matches)} label'ами, не выбираю автоматически. "
+                f"candidates={candidates}, description={event.description!r}"
+            )
+            return AmbiguousMatch(
+                candidates=candidates,
+                reason=f"описание совпало с {len(label_matches)} label'ами",
+            )
 
     scored: list[tuple[int, Mapping]] = []
     if desc:
@@ -190,12 +291,15 @@ async def _resolve_mapping(event: FunPayOrderEvent, log) -> Mapping | None:
                 scored.append((score, mapping))
         scored.sort(key=lambda item: item[0], reverse=True)
         if scored:
+            effective_settings = settings or get_settings()
+            min_score = int(getattr(effective_settings, "order_match_min_score", 20))
+            min_gap = int(getattr(effective_settings, "order_match_min_gap", 10))
             best_score, best_mapping = scored[0]
             second_score = scored[1][0] if len(scored) > 1 else 0
             # Нужен явный отрыв, чтобы не выбрать случайный Apple-лот при
-            # неоднозначном описании. При единственном совпадении score >= 20
-            # достаточно: обычно это "apple + 2" или KnownLot title.
-            if best_score >= 20 and best_score >= second_score + 10:
+            # неоднозначном описании. Пороги настраиваются через
+            # ORDER_MATCH_MIN_SCORE / ORDER_MATCH_MIN_GAP.
+            if best_score >= min_score and best_score >= second_score + min_gap:
                 log.warning(
                     f"FunPay order без lot_id сопоставлен по описанию: "
                     f"order={event.funpay_order_id}, lot={best_mapping.funpay_lot_id}, "
@@ -203,23 +307,28 @@ async def _resolve_mapping(event: FunPayOrderEvent, log) -> Mapping | None:
                     f"description={event.description!r}"
                 )
                 return best_mapping
+            candidates = [
+                f"lot {m.funpay_lot_id} ({m.label}) score={score}"
+                for score, m in scored[:5]
+            ]
             log.error(
                 f"FunPay order без lot_id: описание похоже на несколько "
-                f"маппингов, не выбираю автоматически. candidates="
-                f"{[(score, mapping.funpay_lot_id) for score, mapping in scored[:5]]}, "
+                f"маппингов, не выбираю автоматически. candidates={candidates}, "
                 f"description={event.description!r}"
             )
-            return None
+            return AmbiguousMatch(
+                candidates=candidates,
+                reason=(
+                    f"лучший кандидат score={best_score}, второй="
+                    f"{second_score} — недостаточный отрыв "
+                    f"(нужно ≥{min_score} и отрыв ≥{min_gap})"
+                ),
+            )
 
-    if len(enabled) == 1:
-        mapping = enabled[0]
-        log.warning(
-            f"FunPay order без lot_id: использую единственный активный "
-            f"маппинг lot={mapping.funpay_lot_id}. "
-            f"description={event.description!r}"
-        )
-        return mapping
-
+    # ВАЖНО: fallback'а «единственный включённый маппинг» больше НЕТ.
+    # Он был опасен: заказ по немаппленному лоту (ручная продажа, напр.
+    # CS2) при единственном включённом маппинге покупал на NS совершенно
+    # другой товар и отправлял код покупателю.
     log.error(
         f"FunPay order без lot_id и не удалось однозначно выбрать маппинг: "
         f"enabled_mappings={len(enabled)}, description={event.description!r}"
@@ -575,7 +684,54 @@ async def _process_locked(
         return {"status": "failed", "reason": "pins_ready без pins"}
 
     # ─── 3. Маппинг ───
-    mapping = await _resolve_mapping(event, log)
+    mapping = await _resolve_mapping(event, log, settings=settings)
+
+    if isinstance(mapping, AmbiguousMatch):
+        # Описание похоже сразу на несколько маппингов. НЕ угадываем:
+        # ложный матч = покупка не того товара на NS. Заказ — в
+        # manual_hold, оператор выбирает руками и выдаёт через NS-кабинет.
+        candidates_text = "\n  ".join(mapping.candidates)
+        reason = (
+            f"неоднозначное сопоставление по описанию: {mapping.reason}; "
+            f"кандидаты: {', '.join(mapping.candidates)}"
+        )
+        log.error(reason)
+        async with session_factory()() as session:
+            order = existing or await create_order(
+                session,
+                funpay_order_id=event.funpay_order_id,
+                funpay_lot_id=event.funpay_lot_id or 0,
+                ns_service_id=0,
+                buyer_username=event.buyer_username,
+                buyer_user_id=event.buyer_user_id,
+                chat_id=event.chat_id,
+                quantity=event.quantity,
+                funpay_price_rub=event.funpay_price_rub,
+                description=event.description,
+            )
+            await update_order(session, order, status="manual_hold", error=reason)
+            await session.commit()
+        if telegram is not None:
+            try:
+                await telegram.manual_hold_required(
+                    funpay_order_id=event.funpay_order_id,
+                    stage="resolve_mapping",
+                    age_seconds=0,
+                    buyer_username=event.buyer_username,
+                    ns_custom_id=None,
+                    has_pins=False,
+                    reason=(
+                        f"описание заказа похоже сразу на несколько лотов "
+                        f"({mapping.reason}):\n  {candidates_text}\n"
+                        f"description={event.description!r}"
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — алерт не критичен
+                log.warning(f"Не смог отправить manual_hold alert: {exc}")
+        # Лот НЕ отключаем: мы не знаем, какой именно из кандидатов
+        # продался, а выключать все подряд — слишком разрушительно.
+        return {"status": "manual_hold", "reason": reason}
+
     if mapping is None or not mapping.enabled:
         reason = (
             f"нет маппинга для funpay_lot_id={event.funpay_lot_id} "
