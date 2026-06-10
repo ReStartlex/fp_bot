@@ -72,8 +72,20 @@ def _block_scalar(text: str, indent: int) -> str:
     return "|\n" + body
 
 
-def render_entry_yaml(entry: SkeletonEntry) -> str:
-    """Один YAML-блок для категории (как элемент списка)."""
+def render_entry_yaml(
+    entry: SkeletonEntry, profile: dict[str, str] | None = None
+) -> str:
+    """Один YAML-блок для категории (как элемент списка).
+
+    profile — переопределения summary/desc для платформы (см.
+    migrate.profiles). Чего нет в профиле — берётся дефолтный шаблон.
+    """
+    profile = profile or {}
+    summary_ru = profile.get("summary_ru", DEFAULT_SUMMARY_RU)
+    summary_en = profile.get("summary_en", DEFAULT_SUMMARY_EN)
+    desc_ru = profile.get("desc_ru", DEFAULT_DESC_RU)
+    desc_en = profile.get("desc_en", DEFAULT_DESC_EN)
+
     out: list[str] = []
     a = out.append
 
@@ -98,10 +110,10 @@ def render_entry_yaml(entry: SkeletonEntry) -> str:
     a("    # пример: \"fields[usd]\": '{nominal} USD'")
     a(f"    {TODO}: {TODO}")
 
-    a("  summary_ru: " + _block_scalar(DEFAULT_SUMMARY_RU, 4))
-    a("  summary_en: " + _block_scalar(DEFAULT_SUMMARY_EN, 4))
-    a("  desc_ru: " + _block_scalar(DEFAULT_DESC_RU, 4))
-    a("  desc_en: " + _block_scalar(DEFAULT_DESC_EN, 4))
+    a("  summary_ru: " + _block_scalar(summary_ru, 4))
+    a("  summary_en: " + _block_scalar(summary_en, 4))
+    a("  desc_ru: " + _block_scalar(desc_ru, 4))
+    a("  desc_en: " + _block_scalar(desc_en, 4))
 
     a("  # Услуги NS этой категории (для справки; номинал распознан ботом):")
     a("  services:")
@@ -119,8 +131,18 @@ def render_entry_yaml(entry: SkeletonEntry) -> str:
     return "\n".join(out)
 
 
-def render_skeleton(entries: list[SkeletonEntry]) -> str:
-    """Полный YAML-файл скелета."""
+def render_skeleton(
+    entries: list[SkeletonEntry],
+    profiles: dict[str, dict[str, str]] | None = None,
+) -> str:
+    """Полный YAML-файл скелета.
+
+    profiles — словарь platform_lower → {summary/desc}. Для каждой
+    категории берётся профиль её платформы (если задан).
+    """
+    from src.migrate.profiles import profile_for
+
+    profiles = profiles or {}
     header = (
         "# Таблица соответствий NS → FunPay (СКЕЛЕТ).\n"
         "# Заполни поля с маркером " + TODO + " по схеме раздела FunPay\n"
@@ -131,4 +153,7 @@ def render_skeleton(entries: list[SkeletonEntry]) -> str:
         "# Теги подстановки: {platform} {nominal} {currency} {region_ru} {region_en}\n"
         "\n"
     )
-    return header + "\n\n".join(render_entry_yaml(e) for e in entries) + "\n"
+    blocks = [
+        render_entry_yaml(e, profile_for(profiles, e.platform)) for e in entries
+    ]
+    return header + "\n\n".join(blocks) + "\n"

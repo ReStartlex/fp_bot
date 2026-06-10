@@ -154,9 +154,27 @@ def detect_region(category_name: str) -> tuple[str | None, str | None, str | Non
     return (None, None, None)
 
 
+# Суффиксные слова, которые в названии бренда дублируют «Подарочную
+# карту» в шаблоне (даёт «Playstation Gift Card Gift Card»). Срезаем их
+# с конца платформы: "Apple Gift Card"→"Apple", "Steam Wallet Code"→"Steam".
+_PLATFORM_SUFFIX_TOKENS = {"gift", "card", "code", "voucher", "wallet"}
+
+
 def detect_platform(category_name: str) -> str:
-    """Платформа/бренд — первый сегмент имени категории до '|'."""
-    return category_name.split("|")[0].strip()
+    """
+    Платформа/бренд — первый сегмент имени категории до '|', очищенный
+    от суффиксов вроде «Gift Card», «Wallet Code», чтобы в шаблоне не
+    было «{platform} Gift Card» = «… Gift Card Gift Card».
+
+    Сохраняет значащие слова: "Razer Gold Gift Card"→"Razer Gold",
+    "Google Play Gift Code"→"Google Play".
+    """
+    raw = category_name.split("|")[0].strip()
+    words = raw.split()
+    while words and words[-1].lower().strip(".") in _PLATFORM_SUFFIX_TOKENS:
+        words.pop()
+    cleaned = " ".join(words).strip()
+    return cleaned or raw
 
 
 def extract_nominal(service_name: str, currency: str | None) -> int | None:

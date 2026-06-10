@@ -114,9 +114,15 @@ def test_detect_region_no_region():
     assert detect_region("Grand Theft Auto V") == (None, None, None)
 
 
-def test_detect_platform():
+def test_detect_platform_strips_giftcard_suffix():
     assert detect_platform("Apple | USA") == "Apple"
-    assert detect_platform("Battle.net Gift Card | CA") == "Battle.net Gift Card"
+    assert detect_platform("Apple Gift Card | AE") == "Apple"
+    assert detect_platform("Battle.net Gift Card | CA") == "Battle.net"
+    assert detect_platform("Steam Wallet Code | USA") == "Steam"
+    assert detect_platform("Playstation Gift Card | UK") == "Playstation"
+    # значащие слова сохраняются
+    assert detect_platform("Razer Gold Gift Card | TR") == "Razer Gold"
+    assert detect_platform("Google Play Gift Code | US") == "Google Play"
 
 
 # ───────────────────────── nominal extraction ─────────────────────────
