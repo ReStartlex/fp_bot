@@ -43,19 +43,20 @@ from src.funpay.client import FunPayClient
 from src.logging_setup import setup_logging
 
 
-async def _my_lot_ids(fp: FunPayClient) -> set[int]:
-    """Снапшот id всех моих лотов (для diff до/после создания)."""
+async def _node_offer_ids(admin, node_id: int) -> set[int]:
+    """Снапшот id моих офферов раздела, включая НЕАКТИВНЫЕ (для diff).
+
+    Используем list_node_offers (страница /lots/{node}/trade), а НЕ
+    get_my_lots: последний берёт публичный профиль, где неактивные
+    офферы не видны — именно поэтому свежесозданный неактивный лот не
+    находился.
+    """
     ids: set[int] = set()
     try:
-        for lot in await fp.get_my_lots():
-            raw = getattr(lot, "id", None) or getattr(lot, "lot_id", None)
-            try:
-                if raw is not None:
-                    ids.add(int(raw))
-            except (TypeError, ValueError):
-                continue
+        for offer in await admin.list_node_offers(node_id):
+            ids.add(int(offer["offer_id"]))
     except Exception as exc:
-        logger.warning(f"Не смог получить список лотов: {exc}")
+        logger.warning(f"Не смог получить офферы раздела {node_id}: {exc}")
     return ids
 
 
@@ -142,9 +143,10 @@ async def main() -> int:
             )
             return 1
 
-        # 3. Снапшот лотов ДО.
-        before = await _my_lot_ids(fp)
-        logger.info(f"Лотов до создания: {len(before)}")
+        # 3. Снапшот офферов раздела ДО (вкл. неактивные — через
+        # /lots/{node}/trade, а не публичный профиль).
+        before_offers = await _node_offer_ids(admin, args.node)
+        logger.info(f"Офферов в разделе до создания: {len(before_offers)}")
 
         # 4. POST.
         result = await admin.save_lot(lot_fields)
@@ -167,10 +169,11 @@ async def main() -> int:
                 )
             return 1
 
-        # 5. Снапшот лотов ПОСЛЕ → diff.
+        # 5. Снапшот офферов раздела ПОСЛЕ → diff. list_node_offers видит
+        # неактивные офферы (в отличие от get_my_lots по публичному профилю).
         await asyncio.sleep(2)
-        after = await _my_lot_ids(fp)
-        new_ids = sorted(after - before)
+        after_offers = await _node_offer_ids(admin, args.node)
+        new_ids = sorted(after_offers - before_offers)
         if new_ids:
             logger.success(f"Создан(ы) лот(ы): {new_ids}")
             for lot_id in new_ids:
@@ -180,9 +183,10 @@ async def main() -> int:
                 )
         else:
             logger.warning(
-                "offerSave ответил ok, но новый лот не найден в списке "
-                "(возможно, get_my_lots не видит неактивные). Проверь "
-                f"раздел руками: https://funpay.com/lots/{args.node}/trade"
+                "offerSave ответил ok, но новый лот не найден через "
+                "list_node_offers. Проверь раздел руками: "
+                f"https://funpay.com/lots/{args.node}/trade  "
+                f"(и пришли вывод funpay_node_offers --raw-out — доработаю парсер)"
             )
 
         logger.warning(

@@ -709,6 +709,98 @@ class FunPayAdminClient:
 
         return last_result
 
+    async def list_node_offers(
+        self, node_id: int
+    ) -> list[dict[str, Any]]:
+        """
+        Список МОИХ офферов в разделе (включая НЕАКТИВНЫЕ).
+
+        Зачем: после создания лота через offerSave нужно узнать его
+        lot_id, чтобы записать маппинг NS↔FunPay. get_my_lots() берёт
+        лоты с ПУБЛИЧНОГО профиля, где неактивные офферы не видны.
+        Страница управления `/lots/{node}/trade` показывает все свои
+        офферы раздела (и активные, и снятые) со ссылками offerEdit.
+
+        Возвращает list[dict]: {offer_id (int), title (str), active (bool|None)}.
+        Парсер защитный: FunPay периодически меняет вёрстку, поэтому
+        offer_id берём из любых ссылок offerEdit?...offer=N, а заголовок/
+        активность — best-effort. Если структура не распозналась —
+        вернётся хотя бы список offer_id (title пустой), и это видно
+        в диагностике.
+        """
+        url = f"{self.BASE}/lots/{int(node_id)}/trade"
+        r = await asyncio.to_thread(self._sync_get, url)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        if soup.find("form", action=re.compile(r"/account/login")):
+            raise FunPayAuthError(
+                f"FunPay перебросил на форму логина на {url} — обнови golden_key."
+            )
+
+        offers: dict[int, dict[str, Any]] = {}
+
+        # Основной путь: строки-ссылки на редактирование оффера.
+        # FunPay использует <a class="tc-item" href="...offerEdit?...offer=N">
+        # на странице управления; запасные селекторы — любые ссылки с offer=.
+        candidates = soup.select(
+            'a[href*="offerEdit"], a.tc-item[href*="offer"], '
+            'a.offer-list-item, tr.tc-item'
+        )
+        # Fallback: вообще все <a> с offer= в href.
+        if not candidates:
+            candidates = [
+                a for a in soup.find_all("a")
+                if "offer" in (a.get("href") or "")
+            ]
+
+        for el in candidates:
+            href = el.get("href") or ""
+            m = re.search(r"offer=(\d+)", href)
+            if not m:
+                # иногда id в data-атрибуте
+                data_offer = el.get("data-offer") or el.get("data-id") or ""
+                m2 = re.search(r"\d+", str(data_offer))
+                if not m2:
+                    continue
+                offer_id = int(m2.group(0))
+            else:
+                offer_id = int(m.group(1))
+
+            # Заголовок: текст ячейки описания или весь текст строки.
+            title = ""
+            desc_el = el.select_one(
+                ".tc-desc, .offer-list-title, .tc-desc-text, .tc-item-desc"
+            ) if hasattr(el, "select_one") else None
+            if desc_el is not None:
+                title = desc_el.get_text(separator=" ", strip=True)
+            if not title:
+                title = el.get_text(separator=" ", strip=True)
+
+            # Активность: неактивные офферы FunPay помечает классом
+            # (tc-warning / inactive / hidden) — best-effort.
+            class_text = " ".join(str(c) for c in (el.get("class") or []))
+            active: bool | None = None
+            if re.search(r"inactive|hidden|warning|disabled", class_text, re.I):
+                active = False
+            elif class_text:
+                active = True
+
+            prev = offers.get(offer_id)
+            if prev is None:
+                offers[offer_id] = {
+                    "offer_id": offer_id,
+                    "title": title[:200],
+                    "active": active,
+                }
+            else:
+                # дополняем title/active, если в этой строке информации больше
+                if not prev["title"] and title:
+                    prev["title"] = title[:200]
+                if prev["active"] is None and active is not None:
+                    prev["active"] = active
+
+        return sorted(offers.values(), key=lambda o: o["offer_id"])
+
     async def get_chats_snapshot(self) -> list[dict[str, Any]]:
         """
         Тянет страницу /chat/ и парсит список чатов из левой панели.
