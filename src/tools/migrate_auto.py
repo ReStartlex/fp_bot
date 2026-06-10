@@ -87,9 +87,19 @@ async def main() -> int:
     fx_rate = await get_usd_rub_rate(settings)
     admin = _build_admin(settings)
 
-    url = f"{admin.BASE}/lots/offerEdit?node={pc.funpay_node}"
+    # Если задан schema_offer — тянем форму существующего лота: так нода
+    # отдаёт ВСЕ валютные селекты (Apple показывает fields[try]/[eur]/...
+    # только при открытии лота). Иначе — пустая форма создания.
+    if pc.schema_offer:
+        url = (
+            f"{admin.BASE}/lots/offerEdit?node={pc.funpay_node}"
+            f"&offer={pc.schema_offer}&location=offer"
+        )
+    else:
+        url = f"{admin.BASE}/lots/offerEdit?node={pc.funpay_node}"
     r = await asyncio.to_thread(admin._sync_get, url)
     schema = parse_form_schema(r.text, url)
+    logger.info(f"Схема ноды {pc.funpay_node} загружена (schema_offer={pc.schema_offer})")
 
     if args.activate and args.yes:
         logger.warning("⚠ --activate: лоты создаются СРАЗУ активными (в продажу).")

@@ -35,6 +35,7 @@ def _write_config(tmp_path) -> str:
         ns_grep: "apple"
         funpay_node: 1316
         markup_percent: 7
+        schema_offer: 69405880
         by_currency:
           USD: { "fields[currency]": "USD", "fields[usd]": "{nominal} USD" }
         by_category:
@@ -52,6 +53,7 @@ def test_load_and_resolve_fields(tmp_path):
 
     apple = get_platform(cfg, "Apple")
     assert apple.markup_percent == 7
+    assert apple.schema_offer == 69405880
     # by_currency
     assert resolve_fields(apple, 4, "USD")["fields[usd]"] == "{nominal} USD"
     # by_category приоритетнее by_currency

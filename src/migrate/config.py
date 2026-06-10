@@ -57,6 +57,12 @@ class PlatformConfig:
     fields: dict[str, str] | None = None
     by_currency: dict[str, dict[str, str]] = field(default_factory=dict)
     by_category: dict[int, dict[str, str]] = field(default_factory=dict)
+    # id существующего лота этой ноды. Если задан — схему тянем через
+    # offerEdit?offer=<id>, чтобы получить ВСЕ валютные селекты (Apple
+    # рендерит fields[try]/[eur]/... только при открытии лота, а не в
+    # пустой форме). Без него валидация номиналов недефолтных валют
+    # неполная (полагаемся на серверную проверку FunPay при создании).
+    schema_offer: int | None = None
 
 
 @dataclass
@@ -90,6 +96,7 @@ def parse_platform(raw: dict[str, Any]) -> PlatformConfig:
         fields=_coerce_fields(raw.get("fields")),
         by_currency=by_currency,
         by_category=by_category,
+        schema_offer=(int(raw["schema_offer"]) if raw.get("schema_offer") else None),
     )
 
 
