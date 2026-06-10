@@ -70,7 +70,13 @@ async def main() -> int:
         metavar="NAME=VALUE",
         help="поле формы (повторяемый), имена — из funpay_node_schema",
     )
-    parser.add_argument("--price", type=float, default=999999.0)
+    # Цена: настоящая страховка от случайной продажи — active=False
+    # (неактивный лот купить нельзя). Высокую «заградительную» цену НЕ
+    # ставим: FunPay валидирует ПОТОЛОК цены раздела и отвергает форму
+    # (errors=[["price","Неверная цена."]]). Дефолт — умеренный и для
+    # gift-card разделов обычно проходит; при отказе передай --price с
+    # ценой из своего рабочего лота-образца этого раздела.
+    parser.add_argument("--price", type=float, default=1000.0)
     parser.add_argument("--amount", type=int, default=1)
     parser.add_argument(
         "--really-create", action="store_true",
@@ -144,11 +150,21 @@ async def main() -> int:
         result = await admin.save_lot(lot_fields)
         logger.info(f"Ответ offerSave: {json.dumps(result, ensure_ascii=False)[:500]}")
         if not result.get("ok"):
-            logger.error(
-                "FunPay НЕ подтвердил создание. Смотри funpay_error/body_preview "
-                "выше — вероятно, не заполнено обязательное поле (сверься со "
-                "схемой раздела через funpay_node_schema)."
-            )
+            err_repr = json.dumps(
+                result.get("funpay_error"), ensure_ascii=False
+            ).lower()
+            if "price" in err_repr or "цена" in err_repr:
+                logger.error(
+                    "FunPay отверг ЦЕНУ. Скорее всего, она выше потолка раздела "
+                    "(или ниже минимума). Передай --price с ценой из своего "
+                    "рабочего лота-образца этого раздела."
+                )
+            else:
+                logger.error(
+                    "FunPay НЕ подтвердил создание. Смотри funpay_error выше: в "
+                    "errors указано конкретное поле. Сверь его значение со "
+                    "схемой раздела (funpay_node_schema)."
+                )
             return 1
 
         # 5. Снапшот лотов ПОСЛЕ → diff.
