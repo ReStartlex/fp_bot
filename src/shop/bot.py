@@ -45,6 +45,7 @@ from aiogram.types import (
 )
 from loguru import logger
 
+from src.alerts.aiogram_proxy import build_aiogram_session
 from src.alerts.sessions import PaginationStore
 from src.config import Settings, get_settings
 from src.db.session import session_factory
@@ -247,8 +248,10 @@ class ShopBot:
             return
 
         token = self._settings.shop_telegram_bot_token.get_secret_value()  # type: ignore[union-attr]
+        session = build_aiogram_session(self._settings, bot_label="shop-бот")
         self._bot = Bot(
             token=token,
+            session=session,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
         # MemoryStorage хватит для MVP; для горизонтального масштабирования

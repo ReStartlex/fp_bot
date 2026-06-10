@@ -32,6 +32,7 @@ from loguru import logger
 from sqlalchemy import desc, func, select
 
 from src.alerts import ui
+from src.alerts.aiogram_proxy import build_aiogram_session
 from src.alerts.sessions import PAGE_SIZE, PaginationStore, paginate
 from src.config import Settings, get_settings
 from src.db.models import KnownLot, LotGroup, Mapping, Order, SyncRun
@@ -469,8 +470,10 @@ class TelegramBot:
             return
 
         token = self._settings.telegram_bot_token.get_secret_value()  # type: ignore[union-attr]
+        session = build_aiogram_session(self._settings, bot_label="admin-бот")
         self._bot = Bot(
             token=token,
+            session=session,
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
         self._dp = Dispatcher()

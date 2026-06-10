@@ -26,6 +26,10 @@ beautifulsoup4
 
 # --- Telegram ---
 aiogram>=3.5.0
+# SOCKS5-прокси для aiogram long-polling (РФ-VPS, где direct до
+# api.telegram.org блокируется). Без него Bot(session=AiohttpSession(
+# proxy=socks5://...)) падает ImportError на первом запросе.
+aiohttp_socks>=0.8.4
 
 # --- Авто-курс USD/RUB (auto-режим) ---
 # cbr-xml-daily.ru отдаёт JSON, лишних зависимостей не нужно
