@@ -50,6 +50,22 @@ async def _validate_one(
             logger.error(f"  • {p}")
         return False
 
+    # Диагностика пустого блока services (частая жертва ручной правки YAML).
+    if not entry.services:
+        logger.error(
+            "В записи НЕТ services — список услуг пуст. Скорее всего, блок "
+            "services: повреждён правкой. Перегенерируй файл "
+            "(migrate_skeleton --grep ... --out ...) и используй CLI-оверрайды "
+            "(--funpay-node / --set-field) вместо ручной правки YAML."
+        )
+        return False
+    if not entry.in_stock_services():
+        logger.warning(
+            f"Все {len(entry.services)} услуг категории сейчас не в наличии "
+            f"(in_stock=0) — создавать нечего."
+        )
+        return False
+
     # Схема раздела (live, read-only GET).
     url = f"{admin.BASE}/lots/offerEdit?node={entry.funpay_node}"
     r = await asyncio.to_thread(admin._sync_get, url)
@@ -112,6 +128,19 @@ async def main() -> int:
     parser.add_argument(
         "--no-preview", action="store_true", help="не показывать превью лота",
     )
+    # CLI-оверрайды: позволяют проверить категорию БЕЗ правки YAML.
+    # Удобно на этапе подбора node/полей — не трогаем хрупкий YAML вручную.
+    parser.add_argument(
+        "--funpay-node", type=int, default=None,
+        help="переопределить funpay_node (без правки YAML)",
+    )
+    parser.add_argument(
+        "--set-field", action="append", default=[], metavar="NAME=VALUE",
+        help="задать поле funpay_fields (повторяемый); заменяет funpay_fields целиком",
+    )
+    parser.add_argument(
+        "--markup", type=float, default=None, help="переопределить markup_percent",
+    )
     args = parser.parse_args()
 
     entries = load_entries(args.yaml_path)
@@ -123,6 +152,34 @@ async def main() -> int:
         if not entries:
             logger.error(f"Категория {args.category} не найдена в {args.yaml_path}")
             return 1
+
+    # Применяем CLI-оверрайды (только при единичной категории — иначе
+    # неоднозначно, к какой записи их относить).
+    overrides_fields: dict[str, str] = {}
+    for raw in args.set_field:
+        if "=" not in raw:
+            logger.error(f"--set-field ожидает NAME=VALUE, получил: {raw!r}")
+            return 1
+        name, _, value = raw.partition("=")
+        overrides_fields[name.strip()] = value
+    if args.funpay_node is not None or overrides_fields or args.markup is not None:
+        if len(entries) != 1:
+            logger.error(
+                "CLI-оверрайды (--funpay-node/--set-field/--markup) работают "
+                "только с одной категорией (--category)."
+            )
+            return 1
+        e = entries[0]
+        if args.funpay_node is not None:
+            e.funpay_node = args.funpay_node
+        if overrides_fields:
+            e.funpay_fields = overrides_fields
+        if args.markup is not None:
+            e.markup_percent = args.markup
+        logger.info(
+            f"Применены оверрайды: node={e.funpay_node}, "
+            f"fields={e.funpay_fields}, markup={e.markup_percent}"
+        )
 
     settings = get_settings()
     fx_rate = await get_usd_rub_rate(settings)
