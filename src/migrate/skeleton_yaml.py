@@ -39,12 +39,19 @@ DEFAULT_DESC_RU = """➖➖➖➖➖➖➖☑️После оплаты ☑️�
 🔒 УСЛОВИЯ ПРОДАЖИ
 Обратите внимание: цифровые коды относятся к одноразовым товарам и после передачи покупателю возврату и обмену не подлежат.
 """
-DEFAULT_DESC_EN = """After payment you receive a {nominal} {currency} top-up code for {platform}.
-Platform: {platform}
-Other denominations — see profile or ask in chat.
+DEFAULT_DESC_EN = """➖➖➖➖➖➖➖☑️After payment ☑️➖➖➖➖➖➖➖
 
-Please record your screen from payment to activation — it helps resolve disputes.
-Digital codes are one-time goods and are non-refundable after delivery.
+🔑You receive a top-up code with a face value of {nominal} {currency} for {platform}
+🎮Platform: {platform}
+📩Other denominations — ask in private messages / see profile
+
+➖➖➖➖🛑 IMPORTANT 🛑➖➖➖➖
+
+✅ REQUEST TO THE BUYER
+Please record your screen 🎥 from the moment of payment until you check/activate the code. The video helps quickly resolve any disputes and confirm the quality of the product.
+
+🔒 TERMS OF SALE
+Please note: digital codes are one-time goods and, once delivered to the buyer, are non-refundable and non-exchangeable.
 """
 
 # Маркер незаполненного поля. validate-команда обязана отвергать запись
@@ -83,7 +90,7 @@ def render_entry_yaml(entry: SkeletonEntry) -> str:
     a("  # node_id раздела (funpay.com/lots/<NODE>/trade)")
     a(f"  funpay_node: {TODO}")
     a("  # Цена: NS price_usd × (1 + markup%/100) × курс USD→RUB.")
-    a("  markup_percent: 10")
+    a("  markup_percent: 5")
     a("  # Поля формы FunPay (имена/значения — из funpay_node_schema).")
     a("  # Теги {nominal}{currency}{region_ru}{region_en} подставятся на лот.")
     a("  funpay_fields:")

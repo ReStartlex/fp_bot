@@ -25,8 +25,10 @@ from src.db.models import Mapping
 from src.db.repo import upsert_mapping
 from src.db.session import session_factory
 from src.migrate.generator import (
+    NodeSchemaIndex,
     build_creation_fields,
     compute_price_rub,
+    filter_fields_to_schema,
     validate_entry_against_schema,
 )
 from src.migrate.loader import MigrationEntry, MigrationService
@@ -149,12 +151,18 @@ async def run_category(
 
     before_ids = {int(o["offer_id"]) for o in await admin.list_node_offers(entry.funpay_node)}
     created_ids: set[int] = set()
+    schema_idx = NodeSchemaIndex.from_schema(schema)
 
     for svc in to_create:
         price = compute_price_rub(svc.price_usd, entry.markup_percent, fx_rate)
         try:
             lot = await admin.get_lot_fields(0, node_id=entry.funpay_node)
             fields = build_creation_fields(entry, svc, fx_rate)
+            # Шлём только поля, что есть в форме раздела (у Steam Wallet нет
+            # summary, у PlayStation свой набор — лишнее отбрасываем).
+            fields, dropped = filter_fields_to_schema(fields, schema_idx)
+            if dropped:
+                logger.debug(f"  svc {svc.service_id}: поля не в форме раздела, пропущены: {dropped}")
             lot.raw_fields.update(fields)
             lot.price = price
             lot.amount = 1  # стартовый сток; sync выставит реальный

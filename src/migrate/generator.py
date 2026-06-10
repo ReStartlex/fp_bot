@@ -169,6 +169,10 @@ def build_creation_fields(
     """
     Полный набор override-полей для формы создания лота FunPay
     (накладывается поверх пустой формы offer_id=0). Лот — неактивный.
+
+    Включает summary/desc на обоих языках. Поля, которых нет в конкретном
+    разделе (напр. summary у Steam Wallet), отфильтрует
+    filter_fields_to_schema перед отправкой.
     """
     fields: dict[str, str] = {}
     for fname, ftemplate in entry.funpay_fields.items():
@@ -178,3 +182,25 @@ def build_creation_fields(
     fields["fields[desc][ru]"] = substitute(entry.desc_ru, entry=entry, service=service)
     fields["fields[desc][en]"] = substitute(entry.desc_en, entry=entry, service=service)
     return fields
+
+
+def filter_fields_to_schema(
+    fields: dict[str, str], idx: NodeSchemaIndex
+) -> tuple[dict[str, str], list[str]]:
+    """
+    Оставляет только те поля, что реально есть в форме раздела.
+
+    Зачем: разделы различаются составом полей. Напр. Steam Wallet (node
+    1086) не имеет краткого описания (fields[summary]); PlayStation —
+    свой набор. Слать поле, которого в форме нет, незачем — фильтруем.
+
+    Возвращает (оставленные, отброшенные_имена).
+    """
+    kept: dict[str, str] = {}
+    dropped: list[str] = []
+    for name, value in fields.items():
+        if name in idx.all_field_names:
+            kept[name] = value
+        else:
+            dropped.append(name)
+    return kept, dropped

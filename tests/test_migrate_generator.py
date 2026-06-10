@@ -8,8 +8,10 @@ import textwrap
 import pytest
 
 from src.migrate.generator import (
+    NodeSchemaIndex,
     build_creation_fields,
     compute_price_rub,
+    filter_fields_to_schema,
     substitute,
     validate_entry_against_schema,
 )
@@ -123,6 +125,27 @@ def test_build_creation_fields_includes_summary_and_selects():
     assert fields["fields[usd]"] == "2 USD"
     assert fields["fields[summary][ru]"] == "Карта Apple 2 USD (США)"
     assert fields["fields[desc][en]"] == "2 USD Apple"
+
+
+def test_filter_fields_drops_summary_for_node_without_it():
+    """Steam-Wallet-подобный раздел без fields[summary] → summary отброшен."""
+    schema = {
+        "url": "x", "inputs": [{"name": "price", "type": "text", "value": ""}],
+        "selects": [
+            {"name": "fields[type]", "options": [{"value": "USD", "text": "USD", "selected": True}]},
+        ],
+        "textareas": [{"name": "fields[desc][ru]", "value_preview": ""}],
+    }
+    idx = NodeSchemaIndex.from_schema(schema)
+    fields = {
+        "fields[type]": "USD",
+        "fields[summary][ru]": "должно отброситься",
+        "fields[desc][ru]": "остаётся",
+    }
+    kept, dropped = filter_fields_to_schema(fields, idx)
+    assert "fields[type]" in kept
+    assert "fields[desc][ru]" in kept
+    assert "fields[summary][ru]" in dropped
 
 
 # ───────────── loader / TODO detection ─────────────
