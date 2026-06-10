@@ -29,7 +29,7 @@ DEFAULT_DESC_RU = """➖➖➖➖➖➖➖☑️После оплаты ☑️�
 
 🔑Вы получаете код пополнения номиналом {nominal} {currency} для {platform}
 🎮Платформа: {platform}
-📩Другие валюты уточняйте в личных сообщениях/Смотрите в профиле
+📩Другие номиналы/валюты уточняйте в личных сообщениях / смотрите в профиле
 
 ➖➖➖➖🛑 ВАЖНО ЗНАТЬ 🛑➖➖➖➖
 
@@ -39,19 +39,19 @@ DEFAULT_DESC_RU = """➖➖➖➖➖➖➖☑️После оплаты ☑️�
 🔒 УСЛОВИЯ ПРОДАЖИ
 Обратите внимание: цифровые коды относятся к одноразовым товарам и после передачи покупателю возврату и обмену не подлежат.
 """
-DEFAULT_DESC_EN = """➖➖➖➖➖➖➖☑️After payment ☑️➖➖➖➖➖➖➖
+DEFAULT_DESC_EN = """➖➖➖➖➖➖➖☑️After Payment ☑️➖➖➖➖➖➖➖
 
-🔑You receive a top-up code with a face value of {nominal} {currency} for {platform}
+🔑You will receive a {nominal} {currency} top-up code for {platform}
 🎮Platform: {platform}
-📩Other denominations — ask in private messages / see profile
+📩For other denominations/currencies, please contact us via private messages / check the profile
 
-➖➖➖➖🛑 IMPORTANT 🛑➖➖➖➖
+➖➖➖➖🛑 IMPORTANT INFORMATION 🛑➖➖➖➖
 
 ✅ REQUEST TO THE BUYER
-Please record your screen 🎥 from the moment of payment until you check/activate the code. The video helps quickly resolve any disputes and confirm the quality of the product.
+Please enable 🎥 screen recording from the moment of payment until the code is checked/activated. The video helps quickly resolve any disputes and confirm the quality of the product.
 
-🔒 TERMS OF SALE
-Please note: digital codes are one-time goods and, once delivered to the buyer, are non-refundable and non-exchangeable.
+🔒 SALES TERMS
+Please note: digital codes are one-time-use products and cannot be returned or exchanged after delivery to the buyer.
 """
 
 # Маркер незаполненного поля. validate-команда обязана отвергать запись
