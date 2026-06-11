@@ -59,7 +59,13 @@ FunPay-запросов; в логах `Sync done ... http=[... r429=0 ...]` в 
 
 ---
 
-### [ ] P0-2. Контракт ответов FunPay не зафиксирован фикстурами
+### [x] P0-2. Контракт ответов FunPay не зафиксирован фикстурами — DONE (`<pending>`)
+
+Сделано: `classify_offersave_response` вынесена чистой функцией; не-JSON
+ответ = успех ТОЛЬКО на чистом 3xx-редиректе (200-HTML/мусор → ok=False);
+логин-форма (body или Location) → ok=False с маркером протухшей сессии.
+Фикстуры `tests/fixtures/funpay/offersave_*.json|login_redirect.html` +
+`tests/test_funpay_contract.py` (11 тестов). Полный прогон 1086 зелёных.
 
 **Проблема.** Парсинг ответов `offerSave` — эвристики
 (`admin_http.save_lot`: «JSON без msg/error = ок», «HTML без слова "ошибк" =

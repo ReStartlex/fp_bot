@@ -23,6 +23,7 @@ PHPSESSID FunPay выдаёт сам через Set-Cookie на первом з�
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time as _time_module
 from dataclasses import dataclass, field
@@ -174,6 +175,109 @@ class _RateLimiterCtx:
     def __exit__(self, *_exc) -> None:
         # Семафор отпускаем ВСЕГДА, даже если внутри было исключение.
         self._lim._sem.release()
+
+
+# Маркеры страницы логина FunPay в HTML-ответе. Если offerSave вернул
+# логин-форму — сессия протухла, это НЕ успех (раньше HTML без слова
+# «ошибк» считался успехом, и протухший golden_key давал тихий ложный ok).
+_LOGIN_REDIRECT_MARKERS = (
+    "/account/login",
+    'name="login"',
+    "name=\"password\"",
+    "id=\"auth-form\"",
+)
+
+
+def classify_offersave_response(
+    *,
+    status_code: int,
+    text: str,
+    content_type: str = "",
+    retry_after: str | None = None,
+    location: str | None = None,
+    max_429_retries: int = 4,
+) -> dict[str, Any]:
+    """
+    Чистый классификатор ответа FunPay /lots/offerSave (без HTTP/IO).
+
+    Вынесен из FunPayAdminClient.save_lot, чтобы зафиксировать контракт
+    разбора реальными фикстурами (tests/fixtures/funpay/*) — парсер уже
+    дважды давал тихий ложный «успех» (amount=0; price вне диапазона),
+    и любой рефактор (в т.ч. выпил FunPayAPI) не должен это вернуть.
+
+    Контракт ответов FunPay (наблюдалось в проде):
+      * успех:   {"done": true, "error": false, "errors": [], ...}
+                 или {"msg": "ok"} (старый формат);
+      * ошибка:  {"done": false, "error": "...", "errors": [["price","..."]]}
+                 (msg при этом пустой — ловим по error/errors!);
+      * 429:     status_code == 429 (rate-limit, ретраи исчерпаны);
+      * HTML:    редкий случай. Логин-форма = протухла сессия (НЕ успех).
+
+    Возвращает dict: http_status, content_type, body_preview, ok,
+    [json], [funpay_error].
+    """
+    result: dict[str, Any] = {
+        "http_status": status_code,
+        "content_type": content_type,
+        "body_preview": text[:300],
+    }
+    is_2xx_3xx = 200 <= status_code < 400
+
+    # 429 после всех ретраев — явная диагностика, без HTML-каши в логе.
+    if status_code == 429:
+        result["ok"] = False
+        result["funpay_error"] = (
+            f"FunPay rate-limit 429 после {max_429_retries + 1} попыток "
+            f"(Retry-After={retry_after!r})"
+        )
+        return result
+
+    # JSON-ответ — основной путь.
+    try:
+        j = json.loads(text)
+    except Exception:
+        j = None
+    if isinstance(j, dict):
+        result["json"] = j
+        # msg=ok — успех; msg=что-то ещё — ошибка от FunPay.
+        # КРИТИЧНО: FunPay умеет отвечать 200 + {"error": "...", "errors": [...]}
+        # при отбраковке формы (amount=0, цена вне диапазона) — msg пустой.
+        msg = (j.get("msg") or "").strip().lower()
+        has_error_flag = bool(j.get("error")) or bool(j.get("errors"))
+        result["ok"] = (msg in ("", "ok", "success")) and is_2xx_3xx and not has_error_flag
+        if not result["ok"]:
+            result["funpay_error"] = (
+                j.get("msg") or j.get("errors") or j.get("error") or j
+            )
+        return result
+
+    # Не-JSON (HTML / редирект / мусор).
+    low = text.lower()
+    loc = (location or "").lower()
+    is_login = (
+        any(m.lower() in low for m in _LOGIN_REDIRECT_MARKERS)
+        or "/account/login" in loc
+    )
+    if is_login:
+        result["ok"] = False
+        result["funpay_error"] = (
+            "offerSave вернул страницу логина — golden_key/сессия протухли"
+        )
+        return result
+    # Успех ТОЛЬКО на чистом 3xx-редиректе (FunPay перебрасывает на
+    # страницу сохранённого лота). Подтверждённый успех в норме — это JSON
+    # {"done":true}; любой другой не-JSON (включая 200-HTML) считаем НЕ
+    # успехом: лучше лишний retry, чем тихий ложный ok (инциденты amount=0,
+    # цена вне диапазона уже стоили продаж).
+    if 300 <= status_code < 400:
+        result["ok"] = True
+        return result
+    result["ok"] = False
+    result["funpay_error"] = (
+        f"offerSave вернул не-JSON (status={status_code}, "
+        f"ct={content_type!r}) — успех не подтверждён"
+    )
+    return result
 
 
 class FunPayAdminClient:
@@ -1154,48 +1258,14 @@ class FunPayAdminClient:
 
         r = await asyncio.to_thread(self._sync_post_form_with_429_retry, url, data)
 
-        result: dict[str, Any] = {
-            "http_status": r.status_code,
-            "content_type": r.headers.get("Content-Type", ""),
-            "body_preview": r.text[:300],
-        }
-        # 429 после всех ретраев — явная диагностика, без HTML-каши в логе
-        if r.status_code == 429:
-            result["ok"] = False
-            result["funpay_error"] = (
-                f"FunPay rate-limit 429 после "
-                f"{self._max_429_retries + 1} попыток "
-                f"(Retry-After={r.headers.get('Retry-After')!r})"
-            )
-            return result
-        # Пробуем распарсить JSON-ответ
-        try:
-            j = r.json()
-        except Exception:
-            j = None
-        if isinstance(j, dict):
-            result["json"] = j
-            # msg=ok — успех; msg=что-то ещё — ошибка от FunPay.
-            # ВАЖНО: FunPay умеет отвечать 200 + {"error": 1, "errors": {...}}
-            # при отбраковке формы (например amount=0) — msg при этом пустой.
-            # Раньше такой ответ считался успехом, и «деактивация» лота
-            # молча не применялась (инцидент 2026-06: zombie reaper часами
-            # «успешно» деактивировал один и тот же лот).
-            msg = (j.get("msg") or "").strip().lower()
-            has_error_flag = bool(j.get("error")) or bool(j.get("errors"))
-            result["ok"] = (msg in ("", "ok", "success")) and r.ok and not has_error_flag
-            if not result["ok"]:
-                result["funpay_error"] = (
-                    j.get("msg") or j.get("errors") or j.get("error") or j
-                )
-            return result
-        # HTML-ответ — успех, только если 200 и нет признаков ошибки
-        if r.ok and "ошибк" not in r.text.lower():
-            result["ok"] = True
-        else:
-            result["ok"] = False
-            result["funpay_error"] = "Получили HTML, не JSON, и/или статус != 200"
-        return result
+        return classify_offersave_response(
+            status_code=r.status_code,
+            text=r.text,
+            content_type=r.headers.get("Content-Type", ""),
+            retry_after=r.headers.get("Retry-After"),
+            location=r.headers.get("Location"),
+            max_429_retries=self._max_429_retries,
+        )
 
 
 # ----- ошибки -----
