@@ -9,6 +9,7 @@ from sqlalchemy import desc, func, select
 
 from src.config import Settings, get_settings
 from src.db.models import LotGroup, Mapping, Order, SyncRun
+from src.db.repo import get_daily_summary
 from src.db.session import session_factory
 from src.mapping.rules import estimate_profit_rub
 from src.sync.fx import get_rate_breakdown
@@ -83,6 +84,10 @@ async def get_dashboard_summary(settings: Settings | None = None) -> dict[str, A
                 )
             ).all()
         }
+        today_key = utcnow().date().isoformat()
+        yesterday_key = (utcnow().date() - timedelta(days=1)).isoformat()
+        daily_today = await get_daily_summary(session, day=today_key)
+        daily_yesterday = await get_daily_summary(session, day=yesterday_key)
 
     active_orders = sum(order_counts.get(status, 0) for status in ORDER_ACTIVE_STATUSES)
     problem_orders = sum(order_counts.get(status, 0) for status in ORDER_PROBLEM_STATUSES)
@@ -119,6 +124,10 @@ async def get_dashboard_summary(settings: Settings | None = None) -> dict[str, A
             "interval_seconds": settings.order_reconcile_interval_seconds,
             "stale_after_seconds": settings.order_reconcile_stale_after_seconds,
             "max_per_run": settings.order_reconcile_max_per_run,
+        },
+        "daily": {
+            "today": daily_today,
+            "yesterday": daily_yesterday,
         },
     }
 

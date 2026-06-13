@@ -127,6 +127,30 @@ class SyncRun(Base):
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
+class DailyStats(Base):
+    """
+    Лёгкие СУТОЧНЫЕ счётчики рантайм-событий, которых нет в других
+    таблицах: FunPay rate-limit (r429/exhausted) и деактивации лотов.
+
+    Исходы заказов (delivered/failed/manual_hold/…) здесь НЕ дублируем —
+    они выводятся из `orders` по дате `created_at` (идемпотентно, без
+    риска двойного учёта при ре-обработке заказа). См.
+    `repo.get_daily_summary`.
+
+    Ключ — UTC-дата в формате YYYY-MM-DD (совпадает с `func.date(...)`
+    над naive-UTC `created_at`).
+    """
+    __tablename__ = "daily_stats"
+
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    r429: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    exhausted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    deactivations: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class ChatState(Base):
     """Состояние чата с покупателем: когда здоровались, когда просили помощь."""
     __tablename__ = "chat_states"

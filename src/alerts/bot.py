@@ -41,6 +41,7 @@ from src.db.repo import (
     assign_mapping_group,
     classify_lot_group,
     find_order_by_funpay_id,
+    get_daily_summary,
     list_lot_groups,
     list_mappings,
     list_pending_confirmation,
@@ -2033,9 +2034,13 @@ class TelegramBot:
         await self._edit_or_answer(cq, text, reply_markup=ui.single_close_kb())
 
     async def _render_status_text(self) -> str:
+        today_key = utcnow().date().isoformat()
+        yesterday_key = (utcnow().date() - timedelta(days=1)).isoformat()
         async with session_factory()() as session:
             stmt = select(SyncRun).order_by(desc(SyncRun.started_at)).limit(1)
             last_run = (await session.execute(stmt)).scalar_one_or_none()
+            daily_today = await get_daily_summary(session, day=today_key)
+            daily_yesterday = await get_daily_summary(session, day=yesterday_key)
             active_orders = {
                 status: int(count or 0)
                 for status, count in (
@@ -2093,7 +2098,25 @@ class TelegramBot:
             f"max price jump <b>{self._settings.sync_max_price_change_percent:.0f}%</b>, "
             f"reserve stock <b>{'on' if self._settings.sync_reserve_pending_orders else 'off'}</b>",
         ]
-        return text + "\n".join(health_lines)
+
+        def _daily_line(label: str, d: dict) -> str:
+            return (
+                f"  {label}: ✅<b>{d['orders_ok']}</b> "
+                f"❌<b>{d['orders_failed']}</b> "
+                f"✋<b>{d['manual_holds']}</b> "
+                f"📌<b>{d['pins_ready']}</b> · "
+                f"429=<b>{d['r429']}</b> exh=<b>{d['exhausted']}</b> "
+                f"deact=<b>{d['deactivations']}</b>"
+            )
+
+        daily_lines = [
+            "",
+            "📊 <b>Статистика (UTC)</b> "
+            "<i>✅ok ❌fail ✋hold 📌pins · 429/exhausted/деактивации</i>",
+            _daily_line("Сегодня", daily_today),
+            _daily_line("Вчера", daily_yesterday),
+        ]
+        return text + "\n".join(health_lines + daily_lines)
 
     @_guard
     async def _do_balance(self, msg: Message) -> None:

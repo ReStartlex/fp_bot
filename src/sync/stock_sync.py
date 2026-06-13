@@ -534,6 +534,9 @@ async def sync_once(
     lots_checked = 0
     lots_updated = 0
     lots_skipped = 0
+    # Сколько лотов реально деактивировано (will_deactivate + успешный
+    # apply). Для суточной статистики (P2-5). Считаем только в real-actions.
+    lots_deactivated = 0
     # diff-cache fast-path: лоты, которые НЕ потребовали FunPay GET
     # (NS-target совпадает с last_synced и last_synced свежий).
     # Это НЕ skipped — это «не было нужды трогать», т.е. желаемый
@@ -748,6 +751,8 @@ async def sync_once(
                     await _apply_decision(decision, funpay_client, settings)
                     logger.success(f"  [{label}] applied: {action_str}")
                     lots_updated += 1
+                    if decision.will_deactivate:
+                        lots_deactivated += 1
                     # diff-cache: после успешного save_lot запоминаем
                     # «новое» равновесие. КРИТИЧНО: только при success.
                     # Если save_lot fail'нул (SaveLotFailed) — last_synced
@@ -863,6 +868,7 @@ async def sync_once(
         "updated": lots_updated,
         "skipped": lots_skipped,
         "capped": lots_capped,
+        "deactivated": lots_deactivated,
         "auth_errors": auth_errors,
         "price_mismatches": price_mismatches,
         "http": http_metrics,

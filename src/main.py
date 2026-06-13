@@ -597,6 +597,36 @@ class App:
                         logger.warning(f"sync exhausted recover alert не доставлен: {exc}")
                 self._sync_exhausted_streak = 0
 
+            # P2-5: суточная статистика. Рантайм-счётчики (429/exhausted/
+            # деактивации) персистим в daily_stats. Best-effort: сбой
+            # учёта НЕ должен влиять на sync.
+            http = result.get("http") or {}
+            await self._bump_daily_stats_safe(
+                r429=int(http.get("retry_429", 0)),
+                exhausted=int(http.get("exhausted", 0)),
+                deactivations=int(result.get("deactivated", 0)),
+                source="sync",
+            )
+
+    async def _bump_daily_stats_safe(
+        self, *, r429: int = 0, exhausted: int = 0,
+        deactivations: int = 0, source: str = "",
+    ) -> None:
+        """Best-effort запись суточных счётчиков (P2-5). Никогда не бросает."""
+        if r429 <= 0 and exhausted <= 0 and deactivations <= 0:
+            return
+        try:
+            from src.db.repo import bump_daily_stats
+            from src.db.session import session_factory
+            async with session_factory()() as session:
+                await bump_daily_stats(
+                    session, r429=r429, exhausted=exhausted,
+                    deactivations=deactivations,
+                )
+                await session.commit()
+        except Exception as exc:
+            logger.warning(f"daily_stats bump ({source}) не записан: {exc}")
+
     async def _trigger_sync(self) -> dict:
         """Вручную из Telegram-бота. Не запустится параллельно с scheduler-sync."""
         async with self._sync_lock:
@@ -1040,6 +1070,11 @@ class App:
             f"deactivated={result.deactivated} "
             f"errors={result.errors} "
             f"notify_suppressed={result.notify_suppressed}"
+        )
+
+        # P2-5: деактивации reaper'а тоже идут в суточную статистику.
+        await self._bump_daily_stats_safe(
+            deactivations=int(result.deactivated), source="reaper"
         )
 
         if result.errors > 0:

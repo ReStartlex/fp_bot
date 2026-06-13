@@ -7,10 +7,12 @@ from src.timeutil import utcnow
 from typing import Any
 
 from sqlalchemy import func, select, update as sa_update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models import (
     ChatState,
+    DailyStats,
     FunpayChatCursor,
     FxRate,
     KnownLot,
@@ -800,3 +802,77 @@ async def delete_pending_telegram_alert(
     if obj is not None:
         await session.delete(obj)
         await session.flush()
+
+
+# ---------- Daily stats (P2-5: наблюдаемость одним взглядом) ----------
+
+def _utc_day(day: str | None = None) -> str:
+    """UTC-дата YYYY-MM-DD (ключ daily_stats). Совпадает с func.date(...)
+    над naive-UTC created_at."""
+    return day or utcnow().date().isoformat()
+
+
+async def bump_daily_stats(
+    session: AsyncSession,
+    *,
+    r429: int = 0,
+    exhausted: int = 0,
+    deactivations: int = 0,
+    day: str | None = None,
+) -> None:
+    """
+    Идемпотентно ПРИБАВЛЯЕТ счётчики к строке суток (UTC), создавая её при
+    необходимости (SQLite upsert). Нулевой вызов — no-op (не плодим строки).
+
+    Только для рантайм-событий, которых нет в других таблицах
+    (FunPay rate-limit, деактивации). Исходы заказов сюда НЕ пишем.
+    """
+    if r429 <= 0 and exhausted <= 0 and deactivations <= 0:
+        return
+    d = _utc_day(day)
+    stmt = sqlite_insert(DailyStats).values(
+        day=d, r429=max(r429, 0), exhausted=max(exhausted, 0),
+        deactivations=max(deactivations, 0),
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[DailyStats.day],
+        set_={
+            "r429": DailyStats.r429 + stmt.excluded.r429,
+            "exhausted": DailyStats.exhausted + stmt.excluded.exhausted,
+            "deactivations": DailyStats.deactivations + stmt.excluded.deactivations,
+        },
+    )
+    await session.execute(stmt)
+
+
+async def get_daily_summary(
+    session: AsyncSession, *, day: str | None = None
+) -> dict[str, Any]:
+    """
+    Сводка за сутки (UTC). Исходы заказов выведены из `orders` по
+    `created_at` (по текущему статусу) — идемпотентно, без двойного учёта.
+    Рантайм-счётчики берутся из `daily_stats`.
+    """
+    d = _utc_day(day)
+    rows = (
+        await session.execute(
+            select(Order.status, func.count(Order.id))
+            .where(func.date(Order.created_at) == d)
+            .group_by(Order.status)
+        )
+    ).all()
+    by_status = {status: int(c or 0) for status, c in rows}
+    row = (
+        await session.execute(select(DailyStats).where(DailyStats.day == d))
+    ).scalar_one_or_none()
+    return {
+        "day": d,
+        "orders_total": sum(by_status.values()),
+        "orders_ok": by_status.get("delivered", 0),
+        "orders_failed": by_status.get("failed", 0),
+        "manual_holds": by_status.get("manual_hold", 0),
+        "pins_ready": by_status.get("pins_ready", 0),
+        "r429": int(row.r429) if row is not None else 0,
+        "exhausted": int(row.exhausted) if row is not None else 0,
+        "deactivations": int(row.deactivations) if row is not None else 0,
+    }

@@ -371,7 +371,20 @@ P2-3 и P2-4 имели общий корень: `BRANCH` дефолтил в `m
 **Приёмка.** `bash deploy/update.sh` без env-переменных обновляет на
 последний коммит закреплённой ветки.
 
-### [ ] P2-5. Наблюдаемость: счётчики в БД вместо grep по журналу
+### [x] P2-5. Наблюдаемость: счётчики в БД вместо grep по журналу — DONE (`<pending>`)
+
+Сделано: таблица `daily_stats(day, r429, exhausted, deactivations)` для
+рантайм-сигналов, которых нет в других таблицах. Исходы заказов
+(ok/failed/manual_hold/pins_ready) НЕ дублируются — выводятся из `orders`
+по `func.date(created_at)` (идемпотентно, без двойного учёта при
+ре-обработке, без правок денежного пути). `repo.bump_daily_stats` —
+SQLite-upsert (аддитивный, нулевой вызов = no-op); `repo.get_daily_summary`
+объединяет вывод заказов + счётчики. Инкремент best-effort из `_safe_sync`
+(r429/exhausted/деактивации) и zombie-reaper-job (деактивации) — сбой
+учёта НЕ влияет на sync. Показ: Telegram `/status` (блок «📊 Статистика
+сегодня/вчера») + `/api/dashboard` (ключ `daily.today/yesterday`). Тесты
+`tests/test_daily_stats.py` (5: аддитивность, no-op, вывод исходов,
+разделение суток, пустой день). 1122 зелёных.
 
 Сводки уже пишутся в лог (sync done, http metrics, reaper). Добавить
 лёгкую таблицу `daily_stats` (дата, orders_ok, orders_failed, manual_holds,
