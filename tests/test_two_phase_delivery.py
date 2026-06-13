@@ -45,6 +45,7 @@ async def db_factory(monkeypatch):
     monkeypatch.setattr("src.orders.processor.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.resolve.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.holds.session_factory", lambda: factory)
+    monkeypatch.setattr("src.orders.stages.delivery.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.reconciler.session_factory", lambda: factory)
     monkeypatch.setattr("src.db.repo.session_factory", lambda: factory, raising=False)
     proc._order_locks.clear()
@@ -183,7 +184,7 @@ async def test_deliver_pins_sets_delivering_before_send_message(
     и commit'ом delivered — reconciler увидит delivering и НЕ повторит
     отправку автоматически.
     """
-    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
     await _seed_pins_ready_order(db_factory)
 
@@ -223,7 +224,7 @@ async def test_deliver_pins_rolls_back_to_pins_ready_on_send_failure(
 
     Это позволяет reconciler / Retry безопасно повторить отправку.
     """
-    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
     await _seed_pins_ready_order(db_factory)
 

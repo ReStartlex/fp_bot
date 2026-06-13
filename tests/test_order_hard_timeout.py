@@ -39,6 +39,7 @@ async def db_factory(monkeypatch):
     monkeypatch.setattr("src.orders.processor.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.resolve.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.holds.session_factory", lambda: factory)
+    monkeypatch.setattr("src.orders.stages.delivery.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.reconciler.session_factory", lambda: factory)
     proc._order_locks.clear()
     yield factory
@@ -215,7 +216,7 @@ async def _force_order_age(factory, funpay_order_id: str, age_seconds: int) -> N
 @pytest.mark.asyncio
 async def test_order_description_persisted_to_db(db_factory, settings, monkeypatch):
     """Базовая проверка P2: description из event сохраняется в БД."""
-    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
     ns = FakeNS(pay_pins=["X1"])
     await process_funpay_order(
@@ -478,7 +479,7 @@ async def test_delivery_skipped_when_operator_marked_delivered(
     Гонка: бот вошёл в _deliver_pins, в этот момент оператор в Telegram
     нажал «Выдано вручную» → status=delivered. Бот НЕ должен отправить дубль.
     """
-    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
     # Готовим заказ в pins_ready с сохранёнными pins.
     async with db_factory() as s:
@@ -522,7 +523,7 @@ async def test_force_delivery_does_not_override_operator_delivered(
     db_factory, settings, monkeypatch
 ):
     """force_delivery=True (Retry) НЕ переотправляет, если уже delivered."""
-    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
     async with db_factory() as s:
         import json

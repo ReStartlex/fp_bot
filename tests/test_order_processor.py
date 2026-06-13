@@ -51,6 +51,7 @@ async def db_session_factory(monkeypatch):
     monkeypatch.setattr("src.orders.processor.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.resolve.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.holds.session_factory", lambda: factory)
+    monkeypatch.setattr("src.orders.stages.delivery.session_factory", lambda: factory)
 
     # Чистим in-memory locks между тестами
     proc._order_locks.clear()
@@ -251,7 +252,7 @@ async def test_happy_path_pay_returns_pins_immediately(
     async def fake_rate(_settings=None):
         return 100.0
 
-    monkeypatch.setattr(proc, "get_usd_rub_rate", fake_rate)
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", fake_rate)
     await _make_mapping(db_session_factory)
     ns = FakeNS(pay_pins=["AAAA-AAAA"])
     fp = FakeFunPay()

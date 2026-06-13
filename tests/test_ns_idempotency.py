@@ -52,6 +52,7 @@ async def db_factory(monkeypatch):
     monkeypatch.setattr("src.orders.processor.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.resolve.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.holds.session_factory", lambda: factory)
+    monkeypatch.setattr("src.orders.stages.delivery.session_factory", lambda: factory)
     proc._order_locks.clear()
     yield factory
     await engine.dispose()
@@ -213,7 +214,7 @@ async def test_create_order_uses_valid_uuid4(
     И сохранён в БД для idempotency при retry."""
     from src.orders.processor import _is_valid_uuid4
 
-    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
 
     ns = FakeNSIdempotent()
@@ -251,7 +252,7 @@ async def test_retry_does_not_recreate_existing_ns_order(
     """
     import uuid
 
-    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
 
     # Intent marker UUID4 от прошлой попытки (NS-формат)
@@ -310,7 +311,7 @@ async def test_retry_does_not_repay_when_ns_order_already_in_progress(
     но crash до commit'a ns_paid в БД. Retry должен через order_info
     опознать что заказ уже оплачен и НЕ вызывать pay_order повторно."""
     import uuid
-    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
 
     saved_uuid = str(uuid.uuid4())
@@ -370,7 +371,7 @@ async def test_create_order_proceeds_when_ns_returns_404(
     404 (предыдущий create НЕ дошёл) — должны нормально вызвать create_order
     с тем же UUID."""
     import uuid
-    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
 
     saved_uuid = str(uuid.uuid4())
@@ -419,7 +420,7 @@ async def test_ns_custom_id_persisted_before_ns_call(
 
     Проверяем перехватом: подменяем create_order на функцию, которая ДО
     обращения к NS читает текущее состояние БД."""
-    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
 
     db_state_at_create: dict = {}
@@ -466,7 +467,7 @@ async def test_legacy_fp_id_in_db_is_regenerated_to_uuid4(
     """
     from src.orders.processor import _is_valid_uuid4
 
-    monkeypatch.setattr(proc, "get_usd_rub_rate", lambda _s=None: _coro(100.0))
+    monkeypatch.setattr("src.orders.stages.delivery.get_usd_rub_rate", lambda _s=None: _coro(100.0))
     await _make_mapping(db_factory)
 
     async with db_factory() as s:
