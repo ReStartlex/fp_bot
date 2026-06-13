@@ -468,9 +468,24 @@ csrf-токен на весь процесс и НЕ перевыпускал е
 «Обновите страницу» до перезапуска. Фикс: `_invalidate_csrf()` +
 детектор `_looks_like_stale_csrf` — при таком ответе сбрасываем кэш csrf,
 следующая попытка перевыпускает токен через whoami. Тесты:
-`tests/test_send_message_csrf_refresh.py` (4). save_lot НЕ затронут — он
+`tests/test_send_message_csrf_refresh.py`. save_lot НЕ затронут — он
 берёт csrf из свежесчитанной формы лота, и verify-after-save штатно
 поймал неприменённую аварийную деактивацию (→ pins_ready + алерт).
+
+### Заказ NTZ3MLCY (2026-06-13, `<pending>`): csrf брался из НЕ ТОГО источника
+
+Доделка к JK6JW57J. После деплоя `eab990e` доставка снова ушла через
+FunPayAPI-резерв: admin_http исчерпал 3 попытки с «Обновите страницу»
+ДАЖЕ после перевыпуска токена. Корень: `whoami` тянул csrf из
+`meta[name=csrf-token]`, а `/runner/` (chat_message) валидирует ДРУГОЙ
+токен — из `body[data-app-data]` JSON (поле `csrf-token`). Перевыпуск
+давал тот же неподходящий meta-токен → вечная «Обновите страницу».
+Фикс: `whoami` и fallback `_ensure_csrf` (/chat/) теперь берут csrf из
+`body[data-app-data]` (тот же источник, что FunPayAPI
+`Account.app_data["csrf-token"]`), meta/input — только деградация.
+Заодно userId парсится из app-data. Тесты: +2 whoami-теста. 1117 зелёных.
+Резерв FunPayAPI в send_message трогать НЕ будем, пока admin_http не
+подтвердит primary-доставку на проде (acceptance этапа 2 P1-2).
 
 ## Что НЕ трогать (работает, проверено в этой итерации)
 

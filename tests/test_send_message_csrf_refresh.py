@@ -50,6 +50,61 @@ def test_looks_like_stale_csrf_negatives():
 
 
 @pytest.mark.asyncio
+async def test_whoami_takes_csrf_from_app_data_not_meta():
+    """csrf для /runner/ берётся из body[data-app-data] (как FunPayAPI), а
+    НЕ из meta[name=csrf-token] — это разные токены, и /runner/ валидирует
+    именно app-data (инцидент NTZ3MLCY: meta-токен → «Обновите страницу»)."""
+    admin = _admin()
+    html = (
+        "<html><body "
+        "data-app-data='{\"userId\": 617001, \"csrf-token\": \"RUNNER_TOK\"}' "
+        "data-user-id=\"617001\">"
+        "<div class=\"user-link-name\">lol228822</div>"
+        "<meta name=\"csrf-token\" content=\"WRONG_META_TOK\">"
+        "</body></html>"
+    )
+
+    class _Resp:
+        text = html
+        status_code = 200
+        url = "https://funpay.com/"
+        headers: dict = {}
+
+    admin._sync_get = lambda url: _Resp()  # type: ignore[assignment]
+
+    me = await admin.whoami()
+
+    assert me["csrf_token"] == "RUNNER_TOK"
+    assert admin._csrf_token == "RUNNER_TOK"
+    assert me["user_id"] == 617001
+    assert me["authenticated"] is True
+
+
+@pytest.mark.asyncio
+async def test_whoami_falls_back_to_meta_when_no_app_data():
+    """Если data-app-data отсутствует — берём meta-токен (деградация)."""
+    admin = _admin()
+    html = (
+        "<html><body data-user-id=\"617001\">"
+        "<div class=\"user-link-name\">lol228822</div>"
+        "<meta name=\"csrf-token\" content=\"META_TOK\">"
+        "</body></html>"
+    )
+
+    class _Resp:
+        text = html
+        status_code = 200
+        url = "https://funpay.com/"
+        headers: dict = {}
+
+    admin._sync_get = lambda url: _Resp()  # type: ignore[assignment]
+
+    me = await admin.whoami()
+    assert me["csrf_token"] == "META_TOK"
+    assert me["user_id"] == 617001
+
+
+@pytest.mark.asyncio
 async def test_send_chat_message_refreshes_stale_csrf(monkeypatch):
     """Первый ответ = «Обновите страницу» (stale csrf) → токен сбрасывается
     и перевыпускается; вторая попытка идёт с новым токеном и проходит."""

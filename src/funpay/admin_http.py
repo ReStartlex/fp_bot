@@ -647,7 +647,27 @@ class FunPayAdminClient:
         body = soup.find("body")
         user_id: int | None = None
         username: str | None = None
-        if body and body.get("data-user-id"):
+
+        # ГЛАВНЫЙ источник csrf и userId — JSON в body[data-app-data].
+        # КРИТИЧНО: именно этот токен валидирует FunPay на /runner/
+        # (chat_message). meta[name=csrf-token] — ДРУГОЙ токен; с ним
+        # /runner/ отвечает «Обновите страницу и повторите попытку»
+        # (инцидент NTZ3MLCY). Тот же источник использует FunPayAPI
+        # (Account.app_data["csrf-token"]).
+        app_data: dict[str, Any] = {}
+        if body and body.get("data-app-data"):
+            try:
+                app_data = json.loads(body["data-app-data"]) or {}
+            except (ValueError, TypeError):
+                app_data = {}
+        csrf = app_data.get("csrf-token")
+        if app_data.get("userId") is not None:
+            try:
+                user_id = int(app_data["userId"])
+            except (TypeError, ValueError):
+                pass
+
+        if user_id is None and body and body.get("data-user-id"):
             try:
                 user_id = int(body["data-user-id"])
             except (TypeError, ValueError):
@@ -659,13 +679,13 @@ class FunPayAdminClient:
         if link:
             username = link.get_text(strip=True)
 
-        # CSRF-токен и app-data — кешируем для последующего send_chat_message
-        csrf = None
-        meta = soup.find("meta", attrs={"name": "csrf-token"}) or soup.find(
-            "input", attrs={"name": "csrf_token"}
-        )
-        if meta is not None:
-            csrf = meta.get("content") or meta.get("value")
+        # Fallback на meta/input, если data-app-data не отдал токен.
+        if not csrf:
+            meta = soup.find("meta", attrs={"name": "csrf-token"}) or soup.find(
+                "input", attrs={"name": "csrf_token"}
+            )
+            if meta is not None:
+                csrf = meta.get("content") or meta.get("value")
         if csrf:
             self._csrf_token = csrf
 
@@ -717,6 +737,19 @@ class FunPayAdminClient:
         try:
             r = await asyncio.to_thread(self._sync_get, f"{self.BASE}/chat/")
             soup = BeautifulSoup(r.text, "html.parser")
+            # Сначала — authoritative-источник body[data-app-data] (тот же
+            # токен, что валидирует /runner/), затем meta/input.
+            body = soup.find("body")
+            if body and body.get("data-app-data"):
+                try:
+                    token = (json.loads(body["data-app-data"]) or {}).get(
+                        "csrf-token"
+                    )
+                except (ValueError, TypeError):
+                    token = None
+                if token:
+                    self._csrf_token = token
+                    return token
             for sel, attr in (
                 ('meta[name="csrf-token"]', "content"),
                 ('input[name="csrf_token"]', "value"),
