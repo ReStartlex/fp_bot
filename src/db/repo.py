@@ -13,6 +13,7 @@ from src.db.models import (
     ChatState,
     FunpayChatCursor,
     FxRate,
+    KnownLot,
     LotGroup,
     Mapping,
     Order,
@@ -71,6 +72,43 @@ async def upsert_mapping(
     obj.label = label
     if group_id is not None:
         obj.group_id = group_id
+    await session.flush()
+    return obj
+
+
+async def upsert_known_lot(
+    session: AsyncSession,
+    *,
+    funpay_lot_id: int,
+    title: str | None,
+    mark_notified: bool = False,
+) -> KnownLot:
+    """
+    Создать/обновить KnownLot с заголовком (для матчинга заказов без lot_id).
+
+    Используется миграцией (migrate/runner) сразу при создании лота, чтобы
+    matcher имел сильный сигнал title (бонус 120) с первого заказа, не
+    дожидаясь new_lots discovery. mark_notified=True ставит notified_at,
+    чтобы discovery не счёл лот «новым» (мы создали его осознанно).
+    """
+    now = utcnow()
+    obj = await session.get(KnownLot, funpay_lot_id)
+    clean_title = (title or "").strip()[:255] or None
+    if obj is None:
+        obj = KnownLot(
+            funpay_lot_id=funpay_lot_id,
+            title=clean_title,
+            first_seen_at=now,
+            last_seen_at=now,
+            notified_at=now if mark_notified else None,
+        )
+        session.add(obj)
+    else:
+        obj.last_seen_at = now
+        if clean_title:
+            obj.title = clean_title
+        if mark_notified and obj.notified_at is None:
+            obj.notified_at = now
     await session.flush()
     return obj
 

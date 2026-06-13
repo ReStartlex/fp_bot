@@ -22,13 +22,14 @@ from loguru import logger
 from sqlalchemy import select
 
 from src.db.models import Mapping
-from src.db.repo import upsert_mapping
+from src.db.repo import upsert_known_lot, upsert_mapping
 from src.db.session import session_factory
 from src.migrate.generator import (
     NodeSchemaIndex,
     build_creation_fields,
     compute_price_rub,
     filter_fields_to_schema,
+    substitute,
     validate_entry_against_schema,
 )
 from src.migrate.loader import MigrationEntry, MigrationService
@@ -194,6 +195,15 @@ async def run_category(
                     ns_fields_template=NS_QUANTITY_TEMPLATE,
                     enabled=bool(activate),
                     label=_mapping_label(entry, svc),
+                )
+                # KnownLot с заголовком = подставленный summary_ru: даёт
+                # matcher'у сильный сигнал title с первого же заказа без
+                # lot_id (P1-4), не дожидаясь new_lots discovery.
+                await upsert_known_lot(
+                    session,
+                    funpay_lot_id=lot_id,
+                    title=substitute(entry.summary_ru, entry=entry, service=svc),
+                    mark_notified=True,
                 )
                 await session.commit()
 

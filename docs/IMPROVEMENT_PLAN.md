@@ -233,7 +233,13 @@ Deprecated в Python 3.12 (прод на 3.12). Naive-datetime уже почти
 
 ---
 
-### [ ] P1-4. KnownLot для мигрированных лотов
+### [x] P1-4. KnownLot для мигрированных лотов — DONE (`<pending>`)
+
+Сделано: `upsert_known_lot` в repo; `migrate/runner` пишет KnownLot с
+title = подставленный summary_ru сразу при создании лота (mark_notified,
+чтобы discovery не шумел). Backfill для старых: `src/tools/backfill_known_lots.py`
+(title из mapping.label, dry-run по умолчанию, `--apply`). Тест в
+test_migrate_runner.py. 1099 зелёных.
 
 **Проблема.** Матчинг заказов без lot_id использует `KnownLot.title`
 (бонус 120 в `_mapping_match_score`). Лоты, созданные миграцией, получают

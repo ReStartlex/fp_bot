@@ -113,6 +113,12 @@ async def test_creates_lot_and_mapping_staged(db_factory):
         assert m.enabled is False
         assert m.ns_fields_template == runner_mod.NS_QUANTITY_TEMPLATE
         assert "Apple" in m.label and "2" in m.label
+        # P1-4: KnownLot с непустым title создан сразу при создании лота
+        from src.db.models import KnownLot
+        kl = await s.get(KnownLot, created.funpay_lot_id)
+        assert kl is not None
+        assert kl.title and "2" in kl.title  # подставленный summary_ru
+        assert kl.notified_at is not None  # помечен, чтобы discovery не шумел
 
 
 @pytest.mark.asyncio
