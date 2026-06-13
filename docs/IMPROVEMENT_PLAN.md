@@ -233,7 +233,7 @@ Deprecated в Python 3.12 (прод на 3.12). Naive-datetime уже почти
 
 ---
 
-### [x] P1-4. KnownLot для мигрированных лотов — DONE (`<pending>`)
+### [x] P1-4. KnownLot для мигрированных лотов — DONE (`aeb4542`)
 
 Сделано: `upsert_known_lot` в repo; `migrate/runner` пишет KnownLot с
 title = подставленный summary_ru сразу при создании лота (mark_notified,
@@ -283,7 +283,13 @@ Exception` не превращает неуспешную выдачу/опла�
 
 **Приёмка.** Ни один файл > 1000 строк; тесты зелёные.
 
-### [ ] P2-2. CI (GitHub Actions)
+### [x] P2-2. CI (GitHub Actions) — DONE (`<pending>`)
+
+Сделано: `.github/workflows/ci.yml` — matrix Python 3.11+3.12, install
+requirements, `pytest -q`. Обязательные Settings-поля заданы dummy-env
+(в CI нет .env; ns_api_secret=base64 QQ==). Локально проверено: с этими
+env и без .env тесты собираются и проходят. Финальный зелёный прогон
+Actions подтвердится после первого push в GitHub.
 
 Сейчас тесты гоняются только вручную. Добавить `.github/workflows/ci.yml`:
 python 3.11 + 3.12, `pip install -r requirements.txt`, `pytest -q`.
