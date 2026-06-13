@@ -48,6 +48,7 @@ async def db_session_factory(monkeypatch):
 
     # processor.session_factory() возвращает фабрику; подменяем модульно
     monkeypatch.setattr("src.orders.processor.session_factory", lambda: factory)
+    monkeypatch.setattr("src.orders.stages.resolve.session_factory", lambda: factory)
 
     # Чистим in-memory locks между тестами
     proc._order_locks.clear()
