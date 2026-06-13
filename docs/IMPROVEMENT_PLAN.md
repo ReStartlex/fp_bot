@@ -526,7 +526,7 @@ FunPayAPI-резерв: admin_http исчерпал 3 попытки с «Обн
 Резерв FunPayAPI в send_message трогать НЕ будем, пока admin_http не
 подтвердит primary-доставку на проде (acceptance этапа 2 P1-2).
 
-### zombie_reaper долбил удалённый лот (id=49 / 69932320, `<pending>`)
+### zombie_reaper долбил удалённый лот (id=49 / 69932320, `253bbad`)
 
 Всплыло при backfill node_id (B1): удалённый вручную FunPay-лот
 69932320 (disabled mapping id=49, last_synced_active=0) бесконечно
