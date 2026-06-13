@@ -352,7 +352,7 @@ ambiguous_matches, r429, exhausted, deactivations) и показывать в
 
 **Приёмка.** `/status` показывает счётчики за сегодня/вчера.
 
-### [x] P2-6. Rate-limit на вход site-API — DONE (`<pending>`)
+### [x] P2-6. Rate-limit на вход site-API — DONE (`c8836b3`)
 
 Сделано: `src/api/ratelimit.py` — InMemoryRateLimiter (скользящее окно
 per-key `path:ip`, IP из X-Forwarded-For), dependency `auth_rate_limit`
