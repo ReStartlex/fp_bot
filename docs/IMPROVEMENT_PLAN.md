@@ -255,7 +255,7 @@ _emergency_disable_lot). `processor.py` остаётся оркестратор�
 - [x] Инкр. 3 (`14a9857`): `stages/delivery.py` (`_should_hold_delivery`/
   `_deliver_pins`). 1029→764. get_usd_rub_rate переехал в delivery
   (патч-таргет в 12 тест-местах обновлён) + патч `delivery.session_factory`.
-- [x] Инкр. 4 (`<pending>`): `stages/purchase.py` — `run_purchase` (NS
+- [x] Инкр. 4 (`da4cfbf`): `stages/purchase.py` — `run_purchase` (NS
   create→pay→wait→pins) + хелперы `_build_ns_fields`/`_is_valid_uuid4`/
   `_ns_check_existing_order`. 764→460. Найден ЧИСТЫЙ шов: `_is_hard_timeout`
   (патчится тестами) используется только в pre-purchase и post-pins —
