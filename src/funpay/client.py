@@ -952,84 +952,78 @@ class FunPayClient:
         """
         Отправить сообщение в чат с покупателем.
 
-        ВАЖНОЕ ОТКРЫТИЕ:
-            FunPayAPI.Account.send_message выполняет POST /runner/
-            (сообщение реально доставлено FunPay), а ПОТОМ парсит
-            HTML ответа: parser.find("div.message-text").text.
-            Когда FunPay меняет вёрстку, parser.find возвращает None,
-            и FunPayAPI бросает AttributeError "'NoneType' object has
-            no attribute 'text'" — НО САМО СООБЩЕНИЕ УЖЕ ДОСТАВЛЕНО.
+        P1-2 этап 1 (выпил FunPayAPI): ОСНОВНОЙ путь — прямой POST /runner/
+        через admin_http.send_chat_message. У него нет хрупкого парсинга
+        HTML ответа, который ронял FunPayAPI с AttributeError
+        "'NoneType' object has no attribute 'text'", и он закалён
+        csrf-refresh (инцидент JK6JW57J). FunPayAPI оставлен РЕЗЕРВОМ на
+        пару деплой-циклов — снимем отдельным этапом, когда подтвердим,
+        что admin_http стабилен на проде ≥3 дней.
 
-        Поэтому стратегия:
-        1. FunPayAPI.send_message. Если успешно — OK.
-        2. Если AttributeError "NoneType ... text" — это известный
-           glitch FunPayAPI после успешной отправки. Считаем
-           сообщение доставленным, никаких fallback'ов (иначе
-           отправим дубль).
-        3. Любая ДРУГАЯ ошибка — пробуем admin_http fallback.
-
-        Все исходы логируются.
+        Дубликат vs пропуск: для доставки ПРОПУСК страшнее дубля (покупатель
+        не получит товар). Поэтому при неуспехе основного пути пробуем
+        резерв, осознанно принимая риск повторного сообщения. При провале
+        ОБОИХ путей — RuntimeError (вызывающий код не должен счесть это
+        доставкой и пометить заказ delivered, аудит #2).
         """
         text_preview = text[:80].replace("\n", "\\n")
+
+        # 1. Основной путь — admin_http (прямой POST, без HTML-парсинга).
+        admin_exc: Exception | None = None
+        try:
+            result = await self._admin.send_chat_message(chat_id, text)
+            if result.get("ok"):
+                logger.info(
+                    f"FunPay send_message OK [via admin_http]: "
+                    f"chat={chat_id}, text={text_preview!r}"
+                )
+                return result
+            logger.warning(
+                f"FunPay send_message: admin_http вернул ok=False "
+                f"(result={result}). Пробую резерв FunPayAPI…"
+            )
+        except Exception as exc:
+            admin_exc = exc
+            logger.warning(
+                f"FunPay send_message via admin_http упал "
+                f"({type(exc).__name__}: {exc}). Пробую резерв FunPayAPI…"
+            )
+
+        # 2. Резерв — FunPayAPI. Известный glitch: POST доставлен, но парсер
+        # HTML-ответа падает AttributeError 'NoneType'...text — сообщение
+        # УЖЕ ушло, считаем успехом (без повторов).
+        fallback_exc: Exception
         try:
             result = await self._to_thread(
                 self.account.send_message, chat_id, text
             )
             logger.info(
-                f"FunPay send_message OK [via FunPayAPI]: "
+                f"FunPay send_message OK [via FunPayAPI fallback]: "
                 f"chat={chat_id}, text={text_preview!r}"
             )
             return result
         except AttributeError as exc:
-            # Известный glitch FunPayAPI: сообщение ОТПРАВЛЕНО, но парсер
-            # ответа упал. Не делаем fallback — иначе будет дубль.
             err_str = str(exc).lower()
             if "nonetype" in err_str and "text" in err_str:
                 logger.info(
-                    f"FunPay send_message OK [via FunPayAPI, response "
-                    f"parser glitch ignored]: chat={chat_id}, "
+                    f"FunPay send_message OK [via FunPayAPI fallback, "
+                    f"response parser glitch ignored]: chat={chat_id}, "
                     f"text={text_preview!r}"
                 )
                 return {"ok": True, "via": "funpayapi_with_parser_glitch"}
-            # Другой AttributeError — действительно ошибка, fallback'имся
-            logger.warning(
-                f"FunPay send_message via FunPayAPI упал "
-                f"({type(exc).__name__}: {exc}). "
-                f"Пробую через admin_http fallback…"
-            )
+            fallback_exc = exc
         except Exception as exc:
-            logger.warning(
-                f"FunPay send_message via FunPayAPI упал "
-                f"({type(exc).__name__}: {exc}). "
-                f"Пробую через admin_http fallback…"
-            )
+            fallback_exc = exc
 
-        # Fallback: прямой HTTP POST через admin_http
-        try:
-            result = await self._admin.send_chat_message(chat_id, text)
-        except Exception as exc:
-            logger.opt(exception=exc).error(
-                f"FunPay send_message: и FunPayAPI, и admin_http упали. "
-                f"chat={chat_id}, text={text_preview!r}, err={exc}"
-            )
-            raise
-
-        if result.get("ok"):
-            logger.info(
-                f"FunPay send_message OK [via admin_http fallback]: "
-                f"chat={chat_id}, text={text_preview!r}"
-            )
-            return result
-
-        # Аудит #2: admin_http вернул {"ok": False} — сообщение НЕ доставлено.
-        # Бросаем RuntimeError, чтобы вызывающий код (processor, chat handler)
-        # НЕ счёл это успехом и не пометил заказ как delivered.
-        logger.error(
-            f"FunPay send_message FAIL даже через fallback: "
-            f"chat={chat_id}, result={result}"
+        # 3. Оба пути не смогли доставить — это НЕ успех.
+        logger.opt(exception=fallback_exc).error(
+            f"FunPay send_message FAIL: и admin_http, и FunPayAPI упали. "
+            f"chat={chat_id}, text={text_preview!r}, "
+            f"admin_err={admin_exc!r}"
         )
         raise RuntimeError(
-            f"FunPay send_message failed via admin_http fallback: {result}"
+            f"FunPay send_message failed (admin_http + FunPayAPI): "
+            f"admin_err={admin_exc!r}, funpayapi_err={fallback_exc!r}"
         )
 
     # ----- Диагностика -----

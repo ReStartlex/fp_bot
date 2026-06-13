@@ -202,7 +202,7 @@ _emergency_disable_lot). `processor.py` остаётся оркестратор�
 
 ---
 
-### [ ] P1-2. Выпилить библиотеку FunPayAPI
+### [~] P1-2. Выпилить библиотеку FunPayAPI — ЭТАП 2 DONE (`<pending>`)
 
 **Проблема.** От FunPayAPI осталось: `get_sells` (snapshot/recent sales),
 `send_message` (с fallback на admin_http), `get_user/get_lots`, и ради неё —
@@ -217,6 +217,19 @@ _emergency_disable_lot). `processor.py` остаётся оркестратор�
 основным путём; (3) `get_my_lots` → `list_node_offers` по нодам; (4) удалить
 monkeypatch и зависимость, поднять requests/urllib3.
 Каждый этап — отдельный коммит с фикстурными тестами (см. P0-2).
+
+**Прогресс:**
+- [x] Этап 2 (`<pending>`): `send_message` развёрнут — ОСНОВНОЙ путь теперь
+  `admin_http.send_chat_message` (прямой POST, без хрупкого HTML-парсинга
+  ответа; закалён csrf-refresh). FunPayAPI оставлен РЕЗЕРВОМ на пару
+  деплой-циклов (пропуск доставки страшнее дубля); снимется отдельным
+  под-этапом после ≥3 дней без регрессий. Тесты
+  `test_send_message_fallback.py` переписаны под admin_http-primary (8).
+  1115 зелёных.
+- [ ] Под-этап 2b: убрать FunPayAPI-резерв из `send_message` совсем.
+- [ ] Этап 1: `get_sells` → парсер `/orders/trade` в admin_http.
+- [ ] Этап 3: `get_my_lots` → `list_node_offers` по нодам.
+- [ ] Этап 4: удалить monkeypatch + зависимость, поднять requests/urllib3.
 
 **Приёмка.** `pip show FunPayAPI` отсутствует; monkeypatch удалён;
 заказы/чат/санк работают на проде ≥ 3 дней без регрессий.

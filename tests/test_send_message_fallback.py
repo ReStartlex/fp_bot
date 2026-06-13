@@ -1,14 +1,14 @@
 """
-Тест: если FunPayAPI.Account.send_message бросает исключение,
-FunPayClient.send_message должен автоматически перейти на
-admin_http.send_chat_message fallback.
+Контракт FunPayClient.send_message.
 
-Это критический контракт: без него «бот молчит» при любой ошибке
-библиотеки.
+P1-2 этап 1 (выпил FunPayAPI): ОСНОВНОЙ путь — admin_http.send_chat_message
+(прямой POST /runner/, без хрупкого парсинга HTML-ответа). FunPayAPI —
+РЕЗЕРВ. При неуспехе основного пути пробуем резерв (для доставки пропуск
+страшнее дубля); при провале обоих — RuntimeError (вызывающий код не
+должен счесть это доставкой, аудит #2).
 """
 from __future__ import annotations
 
-import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -28,154 +28,139 @@ def _make_settings():
     )
 
 
-@pytest.mark.asyncio
-async def test_send_message_uses_funpayapi_first_when_works():
+def _client(admin_result=None, admin_exc=None, account_mock=None) -> FunPayClient:
+    """FunPayClient с подменёнными admin_http и FunPayAPI.account."""
     fp = FunPayClient(_make_settings())
-    mock_account = MagicMock()
-    mock_account.send_message = MagicMock(return_value={"ok": True})
-    fp._account = mock_account
-
-    result = await fp.send_message(123, "test")
-    mock_account.send_message.assert_called_once_with(123, "test")
-    assert result == {"ok": True}
-
-
-@pytest.mark.asyncio
-async def test_send_message_falls_back_to_admin_http_on_funpayapi_exception():
-    fp = FunPayClient(_make_settings())
-
-    def _raise(*args, **kwargs):
-        raise json.JSONDecodeError("Expecting value", "doc", 0)
-
-    mock_account = MagicMock()
-    mock_account.send_message = MagicMock(side_effect=_raise)
-    fp._account = mock_account
 
     fake_admin = MagicMock()
-    fake_admin.send_chat_message = AsyncMock(return_value={"ok": True, "http_status": 200})
+    if admin_exc is not None:
+        fake_admin.send_chat_message = AsyncMock(side_effect=admin_exc)
+    else:
+        fake_admin.send_chat_message = AsyncMock(return_value=admin_result)
     fp._admin_client_cache = fake_admin
 
+    fp._account = account_mock if account_mock is not None else MagicMock()
+    return fp
+
+
+@pytest.mark.asyncio
+async def test_send_message_uses_admin_http_first_when_works():
+    """admin_http отдал ok=True → возвращаем его, FunPayAPI НЕ трогаем."""
+    account = MagicMock()
+    account.send_message = MagicMock(return_value={"ok": True, "via": "funpayapi"})
+    fp = _client(admin_result={"ok": True, "http_status": 200}, account_mock=account)
+
+    result = await fp.send_message(123, "test")
+
+    fp._admin.send_chat_message.assert_awaited_once_with(123, "test")
+    account.send_message.assert_not_called()
+    assert result["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_send_message_falls_back_to_funpayapi_on_admin_exception():
+    """admin_http бросил исключение → пробуем резерв FunPayAPI."""
+    account = MagicMock()
+    account.send_message = MagicMock(return_value={"ok": True})
+    fp = _client(admin_exc=RuntimeError("admin down"), account_mock=account)
+
     result = await fp.send_message(777, "fallback please")
-    fake_admin.send_chat_message.assert_awaited_once_with(777, "fallback please")
+
+    fp._admin.send_chat_message.assert_awaited_once()
+    account.send_message.assert_called_once_with(777, "fallback please")
+    assert result["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_send_message_falls_back_to_funpayapi_on_admin_ok_false():
+    """admin_http вернул ok=False (не доставлено) → резерв FunPayAPI."""
+    account = MagicMock()
+    account.send_message = MagicMock(return_value={"ok": True})
+    fp = _client(
+        admin_result={"ok": False, "http_status": 400, "funpay_error": "x"},
+        account_mock=account,
+    )
+
+    result = await fp.send_message(42, "via fallback")
+
+    account.send_message.assert_called_once_with(42, "via fallback")
     assert result["ok"] is True
 
 
 @pytest.mark.asyncio
 async def test_send_message_treats_funpayapi_parser_glitch_as_success():
     """
-    Известный bug FunPayAPI: POST /runner/ доставлен (сообщение отправлено),
-    а потом библиотека парсит HTML ответа: parser.find("div.message-text").text
-    → AttributeError 'NoneType' object has no attribute 'text'.
+    Известный glitch FunPayAPI: POST /runner/ доставлен (сообщение ушло),
+    а потом библиотека парсит HTML ответа: parser.find(...).text →
+    AttributeError 'NoneType' object has no attribute 'text'.
 
-    Сообщение УЖЕ доставлено. Делать fallback (повторно отправлять)
-    нельзя, иначе FunPay вернёт «Обновите страницу» на дубль.
+    Сообщение УЖЕ доставлено резервом → считаем успехом, без повторов.
     """
-    fp = FunPayClient(_make_settings())
-
-    def _glitch(*args, **kwargs):
-        raise AttributeError("'NoneType' object has no attribute 'text'")
-
-    mock_account = MagicMock()
-    mock_account.send_message = MagicMock(side_effect=_glitch)
-    fp._account = mock_account
-
-    fake_admin = MagicMock()
-    fake_admin.send_chat_message = AsyncMock(return_value={"ok": True})
-    fp._admin_client_cache = fake_admin
+    account = MagicMock()
+    account.send_message = MagicMock(
+        side_effect=AttributeError("'NoneType' object has no attribute 'text'")
+    )
+    # admin_http не смог → ушли в резерв, где словили glitch
+    fp = _client(admin_exc=RuntimeError("admin down"), account_mock=account)
 
     result = await fp.send_message(42, "Привет!")
 
-    # Главное: fallback НЕ вызван (иначе будет дубль).
-    fake_admin.send_chat_message.assert_not_called()
     assert isinstance(result, dict)
     assert result.get("ok") is True
+    assert result.get("via") == "funpayapi_with_parser_glitch"
 
 
 @pytest.mark.asyncio
-async def test_send_message_falls_back_on_other_attribute_error():
-    """Прочие AttributeError (не glitch parser'а) → fallback всё-таки нужен."""
-    fp = FunPayClient(_make_settings())
+async def test_send_message_other_attribute_error_after_admin_fail_raises():
+    """Прочий AttributeError резерва (не glitch) + упавший admin → RuntimeError."""
+    account = MagicMock()
+    account.send_message = MagicMock(
+        side_effect=AttributeError("'FunPayClient' object has no attribute 'foo'")
+    )
+    fp = _client(admin_exc=RuntimeError("admin down"), account_mock=account)
 
-    def _other_attr_err(*args, **kwargs):
-        raise AttributeError("'FunPayClient' object has no attribute 'foo'")
-
-    mock_account = MagicMock()
-    mock_account.send_message = MagicMock(side_effect=_other_attr_err)
-    fp._account = mock_account
-
-    fake_admin = MagicMock()
-    fake_admin.send_chat_message = AsyncMock(return_value={"ok": True})
-    fp._admin_client_cache = fake_admin
-
-    result = await fp.send_message(42, "test")
-    fake_admin.send_chat_message.assert_awaited_once()
-    assert result["ok"] is True
+    with pytest.raises(RuntimeError, match="admin_http \\+ FunPayAPI"):
+        await fp.send_message(42, "test")
 
 
 @pytest.mark.asyncio
 async def test_send_message_raises_when_both_paths_fail():
-    fp = FunPayClient(_make_settings())
+    """admin бросил И FunPayAPI бросил → RuntimeError (не доставлено)."""
+    account = MagicMock()
+    account.send_message = MagicMock(side_effect=RuntimeError("FunPayAPI broken"))
+    fp = _client(admin_exc=RuntimeError("admin broken"), account_mock=account)
 
-    mock_account = MagicMock()
-    mock_account.send_message = MagicMock(side_effect=RuntimeError("FunPayAPI broken"))
-    fp._account = mock_account
-
-    fake_admin = MagicMock()
-    fake_admin.send_chat_message = AsyncMock(side_effect=RuntimeError("admin broken too"))
-    fp._admin_client_cache = fake_admin
-
-    with pytest.raises(RuntimeError, match="admin broken too"):
+    with pytest.raises(RuntimeError, match="admin_http \\+ FunPayAPI"):
         await fp.send_message(1, "x")
 
 
 @pytest.mark.asyncio
-async def test_send_message_raises_when_admin_http_returns_ok_false():
+async def test_send_message_admin_ok_false_and_funpayapi_fail_raises():
     """
-    Регрессия (аудит #2): admin_http fallback может вернуть {"ok": False}
-    БЕЗ исключения (например HTTP 200 с ошибкой в теле или сетевой timeout
-    обработанный внутри admin_http). Раньше processor.py трактовал такой
-    return как успех и помечал заказ delivered, хотя сообщение НЕ дошло.
-
-    Контракт: при ok=False fallback должен бросать RuntimeError, чтобы
-    вызывающий код (processor, chat handler) видел это как обычное
-    исключение и НЕ ставил delivered.
+    Регрессия (аудит #2): если ОБА пути не доставили — должно быть
+    исключение, чтобы processor НЕ пометил заказ delivered.
+    admin ok=False + FunPayAPI бросает → RuntimeError.
     """
-    fp = FunPayClient(_make_settings())
-
-    mock_account = MagicMock()
-    mock_account.send_message = MagicMock(
-        side_effect=RuntimeError("primary path broken")
+    account = MagicMock()
+    account.send_message = MagicMock(side_effect=RuntimeError("funpayapi died too"))
+    fp = _client(
+        admin_result={"ok": False, "http_status": 500, "funpay_error": "server died"},
+        account_mock=account,
     )
-    fp._account = mock_account
 
-    fake_admin = MagicMock()
-    fake_admin.send_chat_message = AsyncMock(
-        return_value={"ok": False, "http_status": 500, "error": "server died"}
-    )
-    fp._admin_client_cache = fake_admin
-
-    with pytest.raises(RuntimeError, match="admin_http"):
+    with pytest.raises(RuntimeError, match="admin_http \\+ FunPayAPI"):
         await fp.send_message(123, "should not be considered delivered")
 
-    fake_admin.send_chat_message.assert_awaited_once()
+    account.send_message.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_send_message_returns_ok_true_from_admin_http_fallback():
-    """Граница: ok=True от fallback — всё штатно, exception НЕ поднимаем."""
-    fp = FunPayClient(_make_settings())
-
-    mock_account = MagicMock()
-    mock_account.send_message = MagicMock(
-        side_effect=RuntimeError("primary path broken")
-    )
-    fp._account = mock_account
-
-    fake_admin = MagicMock()
-    fake_admin.send_chat_message = AsyncMock(
-        return_value={"ok": True, "http_status": 200}
-    )
-    fp._admin_client_cache = fake_admin
+async def test_send_message_returns_ok_true_from_admin_http():
+    """Граница: ok=True от admin_http — штатно, резерв не трогаем."""
+    account = MagicMock()
+    account.send_message = MagicMock(return_value={"ok": True})
+    fp = _client(admin_result={"ok": True, "http_status": 200}, account_mock=account)
 
     result = await fp.send_message(123, "delivered ok")
     assert isinstance(result, dict) and result.get("ok") is True
+    account.send_message.assert_not_called()
