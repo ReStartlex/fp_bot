@@ -22,14 +22,38 @@ per-lot сдвиг 0..jitter в `_is_cache_hit` растягивает пере�
 instances»). Тесты `tests/test_sync_diff_cache_jitter.py` (7). Это снимает
 burst-симптом; вместе с quick-fix .env закрывает прод-боль.
 
-**Фаза B (TODO, нужен прод-HTML):** полноценный snapshot-sync по нодам
-(1 GET `/lots/{node}/trade` на ноду вместо N offerEdit). Блокер: парсинг
-ЦЕНЫ из строки trade-страницы — нужна реальная вёрстка. Запросить у юзера
-`./.venv/bin/python -m src.tools.funpay_node_offers <node> --raw-out
-/root/trade.html`, по ней доработать `list_node_offers` (добавить price),
-затем переписать цикл sync_once с группировкой по `Mapping.funpay_node_id`
-(добавить колонку + ALTER + fill из migrate/runner) и fallback на per-lot.
-Оригинальное ТЗ ниже сохранено.
+**Фаза B (в работе, поэтапно):** полноценный snapshot-sync по нодам
+(1 GET `/lots/{node}/trade` на ноду вместо N offerEdit). Прод-данные
+подтвердили актуальность: daily_stats 2026-06-13 r429=8, 429 идут весь
+день (не только вечерний пик), источник — offerEdit, иногда offerSave и
+ОПАСНО chat/?node (бьёт по delivery).
+
+Под-этапы:
+- [x] **B1 — фундамент (`<pending>`):** колонка `Mapping.funpay_node_id`
+  (nullable) + ALTER в `init_db` + параметр в `upsert_mapping`
+  (None=не трогать, чтобы обычный upsert не затирал backfill).
+  migrate/runner пишет node при создании. Backfill старых:
+  `src/tools/backfill_node_ids.py` (GET lot_fields→node_id, throttle
+  `--delay`, dry-run по умолчанию). Хелперы `set_mapping_node_id`,
+  `list_mappings_missing_node_id`. Тесты `tests/test_node_id_backfill.py`
+  (4). Поведение sync НЕ изменено. 1126 зелёных.
+  **Деплой-чеклист B1:** после деплоя прогнать
+  `python -m src.tools.backfill_node_ids --apply` на VPS (заполнит node
+  для существующих ~110 лотов) — нужно ДО включения B3.
+- [ ] **B2 — парсер (нужен прод-HTML):** научить `list_node_offers`
+  возвращать ещё `price` и НАДЁЖНЫЙ `active` (сейчас active —
+  CSS-эвристика, для решений о деактивации недостаточно). Снять реальную
+  вёрстку: `python -m src.tools.funpay_node_offers <node> --raw-out
+  /root/trade.html` → фикстура + contract-тест (по образцу P0-2).
+- [ ] **B3 — новый цикл + детектор деградации:** sync_once группирует по
+  node, 1 snapshot-GET на ноду, offerEdit+save_lot ТОЛЬКО для
+  изменившихся; маппинги без node → fallback per-lot. ДЕТЕКТОР: отличать
+  «мы долбим offerEdit» (структурно лечит snapshot) от «FunPay лежит»
+  (snapshot-GET сам 429-ит / устойчивые 429 по всем эндпоинтам) →
+  глобальный backoff, который НЕ мешает chat/delivery и не добивает
+  FunPay. Стратегия стока (snapshot не видит сток): редкий полный проход
+  раз в N циклов + GET только лотов с продажами (invalidate-hook).
+  Оригинальное ТЗ ниже сохранено.
 
 #### Оригинальное ТЗ P0-1 (для фазы B)
 

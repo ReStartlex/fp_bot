@@ -195,6 +195,9 @@ async def run_category(
                     ns_fields_template=NS_QUANTITY_TEMPLATE,
                     enabled=bool(activate),
                     label=_mapping_label(entry, svc),
+                    # P0-1 Фаза B: node известен при создании — пишем сразу,
+                    # чтобы snapshot-sync не пришлось backfill'ить новые лоты.
+                    funpay_node_id=entry.funpay_node,
                 )
                 # KnownLot с заголовком = подставленный summary_ru: даёт
                 # matcher'у сильный сигнал title с первого же заказа без

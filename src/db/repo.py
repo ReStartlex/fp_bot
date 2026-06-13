@@ -58,6 +58,7 @@ async def upsert_mapping(
     enabled: bool = True,
     label: str | None = None,
     group_id: int | None = None,
+    funpay_node_id: int | None = None,
 ) -> Mapping:
     existing = await session.execute(
         select(Mapping).where(Mapping.funpay_lot_id == funpay_lot_id)
@@ -74,8 +75,39 @@ async def upsert_mapping(
     obj.label = label
     if group_id is not None:
         obj.group_id = group_id
+    # node_id обновляем только когда передан (None = «не трогать»), чтобы
+    # backfill из get_lot_fields не затирался последующим upsert без node.
+    if funpay_node_id is not None:
+        obj.funpay_node_id = funpay_node_id
     await session.flush()
     return obj
+
+
+async def set_mapping_node_id(
+    session: AsyncSession, *, funpay_lot_id: int, funpay_node_id: int
+) -> bool:
+    """
+    Заполнить Mapping.funpay_node_id для лота (P0-1 Фаза B backfill).
+    Возвращает True, если строка обновлена. Идемпотентно перезаписывает.
+    """
+    res = await session.execute(
+        sa_update(Mapping)
+        .where(Mapping.funpay_lot_id == funpay_lot_id)
+        .values(funpay_node_id=int(funpay_node_id))
+    )
+    return bool(res.rowcount)
+
+
+async def list_mappings_missing_node_id(
+    session: AsyncSession,
+) -> list[Mapping]:
+    """Маппинги без funpay_node_id (кандидаты на backfill)."""
+    res = await session.execute(
+        select(Mapping)
+        .where(Mapping.funpay_node_id.is_(None))
+        .order_by(Mapping.funpay_lot_id)
+    )
+    return list(res.scalars().all())
 
 
 async def upsert_known_lot(

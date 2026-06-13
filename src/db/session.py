@@ -170,6 +170,9 @@ def _migrate_sqlite_schema(sync_conn) -> None:
         if "group_id" not in columns:
             sync_conn.execute(text("ALTER TABLE mappings ADD COLUMN group_id INTEGER"))
             logger.info("init_db: добавлена колонка mappings.group_id")
+        if "funpay_node_id" not in columns:
+            sync_conn.execute(text("ALTER TABLE mappings ADD COLUMN funpay_node_id INTEGER"))
+            logger.info("init_db: добавлена колонка mappings.funpay_node_id")
         # Diff-based sync cache (см. Mapping модель в models.py)
         if "last_synced_price" not in columns:
             sync_conn.execute(text("ALTER TABLE mappings ADD COLUMN last_synced_price FLOAT"))

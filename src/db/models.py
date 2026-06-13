@@ -44,6 +44,13 @@ class Mapping(Base):
     stock_cap: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     group_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
+    # FunPay node_id (раздел/subcategory лота). Нужен для P0-1 Фазы B
+    # (snapshot-sync по нодам: 1 GET /lots/{node}/trade на ноду вместо N
+    # offerEdit). NULL = ещё не известен → fallback на старый per-lot путь.
+    # Заполняется: migrate/runner при создании; backfill-скрипт для старых
+    # (из get_lot_fields(...).node_id).
+    funpay_node_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     # Шаблон fields для NS create_order. JSON-строка.
     # Например: '{"quantity": "@QUANTITY"}'. @QUANTITY = количество из FunPay-заказа.
     ns_fields_template: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
