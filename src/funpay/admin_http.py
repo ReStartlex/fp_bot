@@ -187,6 +187,28 @@ _LOGIN_REDIRECT_MARKERS = (
     "id=\"auth-form\"",
 )
 
+# Маркеры «протух CSRF-токен» в ответе FunPay на AJAX/форму. FunPay
+# отвечает {"msg":"Обновите страницу и повторите попытку.","error":1}
+# когда csrf_token не совпадает с сессией. Кэшированный токен мог
+# протухнуть (FunPay ротирует его в течение жизни процесса) — ретрай с
+# тем же токеном бесполезен, надо ПЕРЕвыпустить csrf. Инцидент: заказ
+# JK6JW57J — send_message исчерпал ретраи на одном мёртвом токене.
+_CSRF_STALE_MARKERS = (
+    "обновите страницу",
+    "повторите попытку",
+)
+
+
+def _looks_like_stale_csrf(*parts: str | None) -> bool:
+    """True, если в любом из текстов есть маркер протухшего CSRF."""
+    for part in parts:
+        if not part:
+            continue
+        low = part.lower()
+        if any(m in low for m in _CSRF_STALE_MARKERS):
+            return True
+    return False
+
 
 def classify_offersave_response(
     *,
@@ -668,6 +690,14 @@ class FunPayAdminClient:
             "login_marker": login_marker,
         }
 
+    def _invalidate_csrf(self) -> None:
+        """
+        Сбросить кэш CSRF-токена, чтобы следующий _ensure_csrf() перевыпустил
+        его с живой страницы. Вызывается, когда FunPay ответил «Обновите
+        страницу» — признак, что закэшированный токен протух.
+        """
+        self._csrf_token = None
+
     async def _ensure_csrf(self) -> str | None:
         """
         Возвращает CSRF-токен. Ищет в нескольких источниках:
@@ -809,6 +839,18 @@ class FunPayAdminClient:
                 result["ok"] = r.ok and not error
                 if error:
                     result["funpay_error"] = error
+                # Протух CSRF («Обновите страницу и повторите попытку») —
+                # ретрай с тем же токеном бесполезен. Сбрасываем кэш, чтобы
+                # следующая попытка перевыпустила csrf (инцидент JK6JW57J).
+                if not result["ok"] and _looks_like_stale_csrf(
+                    j.get("msg"), r.text
+                ):
+                    logger.warning(
+                        f"send_chat_message: FunPay просит обновить страницу "
+                        f"(протух CSRF), перевыпускаю токен "
+                        f"(attempt {attempt + 1}/{retries + 1})"
+                    )
+                    self._invalidate_csrf()
                 # На 429 / временную ошибку FunPay часто отвечает 200 + error
                 if not result["ok"] and attempt < retries:
                     await asyncio.sleep(0.5 * (2 ** attempt))
@@ -819,6 +861,12 @@ class FunPayAdminClient:
             result["ok"] = bool(r.ok)
             if not r.ok:
                 result["funpay_error"] = f"HTTP {r.status_code}"
+                if _looks_like_stale_csrf(r.text):
+                    logger.warning(
+                        "send_chat_message: ответ «обновите страницу» "
+                        "(протух CSRF), перевыпускаю токен"
+                    )
+                    self._invalidate_csrf()
                 if attempt < retries:
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     last_result = result
