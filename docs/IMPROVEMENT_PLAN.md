@@ -40,11 +40,18 @@ burst-симптом; вместе с quick-fix .env закрывает прод
   **Деплой-чеклист B1:** после деплоя прогнать
   `python -m src.tools.backfill_node_ids --apply` на VPS (заполнит node
   для существующих ~110 лотов) — нужно ДО включения B3.
-- [ ] **B2 — парсер (нужен прод-HTML):** научить `list_node_offers`
-  возвращать ещё `price` и НАДЁЖНЫЙ `active` (сейчас active —
-  CSS-эвристика, для решений о деактивации недостаточно). Снять реальную
-  вёрстку: `python -m src.tools.funpay_node_offers <node> --raw-out
-  /root/trade.html` → фикстура + contract-тест (по образцу P0-2).
+- [x] **B2 — парсер (`<pending>`):** `list_node_offers` теперь возвращает
+  `price` (float, из `tc-price[data-s]`, бывает дробной 439.04) и `amount`
+  (int, `tc-amount`) — этого хватает для snapshot-сравнения с target.
+  Реальная вёрстка прода зафиксирована фикстурами
+  `tests/fixtures/funpay/trade_node_{apple_1316,steam_1086}.html` +
+  contract-тест `tests/test_list_node_offers_parse.py` (4). 1134 зелёных.
+  **ВАЖНО про active:** в наблюдаемой вёрстке trade-страница перечисляет
+  ТОЛЬКО активные офферы (ни одного inactive-маркера). Значит для B3:
+  присутствие в snapshot = активен; отсутствие = неактивен/снят.
+  Решения о ДЕАКТИВАЦИИ на snapshot НЕ опираются — B3 верифицирует
+  деактивацию отдельным per-lot GET (их мало). Если у ноды появятся
+  снятые лоты с иным маркером — добрать фикстуру.
 - [ ] **B3 — новый цикл + детектор деградации:** sync_once группирует по
   node, 1 snapshot-GET на ноду, offerEdit+save_lot ТОЛЬКО для
   изменившихся; маппинги без node → fallback per-lot. ДЕТЕКТОР: отличать

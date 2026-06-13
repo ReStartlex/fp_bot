@@ -210,6 +210,61 @@ def _looks_like_stale_csrf(*parts: str | None) -> bool:
     return False
 
 
+def _first_int(text: str | None) -> int | None:
+    """Первое целое из строки (для tc-amount/tc-price text). None если нет."""
+    if not text:
+        return None
+    m = re.search(r"\d[\d\s]*", text)
+    if not m:
+        return None
+    digits = re.sub(r"\s", "", m.group(0))
+    return int(digits) if digits else None
+
+
+def _first_float(text: str | None) -> float | None:
+    """Первое число (с дробной частью) из строки. None если нет."""
+    if not text:
+        return None
+    m = re.search(r"\d[\d\s]*(?:[.,]\d+)?", text)
+    if not m:
+        return None
+    raw = re.sub(r"\s", "", m.group(0)).replace(",", ".")
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _parse_offer_price(el: Any) -> float | None:
+    """
+    Цена оффера из строки trade-страницы (P0-1 Фаза B).
+    Источники по надёжности: tc-price[data-s] → текст внутри .tc-price.
+    Число (float) в валюте аккаунта (₽): бывает дробной (data-s="439.04").
+    None — если не нашли.
+    """
+    if not hasattr(el, "select_one"):
+        return None
+    price_el = el.select_one(".tc-price")
+    if price_el is None:
+        return None
+    data_s = price_el.get("data-s")
+    if data_s is not None:
+        val = _first_float(str(data_s))
+        if val is not None:
+            return val
+    return _first_float(price_el.get_text(" ", strip=True))
+
+
+def _parse_offer_amount(el: Any) -> int | None:
+    """Сток оффера из `.tc-amount` строки trade-страницы. None — если нет."""
+    if not hasattr(el, "select_one"):
+        return None
+    amt_el = el.select_one(".tc-amount")
+    if amt_el is None:
+        return None
+    return _first_int(amt_el.get_text(" ", strip=True))
+
+
 def classify_offersave_response(
     *,
     status_code: int,
@@ -920,12 +975,26 @@ class FunPayAdminClient:
         Страница управления `/lots/{node}/trade` показывает все свои
         офферы раздела (и активные, и снятые) со ссылками offerEdit.
 
-        Возвращает list[dict]: {offer_id (int), title (str), active (bool|None)}.
+        Возвращает list[dict]: {offer_id (int), title (str),
+        active (bool|None), price (int|None), amount (int|None)}.
+
+        price/amount (P0-1 Фаза B): нужны для snapshot-sync — сравнить
+        текущее состояние ноды с target БЕЗ per-lot offerEdit GET'ов.
+        Берутся из реальной вёрстки `/lots/{node}/trade` (зафиксирована
+        фикстурами `tests/fixtures/funpay/trade_node_*.html`):
+            * цена — `<div class="tc-price" data-s="3549">` (float в валюте
+              аккаунта ₽, бывает дробной data-s="439.04"; fallback — текст);
+            * сток — `<div class="tc-amount">10</div>`.
+
+        ВАЖНО про active: trade-страница в наблюдаемой вёрстке перечисляет
+        ТОЛЬКО активные офферы (ни одного маркера inactive). Поэтому
+        `active` здесь = «оффер присутствует в листинге» (True); решения о
+        ДЕАКТИВАЦИИ на это НЕ опираются (B3 верифицирует деактивацию
+        отдельным per-lot GET — дешёво, т.к. деактиваций мало).
+
         Парсер защитный: FunPay периодически меняет вёрстку, поэтому
-        offer_id берём из любых ссылок offerEdit?...offer=N, а заголовок/
-        активность — best-effort. Если структура не распозналась —
-        вернётся хотя бы список offer_id (title пустой), и это видно
-        в диагностике.
+        offer_id берём из любых ссылок offerEdit?...offer=N, а title/
+        price/amount — best-effort (None при нераспознании).
         """
         url = f"{self.BASE}/lots/{int(node_id)}/trade"
         r = await asyncio.to_thread(self._sync_get, url)
@@ -984,19 +1053,28 @@ class FunPayAdminClient:
             elif class_text:
                 active = True
 
+            price = _parse_offer_price(el)
+            amount = _parse_offer_amount(el)
+
             prev = offers.get(offer_id)
             if prev is None:
                 offers[offer_id] = {
                     "offer_id": offer_id,
                     "title": title[:200],
                     "active": active,
+                    "price": price,
+                    "amount": amount,
                 }
             else:
-                # дополняем title/active, если в этой строке информации больше
+                # дополняем поля, если в этой строке информации больше
                 if not prev["title"] and title:
                     prev["title"] = title[:200]
                 if prev["active"] is None and active is not None:
                     prev["active"] = active
+                if prev.get("price") is None and price is not None:
+                    prev["price"] = price
+                if prev.get("amount") is None and amount is not None:
+                    prev["amount"] = amount
 
         return sorted(offers.values(), key=lambda o: o["offer_id"])
 
