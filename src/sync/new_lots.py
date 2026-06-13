@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from src.timeutil import utcnow
 from typing import Any
 
 from loguru import logger
@@ -76,7 +77,7 @@ async def discover_new_lots(
 
     seen = 0
     new_lots: list[tuple[int, str | None]] = []
-    now = datetime.utcnow()
+    now = utcnow()
     async with session_factory()() as session:
         existing_ids = {
             r for r in (
@@ -145,7 +146,7 @@ async def discover_new_lots(
                 async with session_factory()() as session:
                     row = await session.get(KnownLot, lid)
                     if row is not None:
-                        row.notified_at = datetime.utcnow()
+                        row.notified_at = utcnow()
                         await session.commit()
             except Exception as exc:
                 logger.warning(f"Не пушнул алерт о новом лоте {lid}: {exc}")

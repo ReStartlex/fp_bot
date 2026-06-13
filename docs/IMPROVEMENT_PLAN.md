@@ -13,7 +13,7 @@ SQLite WAL, systemd (funpay-ns-bot + funpay-ns-api).
 
 ## P0 — масштаб и деньги (делать первыми)
 
-### [~] P0-1. Sync не масштабируется: per-lot GET на каждый цикл — ФАЗА A DONE (`<pending>`)
+### [~] P0-1. Sync не масштабируется: per-lot GET на каждый цикл — ФАЗА A DONE (`90ed865`)
 
 **Фаза A (сделано, безопасно, оффлайн):** джиттер TTL diff-cache
 (`SYNC_STOCK_DIFF_CACHE_JITTER_SECONDS`, default 60) — детерминированный
@@ -211,7 +211,14 @@ monkeypatch и зависимость, поднять requests/urllib3.
 
 ---
 
-### [ ] P1-3. `datetime.utcnow()` → `datetime.now(UTC)` (36 вхождений)
+### [x] P1-3. `datetime.utcnow()` → `datetime.now(UTC)` (36 вхождений) — DONE (`<pending>`)
+
+Сделано: `src/timeutil.utcnow()` возвращает naive-UTC
+(`datetime.now(timezone.utc).replace(tzinfo=None)`) — точная семантика
+старого вызова, без deprecation и без смешивания aware/naive (SQLite
+хранит naive). Заменены все 36 вызовов в 11 файлах. 0 вхождений
+`datetime.utcnow()` (кроме docstring helper'а). 1099 зелёных, все
+модули импортируются.
 
 Deprecated в Python 3.12 (прод на 3.12). Naive-datetime уже почти укусил
 (сравнения в diff-cache). Механическая замена + проверить места сравнения

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
+from src.timeutil import utcnow
 from typing import Any
 
 from loguru import logger
@@ -392,7 +393,7 @@ def _is_cache_hit(
     if last_at is None or last_price is None or last_stock is None or last_active is None:
         return False
 
-    current_time = now or datetime.utcnow()
+    current_time = now or utcnow()
     effective_ttl = ttl_seconds + _lot_ttl_jitter(
         getattr(mapping, "funpay_lot_id", 0), jitter_seconds
     )
@@ -608,7 +609,7 @@ async def sync_once(
         diff_cache_jitter = int(
             getattr(settings, "sync_stock_diff_cache_jitter_seconds", 0)
         )
-        cache_check_now = datetime.utcnow()  # фиксируем "now" для всех проверок цикла
+        cache_check_now = utcnow()  # фиксируем "now" для всех проверок цикла
 
         decisions: list[LotSyncDecision] = []
 

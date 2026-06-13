@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta
+from src.timeutil import utcnow
 from typing import Optional
 
 from loguru import logger
@@ -453,7 +454,7 @@ class ChatHandler:
                 )
                 if (
                     pre_state.last_help_request_at is not None
-                    and (datetime.utcnow() - pre_state.last_help_request_at).total_seconds()
+                    and (utcnow() - pre_state.last_help_request_at).total_seconds()
                     < cooldown_seconds
                 ):
                     await session.commit()
@@ -472,7 +473,7 @@ class ChatHandler:
             active_orders = await list_active_orders_for_chat(
                 session, chat_id=event.chat_id
             )
-        now = datetime.utcnow()
+        now = utcnow()
         has_order_in_grace = any(
             order.status != "manual_hold"
             and grace_seconds > 0

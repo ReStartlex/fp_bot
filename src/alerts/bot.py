@@ -17,6 +17,7 @@ import asyncio
 import html
 import time
 from datetime import datetime, timedelta, timezone
+from src.timeutil import utcnow
 from functools import wraps
 from types import SimpleNamespace
 from typing import Awaitable, Callable
@@ -2200,7 +2201,7 @@ class TelegramBot:
             f"подтвердил (тихо, без системки в чат) — нажми «🔄 Sync с "
             f"FunPay» под последним сообщением. Это вычистит фантомы.\n"
         )
-        now = datetime.utcnow()
+        now = utcnow()
         item_lines = [
             f"• #{o.funpay_order_id} — {o.buyer_username or '—'}, "
             f"выдан {int((now - o.updated_at).total_seconds() // 3600)}ч назад"
@@ -2386,7 +2387,7 @@ class TelegramBot:
 
     async def _render_profit_stats(self) -> str:
         rate = await get_rate_breakdown(self._settings)
-        since = datetime.utcnow() - timedelta(days=7)
+        since = utcnow() - timedelta(days=7)
         async with session_factory()() as session:
             orders = list(
                 (
@@ -4207,7 +4208,7 @@ class TelegramBot:
         cache_fresh = False
         minutes_ago: float | None = None
         if last_at is not None:
-            delta = (datetime.utcnow() - last_at).total_seconds()
+            delta = (utcnow() - last_at).total_seconds()
             minutes_ago = delta / 60.0
             cache_fresh = delta < ttl
             cache_status = (

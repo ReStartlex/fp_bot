@@ -33,6 +33,7 @@ import re
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from src.timeutil import utcnow
 from typing import Optional
 
 from loguru import logger
@@ -406,7 +407,7 @@ def _pins_from_order(order: Order) -> list:
 
 def _order_age_seconds(order: Order, *, now: datetime | None = None) -> float:
     """Сколько секунд прошло от Order.created_at. naive UTC, как и весь проект."""
-    current = now or datetime.utcnow()
+    current = now or utcnow()
     return max(0.0, (current - order.created_at).total_seconds())
 
 
@@ -589,7 +590,7 @@ async def _should_hold_delivery(
         grace_seconds = int(get_settings().chat_help_auto_delivery_grace_seconds)
     if grace_seconds <= 0:
         return True
-    return datetime.utcnow() >= created_at + timedelta(seconds=grace_seconds)
+    return utcnow() >= created_at + timedelta(seconds=grace_seconds)
 
 
 async def process_funpay_order(

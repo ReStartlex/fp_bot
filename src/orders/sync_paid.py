@@ -19,6 +19,7 @@ funpay.com/orders/trade с фильтром state=paid и считать всё,
 from __future__ import annotations
 
 from datetime import datetime
+from src.timeutil import utcnow
 from typing import Any, Awaitable, Callable
 
 from loguru import logger
@@ -81,7 +82,7 @@ async def sync_pending_confirmation(
         result = await session.execute(stmt)
         candidates = list(result.scalars().all())
 
-        now = datetime.utcnow()
+        now = utcnow()
         marked = 0
         # Аудит #7: если snapshot неполный (пагинация обрезана), помечать
         # confirmed НЕЛЬЗЯ — paid_set может не содержать реально оплачённых

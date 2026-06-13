@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+from src.timeutil import utcnow
 from typing import Any
 
 from sqlalchemy import func, select, update as sa_update
@@ -180,7 +181,7 @@ async def update_mapping_last_synced(
             last_synced_price=float(price),
             last_synced_stock=int(stock),
             last_synced_active=bool(active),
-            last_synced_at=datetime.utcnow(),
+            last_synced_at=utcnow(),
         )
     )
 
@@ -266,7 +267,7 @@ async def finish_sync_run(
         loaded = await session.get(SyncRun, run.id)
         if loaded is not None:
             target = loaded
-    target.finished_at = datetime.utcnow()
+    target.finished_at = utcnow()
     target.status = status
     target.lots_checked = lots_checked
     target.lots_updated = lots_updated
@@ -365,7 +366,7 @@ async def mark_order_confirmed(
     # Идемпотентность: если уже подтверждён — не трогаем (сохраняем
     # «первое» подтверждение, оно более точное).
     if order.confirmed_at is None:
-        order.confirmed_at = datetime.utcnow()
+        order.confirmed_at = utcnow()
         order.confirmed_by = confirmed_by
         await session.flush()
         return order, True
@@ -387,7 +388,7 @@ async def list_pending_confirmation(
     Сортируем по `updated_at` от старых к новым — чтобы в выгрузке
     первыми были самые «горящие» (по которым уже точно прошёл срок).
     """
-    cutoff = datetime.utcnow() - timedelta(hours=older_than_hours)
+    cutoff = utcnow() - timedelta(hours=older_than_hours)
     stmt = (
         select(Order)
         .where(Order.status == "delivered")
@@ -433,7 +434,7 @@ async def list_reconcilable_orders(
     limit: int,
 ) -> list[Order]:
     """Заказы, которые можно безопасно повторно прогнать через processor."""
-    cutoff = datetime.utcnow() - timedelta(seconds=stale_after_seconds)
+    cutoff = utcnow() - timedelta(seconds=stale_after_seconds)
     stmt = (
         select(Order)
         # Аудит #5: добавили `received` — crash после create_order в БД,
@@ -479,7 +480,7 @@ async def hold_active_orders_for_chat(
     этот чат без явного решения оператора.
     """
     orders = await list_active_orders_for_chat(session, chat_id=chat_id)
-    now = datetime.utcnow()
+    now = utcnow()
     held: list[Order] = []
     for order in orders:
         if grace_seconds > 0:
@@ -530,7 +531,7 @@ async def get_or_create_chat_state(
 async def mark_greeted(session: AsyncSession, state: ChatState) -> None:
     from datetime import datetime
 
-    state.greeted_at = datetime.utcnow()
+    state.greeted_at = utcnow()
     await session.flush()
 
 
@@ -553,7 +554,7 @@ async def mark_greeted_if_due(
     для одного и того же сообщения, которое watcher продublirovал через
     оба канала (listen-loop с text-key + poll-loop с id-key).
     """
-    now = datetime.utcnow()
+    now = utcnow()
     cutoff = now - cooldown
     result = await session.execute(
         sa_update(ChatState)
@@ -569,14 +570,14 @@ async def mark_greeted_if_due(
 async def mark_help_requested(session: AsyncSession, state: ChatState) -> None:
     from datetime import datetime
 
-    state.last_help_request_at = datetime.utcnow()
+    state.last_help_request_at = utcnow()
     state.help_requests_count = (state.help_requests_count or 0) + 1
     await session.flush()
 
 
 async def mark_paid_order_seen(session: AsyncSession, state: ChatState) -> None:
     """Запомнить, что в чате было системное сообщение об оплате заказа."""
-    now = datetime.utcnow()
+    now = utcnow()
     state.last_paid_order_at = now
     # Бот уже «поздоровался» через order_received/delivery — pre-purchase
     # greeting после оплаты не нужен.
@@ -602,7 +603,7 @@ async def chat_has_recent_order_context(
     if active:
         return True
 
-    cutoff = datetime.utcnow() - within
+    cutoff = utcnow() - within
     stmt = (
         select(Order.id)
         .where(Order.chat_id == chat_id)
@@ -614,7 +615,7 @@ async def chat_has_recent_order_context(
 
 async def mark_manual_intervention(session: AsyncSession, state: ChatState) -> None:
     """Запомнить ручное исходящее сообщение продавца в чат."""
-    state.last_manual_message_at = datetime.utcnow()
+    state.last_manual_message_at = utcnow()
     state.manual_messages_count = (state.manual_messages_count or 0) + 1
     await session.flush()
 
@@ -681,7 +682,7 @@ async def mark_zombie_reaper_notified(
     await session.execute(
         sa_update(Mapping)
         .where(Mapping.id == mapping_id)
-        .values(zombie_reaper_notified_at=datetime.utcnow())
+        .values(zombie_reaper_notified_at=utcnow())
     )
 
 
@@ -713,7 +714,7 @@ async def enqueue_pending_telegram_alert(
         parse_mode=parse_mode,
         reply_markup_json=reply_markup_json,
         retry_count=0,
-        next_retry_at=datetime.utcnow() + timedelta(seconds=retry_after_seconds),
+        next_retry_at=utcnow() + timedelta(seconds=retry_after_seconds),
     )
     session.add(obj)
     await session.flush()
@@ -725,7 +726,7 @@ async def list_due_pending_telegram_alerts(
     *,
     limit: int = 20,
 ) -> list[PendingTelegramAlert]:
-    now = datetime.utcnow()
+    now = utcnow()
     stmt = (
         select(PendingTelegramAlert)
         .where(PendingTelegramAlert.next_retry_at <= now)
@@ -748,7 +749,7 @@ async def reschedule_pending_telegram_alert(
         base_backoff_seconds * (2 ** (alert.retry_count - 1)),
         max_backoff_seconds,
     )
-    alert.next_retry_at = datetime.utcnow() + timedelta(seconds=delay)
+    alert.next_retry_at = utcnow() + timedelta(seconds=delay)
     alert.last_error = error[:500]
     await session.flush()
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
+from src.timeutil import utcnow
 from typing import Optional
 
 try:
@@ -28,7 +29,7 @@ class WorkingHours:
 
     def now_local(self, now: Optional[datetime] = None) -> datetime:
         tz = self._tz()
-        base = now or datetime.utcnow().replace(microsecond=0)
+        base = now or utcnow().replace(microsecond=0)
         if tz is None:
             return base
         if base.tzinfo is None:

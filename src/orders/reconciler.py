@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from src.timeutil import utcnow
 
 from loguru import logger
 
@@ -59,7 +60,7 @@ async def reconcile_orders_once(
     # этого поля. 0 = guard выключен.
     hard_timeout = int(getattr(settings, "order_delivery_hard_timeout_seconds", 0))
     timeout_cutoff = (
-        datetime.utcnow() - timedelta(seconds=hard_timeout)
+        utcnow() - timedelta(seconds=hard_timeout)
         if hard_timeout > 0
         else None
     )

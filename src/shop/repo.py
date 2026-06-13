@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from src.timeutil import utcnow
 from typing import Iterable, Optional
 
 from loguru import logger
@@ -59,7 +60,7 @@ async def get_or_create_user(
         # last_seen_at обновляется через onupdate=func.now(), но это
         # триггерится только если хоть одно поле изменилось. Принудительный
         # touch — мини-update last_seen_at независимо от других полей.
-        user.last_seen_at = datetime.utcnow()
+        user.last_seen_at = utcnow()
         if changed:
             logger.debug(
                 f"shop user {telegram_user_id} profile updated"
@@ -555,7 +556,7 @@ async def get_referral_stats(
     )).scalar() or 0)
 
     from datetime import timedelta
-    cutoff = datetime.utcnow() - timedelta(days=30)
+    cutoff = utcnow() - timedelta(days=30)
     active = int((await session.execute(
         select(func.count(ShopUser.id))
         .where(
@@ -1078,7 +1079,7 @@ async def apply_paid_invoice(
             user_id = None
 
     payment.status = "paid"
-    payment.paid_at = paid_at or datetime.utcnow()
+    payment.paid_at = paid_at or utcnow()
     if raw_payload_json is not None:
         # Дополнить raw — оставляем topup_user_id, добавляем paid-данные
         try:
@@ -1272,7 +1273,7 @@ async def mark_order_paid(
     order.status = SHOP_ORDER_STATUS_PAID
     order.balance_used_kopecks = balance_used_kopecks
     order.external_paid_kopecks = external_paid_kopecks
-    order.paid_at = datetime.utcnow()
+    order.paid_at = utcnow()
     await session.flush()
     return order
 
@@ -1308,7 +1309,7 @@ async def mark_order_delivered(
         raise ValueError(f"order {order_id} not found")
     order.status = SHOP_ORDER_STATUS_DELIVERED
     order.pins_json = pins_json
-    order.delivered_at = datetime.utcnow()
+    order.delivered_at = utcnow()
     await session.flush()
     return order
 

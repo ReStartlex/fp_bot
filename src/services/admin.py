@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from src.timeutil import utcnow
 from typing import Any
 
 from sqlalchemy import desc, func, select
@@ -182,7 +183,7 @@ async def get_profit_summary(days: int = 7, settings: Settings | None = None) ->
     settings = settings or get_settings()
     days = max(1, min(days, 90))
     rate = await get_rate_breakdown(settings)
-    since = datetime.utcnow() - timedelta(days=days)
+    since = utcnow() - timedelta(days=days)
     async with session_factory()() as session:
         orders = list(
             (
