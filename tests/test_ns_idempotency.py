@@ -53,6 +53,7 @@ async def db_factory(monkeypatch):
     monkeypatch.setattr("src.orders.stages.resolve.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.holds.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.delivery.session_factory", lambda: factory)
+    monkeypatch.setattr("src.orders.stages.purchase.session_factory", lambda: factory)
     proc._order_locks.clear()
     yield factory
     await engine.dispose()
