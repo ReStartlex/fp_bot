@@ -394,6 +394,18 @@ class Settings(BaseSettings):
         default=5.0, ge=1.0, le=30.0
     )
 
+    # ─── FunPay golden_key watchdog ─────────────────────────────────────
+    # При инвалидации golden_key FunPay-клиент остаётся «подключённым»
+    # (объект есть), поэтому reconnect-job его не чинит, а все операции
+    # тихо падают auth-ошибками. Watchdog периодически дёргает whoami()
+    # и при потере авторизации шлёт однозначный алерт «обнови golden_key».
+    funpay_auth_watchdog_enabled: bool = True
+    funpay_auth_watchdog_interval_seconds: int = Field(default=600, ge=60, le=3600)
+    # Анти-спам: не чаще одного алерта в N секунд (по умолчанию раз в час).
+    funpay_auth_watchdog_alert_cooldown_seconds: int = Field(
+        default=3600, ge=300, le=86400
+    )
+
     @field_validator("ns_api_secret")
     @classmethod
     def _check_secret_base64(cls, v: SecretStr) -> SecretStr:

@@ -59,7 +59,7 @@ FunPay-запросов; в логах `Sync done ... http=[... r429=0 ...]` в 
 
 ---
 
-### [x] P0-2. Контракт ответов FunPay не зафиксирован фикстурами — DONE (`<pending>`)
+### [x] P0-2. Контракт ответов FunPay не зафиксирован фикстурами — DONE (`abf0838`)
 
 Сделано: `classify_offersave_response` вынесена чистой функцией; не-JSON
 ответ = успех ТОЛЬКО на чистом 3xx-редиректе (200-HTML/мусор → ok=False);
@@ -93,7 +93,15 @@ FunPay-запросов; в логах `Sync done ... http=[... r429=0 ...]` в 
 
 ---
 
-### [ ] P0-3. Нет проактивного watchdog'а протухания golden_key
+### [x] P0-3. Нет проактивного watchdog'а протухания golden_key — DONE (`<pending>`)
+
+Сделано: job `_funpay_auth_watchdog` (каждые 600с, `FUNPAY_AUTH_WATCHDOG_*`)
+дёргает `FunPayClient.check_auth()` (whoami) → при потере авторизации алерт
+с инструкцией обновить golden_key (анти-спам по кулдауну, по умолчанию 1ч),
+на восстановлении — «✅». Плюс немедленный сигнал: `sync_once` помечает
+лоты `auth_error` (FunPayAuthError) и возвращает `result["auth_errors"]`,
+`_safe_sync` алертит сразу тем же `_alert_golden_key_expired`. Тесты:
+`tests/test_funpay_auth_watchdog.py` (4). 1090 зелёных.
 
 **Проблема.** При инвалидации `golden_key` FunPay-клиент существует
 (`fp is not None`), поэтому `_funpay_reconnect_if_needed` (`src/main.py:470`)

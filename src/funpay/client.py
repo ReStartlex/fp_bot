@@ -786,6 +786,24 @@ class FunPayClient:
             return {"ok": 0, "retry_429": 0, "retry_5xx": 0, "exhausted": 0}
         return cached.get_and_reset_http_metrics()
 
+    async def check_auth(self) -> bool:
+        """
+        Жив ли golden_key прямо сейчас. Делает один лёгкий GET главной
+        страницы FunPay (whoami) и смотрит, распарсился ли наш user_id.
+
+        Используется golden_key-watchdog'ом (src/main.py): при инвалидации
+        ключа FunPay отдаёт страницу логина → user_id не парсится →
+        authenticated=False. Не бросает наружу — на сетевой ошибке
+        возвращает True (не паникуем на «моргание сети», только на
+        явную потерю авторизации).
+        """
+        try:
+            me = await self._admin.whoami()
+        except Exception as exc:
+            logger.debug(f"check_auth: whoami упал (трактую как 'не знаю'): {exc}")
+            return True
+        return bool(me.get("authenticated"))
+
     async def get_lot_fields(self, lot_id: int, node_id: int | None = None) -> Any:
         """
         Поля лота для редактирования (LotFields).

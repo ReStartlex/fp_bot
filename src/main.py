@@ -81,6 +81,9 @@ class App:
         # Счётчик подряд циклов sync с exhausted>0. На 3+ подряд — алертим
         # владельцу, чтобы понять, что лоты в этом окне не апдейтятся.
         self._sync_exhausted_streak = 0
+        # Время последнего алерта о протухшем golden_key (анти-спам).
+        # None = ещё не алертили / авторизация в норме.
+        self._last_golden_key_alert: datetime | None = None
 
     # ---------- Lifecycle ----------
 
@@ -348,6 +351,21 @@ class App:
                 coalesce=True,
             )
 
+        # FunPay golden_key watchdog: ловит протухание ключа (объект
+        # клиента остаётся, reconnect-job его не чинит, операции тихо
+        # падают auth-ошибками). См. _funpay_auth_watchdog.
+        if self.settings.funpay_auth_watchdog_enabled:
+            self.scheduler.add_job(
+                self._funpay_auth_watchdog,
+                "interval",
+                seconds=self.settings.funpay_auth_watchdog_interval_seconds,
+                id="funpay_auth_watchdog",
+                # +50с: после прогрева FunPay-сессии, в стороне от sync.
+                next_run_time=datetime.now() + timedelta(seconds=50),
+                max_instances=1,
+                coalesce=True,
+            )
+
         self.scheduler.start()
         # Лог-сводка реально активных job'ов — критично для диагностики
         # «job точно запущен или нет?» по journalctl. Если в .env что-то
@@ -504,6 +522,16 @@ class App:
                     short = str(exc)[:200]
                     await self.tg.error(f"Sync run упал: <code>{short}</code>")
                 return
+
+            # Протух golden_key: sync_once гасит FunPayAuthError в skip'ы и
+            # сообщает их числом auth_errors. Алертим сразу (не ждём
+            # 10-минутный watchdog), с тем же анти-спамом по кулдауну.
+            if int(result.get("auth_errors", 0)) > 0:
+                logger.error(
+                    f"Sync: {result['auth_errors']} лот(ов) пропущено из-за "
+                    f"auth-ошибки FunPay (golden_key)"
+                )
+                await self._alert_golden_key_expired(context="ошибки авторизации в sync")
 
             # Visibility: если retry-логика FunPay-клиента не справилась
             # (429 повторялся пока budget не кончился), часть лотов в этом
@@ -675,6 +703,74 @@ class App:
             )
         except Exception as send_exc:
             logger.warning(f"ns watchdog: alert fail не доставлен: {send_exc}")
+
+    async def _alert_golden_key_expired(self, *, context: str) -> None:
+        """
+        Однозначный алерт «🔑 golden_key протух» с анти-спамом.
+
+        Дёргается из watchdog'а (периодическая проверка whoami) и из
+        _safe_sync (когда вылетел FunPayAuthError) — в обоих случаях
+        текст один: что делать оператору. Анти-спам: не чаще, чем раз в
+        funpay_auth_watchdog_alert_cooldown_seconds.
+        """
+        if self.tg is None:
+            return
+        now = datetime.now()
+        cooldown = timedelta(
+            seconds=self.settings.funpay_auth_watchdog_alert_cooldown_seconds
+        )
+        if (
+            self._last_golden_key_alert is not None
+            and now - self._last_golden_key_alert < cooldown
+        ):
+            return
+        self._last_golden_key_alert = now
+        try:
+            await self.tg.error(
+                "🔑 <b>FunPay golden_key протух</b>\n"
+                f"Обнаружено: {context}.\n\n"
+                "Все операции с FunPay (sync цен/стока, выдача, чат) "
+                "сейчас падают. Что делать:\n"
+                "1. Зайди на funpay.com, при необходимости выйди из всех "
+                "устройств и войди заново.\n"
+                "2. Возьми новые <code>golden_key</code> и "
+                "<code>PHPSESSID</code> из cookies.\n"
+                "3. Обнови их в <code>.env</code> на VPS и перезапусти: "
+                "<code>systemctl restart funpay-ns-bot</code>."
+            )
+        except Exception as exc:
+            logger.warning(f"golden_key alert не доставлен: {exc}")
+
+    async def _funpay_auth_watchdog(self) -> None:
+        """
+        Периодически проверяет, жив ли golden_key (один лёгкий whoami).
+
+        При потере авторизации — алерт с инструкцией (анти-спам внутри
+        _alert_golden_key_expired). При восстановлении — сбрасываем
+        кулдаун и шлём «✅», если до этого алертили.
+        """
+        if self.fp is None:
+            return
+        try:
+            authed = await self.fp.check_auth()
+        except Exception as exc:
+            logger.debug(f"funpay auth watchdog: check_auth упал: {exc}")
+            return
+
+        if authed:
+            if self._last_golden_key_alert is not None and self.tg is not None:
+                try:
+                    await self.tg.info(
+                        "✅ <b>FunPay golden_key снова валиден</b> — "
+                        "авторизация восстановлена."
+                    )
+                except Exception as exc:
+                    logger.warning(f"golden_key recover alert не доставлен: {exc}")
+            self._last_golden_key_alert = None
+            return
+
+        logger.error("funpay auth watchdog: golden_key невалиден (whoami: не авторизован)")
+        await self._alert_golden_key_expired(context="плановая проверка whoami")
 
     # ---------- FunPay events ----------
 

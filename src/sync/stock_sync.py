@@ -32,6 +32,7 @@ from src.db.repo import (
     update_mapping_last_synced,
 )
 from src.db.session import session_factory
+from src.funpay.admin_http import FunPayAuthError
 from src.funpay.client import FunPayClient
 from src.mapping.rules import PricingResult, compute_pricing, should_update_price
 from src.ns import NSClient
@@ -51,6 +52,10 @@ class LotSyncDecision:
     will_activate: bool
     will_deactivate: bool
     skip_reason: str | None = None
+    # True, если лот пропущен именно из-за протухшего golden_key
+    # (FunPayAuthError). Используется sync_once для агрегата auth_errors
+    # → немедленный алерт оператору из _safe_sync.
+    auth_error: bool = False
 
 
 def _flatten_services(stock: StockResponse) -> dict[int, Service]:
@@ -156,10 +161,11 @@ async def _decide_for_one(
     try:
         lot_fields = await funpay_client.get_lot_fields(mapping.funpay_lot_id)
     except Exception as exc:
+        is_auth = isinstance(exc, FunPayAuthError)
         text = str(exc)
         hint = ""
         # Auth-ошибка (golden_key инвалидирован FunPay'ем) — самая частая.
-        if "auth" in text.lower() or "login" in text.lower():
+        if is_auth or "auth" in text.lower() or "login" in text.lower():
             hint = " (обнови FUNPAY_GOLDEN_KEY в .env и перезапусти сервис)"
         return LotSyncDecision(
             funpay_lot_id=mapping.funpay_lot_id,
@@ -172,6 +178,7 @@ async def _decide_for_one(
             will_activate=False,
             will_deactivate=False,
             skip_reason=f"FunPay get_lot_fields упал: {exc}{hint}",
+            auth_error=is_auth,
         )
 
     current_price = _extract_price(lot_fields)
@@ -490,6 +497,9 @@ async def sync_once(
     # просто cap=100 ограничивает выставленный stock. Высокое значение
     # capped=N намекает что юзеру стоит увеличить cap или дать per-lot cap.
     lots_capped = 0
+    # Сколько лотов пропущено из-за протухшего golden_key (FunPayAuthError).
+    # >0 → _safe_sync шлёт немедленный алерт «обнови golden_key».
+    auth_errors = 0
     error: str | None = None
     # Маппинги, которые нужно обновить last_synced_* после успешного цикла
     # (только те, для которых _apply_decision прошёл без исключения).
@@ -646,6 +656,8 @@ async def sync_once(
             if decision.skip_reason:
                 logger.warning(f"  [{label}] SKIP: {decision.skip_reason}")
                 lots_skipped += 1
+                if decision.auth_error:
+                    auth_errors += 1
                 continue
 
             if not actions:
@@ -794,5 +806,6 @@ async def sync_once(
         "updated": lots_updated,
         "skipped": lots_skipped,
         "capped": lots_capped,
+        "auth_errors": auth_errors,
         "http": http_metrics,
     }
