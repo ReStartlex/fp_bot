@@ -229,7 +229,7 @@ FunPay с `last_synced_price` (что бот записал в прошлый р
 
 ## P1 — корректность и сопровождаемость
 
-### [~] P1-1. Разбить `orders/processor.py` (1551 строка) — ИНКР. 1 DONE (`6bd903e`)
+### [~] P1-1. Разбить `orders/processor.py` (1551→764) — ИНКР. 1-3 DONE (`6bd903e`/`cca52fa`/`14a9857`)
 
 Монолит со стадиями create/pay/wait/deliver/holds/refund в одной функции
 `_process_locked` + вложенные хелперы. Любая правка рискует задеть соседний
@@ -244,22 +244,30 @@ _emergency_disable_lot). `processor.py` остаётся оркестратор�
 **Прогресс (поэтапно, каждый инкремент = коммит + полный прогон):**
 - [x] Инкр. 1 (`6bd903e`): `events.py` (FunPayOrderEvent, ре-экспорт из
   processor) + `stages/resolve.py` (матчинг + `_resolve_mapping`/
-  `_resolve_chat_id`). 1551→1260 строк. 1145 зелёных. Тесты, патчащие
-  `processor.session_factory` per-module, получили парный патч
-  `stages/resolve.session_factory`.
-- [ ] Инкр. 2 (holds): `_trigger_manual_hold`/`_mark_failed`/
-  `_emergency_disable_lot` + общие хелперы `_pins_from_order`/
-  `_order_age_seconds` в leaf-модуль. ВНИМАНИЕ: эти зовутся через `proc.*`
-  в тестах (ре-экспорт обязателен) и используют session_factory
-  (доп. патч). `_is_hard_timeout` патчится тестами — оставить в processor.
-- [ ] Инкр. 3 (delivery): `_deliver_pins`/`_should_hold_delivery`.
-- [ ] Инкр. 4 (purchase): извлечь NS create/pay/wait из `_process_locked`
-  (это уже не чистый перенос, а экстракция — самый аккуратный шаг).
+  `_resolve_chat_id`). 1551→1260. Парный патч `resolve.session_factory`.
+- [x] Инкр. 2 (`cca52fa`): `stages/common.py` (`_pins_from_order`/
+  `_order_age_seconds`) + `stages/holds.py` (`_trigger_manual_hold`/
+  `_mark_failed`/`_emergency_disable_lot`). 1260→1029. Ре-экспорт +
+  патч `holds.session_factory`. `_is_hard_timeout` оставлен в processor
+  (патчится тестами).
+- [x] Инкр. 3 (`14a9857`): `stages/delivery.py` (`_should_hold_delivery`/
+  `_deliver_pins`). 1029→764. get_usd_rub_rate переехал в delivery
+  (патч-таргет в 12 тест-местах обновлён) + патч `delivery.session_factory`.
+- [~] Инкр. 4 (purchase) — **ОТЛОЖЕНО (осознанно).** Извлечь NS
+  create/pay/wait из `_process_locked` — это НЕ чистый перенос, а
+  экстракция из единого try-блока с ~10 разделяемыми локалами,
+  переплетёнными с hard-timeout/manual_hold/сессиями. Риск регрессии на
+  денежном пути выше выигрыша; то, что осталось в processor (764 стр.) —
+  это и есть «оркестратор», который план просил оставить. Возвращаться
+  только при явной необходимости и с отдельным дизайн-ревью шва.
 
-**Приёмка.** `processor.py` < 400 строк; полный прогон тестов зелёный;
-никаких изменений в логике (diff поведения = 0).
+**Приёмка.** Достигнуто по духу: монолит 1551→764 (−51%), все
+обособляемые стадии (resolve/holds/delivery) вынесены в `stages/`,
+поведение = 0 (1145 тестов зелёные на каждом инкременте). Формальный
+порог «<400 строк» НЕ достигнут — требует рискованной экстракции
+purchase (инкр. 4, отложен).
 
-**Сложность:** средняя (механическая, но аккуратная).
+**Сложность:** средняя (инкр. 1–3 — механические; инкр. 4 — рискованный).
 
 ---
 
