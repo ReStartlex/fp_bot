@@ -297,7 +297,7 @@ python 3.11 + 3.12, `pip install -r requirements.txt`, `pytest -q`.
 
 **Приёмка.** PR/push в ветку — автоматический зелёный прогон.
 
-### [ ] P2-3. BUILD_INFO пишет неверную ветку
+### [x] P2-3. BUILD_INFO пишет неверную ветку — DONE (`<pending>`, вместе с P2-4)
 
 В проде `BUILD_INFO: branch=main`, хотя деплой из
 `vps-stable-2026-06-02-151807`. Вводит в заблуждение при диагностике.
@@ -306,7 +306,15 @@ ref/branch, а не дефолт).
 
 **Приёмка.** После деплоя `cat BUILD_INFO` показывает реальную ветку.
 
-### [ ] P2-4. Зафиксировать ветку деплоя
+### [x] P2-4. Зафиксировать ветку деплоя — DONE (`<pending>`)
+
+P2-3 и P2-4 имели общий корень: `BRANCH` дефолтил в `main`. Теперь
+`fetch_code.sh` резолвит BRANCH: env > `.deploy_branch` > main, и при
+явном `BRANCH=` персистит её в `${PROD_APP_DIR}/.deploy_branch` (исключён
+из git clean, как .deploy_pin). Это чинит и откат-на-main, и
+`BUILD_INFO branch=`. Один раз задеплоить с `BRANCH=vps-stable-...`, далее
+`bash deploy/update.sh` без env берёт закреплённую ветку. 4 статических
+теста в test_deploy_scripts_safety.py. 1102 зелёных.
 
 Каждый деплой требует `BRANCH=vps-stable-... PIN_SHA=...` вручную — забыть
 `BRANCH` = откат на main. Решение: писать ветку в `.deploy_branch` рядом с

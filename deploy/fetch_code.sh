@@ -36,6 +36,16 @@ APP_DIR=${APP_DIR:-/opt/funpay-ns-bot}
 # По умолчанию = APP_DIR (для случая когда нет staging-режима, т.е.
 # fetch_code.sh запускается напрямую в продовый каталог).
 PROD_APP_DIR=${PROD_APP_DIR:-${APP_DIR}}
+# BRANCH: явный env > .deploy_branch (закреплённая ветка деплоя) > main.
+# Раньше дефолт был просто main, поэтому забытый `BRANCH=` при деплое
+# откатывал прод на main, а BUILD_INFO врал `branch=main` (P2-3/P2-4).
+BRANCH_FROM_ENV=0
+if [[ -n "${BRANCH:-}" ]]; then
+    BRANCH_FROM_ENV=1
+elif [[ -f "${PROD_APP_DIR}/.deploy_branch" ]]; then
+    BRANCH=$(grep -E '^[A-Za-z0-9._/-]+$' "${PROD_APP_DIR}/.deploy_branch" \
+        | head -1 || echo "")
+fi
 BRANCH=${BRANCH:-main}
 GH_OWNER=ReStartlex
 GH_REPO=fp_bot
@@ -194,7 +204,7 @@ fi
 # НЕ трогает .venv, data, .env, logs (они non-tracked).
 git clean -fd --exclude='.venv' --exclude='data' --exclude='.env' \
     --exclude='logs' --exclude='BUILD_INFO' --exclude='backups' \
-    --exclude='.deploy_pin' 2>/dev/null || true
+    --exclude='.deploy_pin' --exclude='.deploy_branch' 2>/dev/null || true
 
 # Обязательные runtime-папки. systemd-сервис стартует с
 # ProtectHome/InaccessiblePaths, который требует, чтобы logs/ и
@@ -240,6 +250,15 @@ if [[ -n "${SHA}" ]]; then
         echo "fetched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     } > "${APP_DIR}/BUILD_INFO"
     echo "    BUILD_INFO: ${SHA:0:12}  ${DATE:-?}  ${SUBJECT:-?}"
+fi
+
+# P2-4: закрепляем ветку деплоя, чтобы следующий update.sh БЕЗ BRANCH=
+# не откатился на main. Пишем только при явно заданной ветке (иначе
+# закрепили бы случайный main). Файл живёт в PROD_APP_DIR рядом с
+# .deploy_pin и читается на следующем запуске как дефолт BRANCH.
+if [[ "${BRANCH_FROM_ENV}" -eq 1 ]]; then
+    echo "${BRANCH}" > "${PROD_APP_DIR}/.deploy_branch" 2>/dev/null || true
+    echo "    [git] ветка деплоя закреплена в .deploy_branch: ${BRANCH}"
 fi
 
 # chown: tracked файлы от git могут быть от root, чиним обратно.

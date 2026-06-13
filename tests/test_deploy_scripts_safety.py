@@ -163,6 +163,30 @@ def test_fetch_writes_build_info_with_target_ref():
     assert 'target_ref=${TARGET_REF}' in text
 
 
+def test_fetch_reads_branch_from_deploy_branch_file():
+    """P2-4: BRANCH резолвится env > .deploy_branch > main, чтобы забытый
+    BRANCH= не откатывал прод на main (и BUILD_INFO не врал branch=main)."""
+    text = FETCH_SH.read_text(encoding="utf-8")
+    assert '"${PROD_APP_DIR}/.deploy_branch"' in text, (
+        "fetch_code.sh должен читать закреплённую ветку из .deploy_branch"
+    )
+    assert "BRANCH_FROM_ENV" in text, (
+        "должен различать явный BRANCH= и дефолт, чтобы не закрепить main"
+    )
+
+
+def test_fetch_persists_deploy_branch_when_explicit():
+    """При явном BRANCH= ветка закрепляется в .deploy_branch (PROD_APP_DIR)."""
+    text = FETCH_SH.read_text(encoding="utf-8")
+    assert 'echo "${BRANCH}" > "${PROD_APP_DIR}/.deploy_branch"' in text
+
+
+def test_fetch_clean_preserves_deploy_branch():
+    """git clean не должен удалять .deploy_branch (как и .deploy_pin)."""
+    text = FETCH_SH.read_text(encoding="utf-8")
+    assert "--exclude='.deploy_branch'" in text
+
+
 def test_fetch_reads_sha_from_git_not_only_version_py():
     """
     BUILD_INFO должен брать SHA из `git rev-parse HEAD` как primary
