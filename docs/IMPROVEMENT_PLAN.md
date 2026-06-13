@@ -67,12 +67,14 @@ burst-симптом; вместе с quick-fix .env закрывает прод
   пробрасывает исключение на 429-исчерпании (сигнал деградации, не пустой
   список). Тесты `tests/test_sync_snapshot.py` (11: юнит in-sync + 4
   интеграции). 1145 зелёных.
-  **ПОДТВЕРЖДЕНО НА ПРОДЕ (2026-06-13, SYNC_SNAPSHOT_MODE=true):**
+  **ПРИНЯТО НА ПРОДЕ (2026-06-13, SYNC_SNAPSHOT_MODE=true):**
   `checked` упал с ~64 до 0–3 за цикл, `unchanged≈113-115`,
   `snapshot_synced` стабилен, `r429=0` во всех snapshot-циклах (было
-  r429=4 в старых). Пример: `checked=0 unchanged=115 snapshot_synced=3
-  http=[ok=36 r429=0 ...]`. zombie_reaper чистый. Остаётся понаблюдать
-  доставку на реальном заказе. Откат = `SYNC_SNAPSHOT_MODE=false` + рестарт.
+  r429=4 в старых). zombie_reaper чистый. БОЕВОЙ ТЕСТ автовыдачи —
+  заказ XT8EZFFE (без lot_id, сматчен по описанию score=190;
+  приветствие/PIN/благодарность через admin_http; status=delivered,
+  покупатель подтвердил): без FunPayAPI-fallback / «Обновите страницу» /
+  csrf-ошибок / manual_hold. Откат = `SYNC_SNAPSHOT_MODE=false` + рестарт.
   (Отдельно замечены внешние `FunPay GET 502` на `/chat/` — нестабильность
   FunPay, не snapshot-sync; детектор деградации на снапшот-нодах их не
   считает, т.к. это chat-эндпоинт.)
