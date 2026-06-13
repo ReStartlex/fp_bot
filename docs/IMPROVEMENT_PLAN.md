@@ -202,7 +202,7 @@ _emergency_disable_lot). `processor.py` остаётся оркестратор�
 
 ---
 
-### [~] P1-2. Выпилить библиотеку FunPayAPI — ЭТАП 2 DONE (`<pending>`)
+### [~] P1-2. Выпилить библиотеку FunPayAPI — ЭТАП 2 DONE (`a4756f5`)
 
 **Проблема.** От FunPayAPI осталось: `get_sells` (snapshot/recent sales),
 `send_message` (с fallback на admin_http), `get_user/get_lots`, и ради неё —
@@ -219,7 +219,7 @@ monkeypatch и зависимость, поднять requests/urllib3.
 Каждый этап — отдельный коммит с фикстурными тестами (см. P0-2).
 
 **Прогресс:**
-- [x] Этап 2 (`<pending>`): `send_message` развёрнут — ОСНОВНОЙ путь теперь
+- [x] Этап 2 (`a4756f5`): `send_message` развёрнут — ОСНОВНОЙ путь теперь
   `admin_http.send_chat_message` (прямой POST, без хрупкого HTML-парсинга
   ответа; закалён csrf-refresh). FunPayAPI оставлен РЕЗЕРВОМ на пару
   деплой-циклов (пропуск доставки страшнее дубля); снимется отдельным
