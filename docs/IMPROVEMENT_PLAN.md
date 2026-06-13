@@ -229,7 +229,7 @@ FunPay с `last_synced_price` (что бот записал в прошлый р
 
 ## P1 — корректность и сопровождаемость
 
-### [ ] P1-1. Разбить `orders/processor.py` (1551 строка)
+### [~] P1-1. Разбить `orders/processor.py` (1551 строка) — ИНКР. 1 DONE (`6bd903e`)
 
 Монолит со стадиями create/pay/wait/deliver/holds/refund в одной функции
 `_process_locked` + вложенные хелперы. Любая правка рискует задеть соседний
@@ -239,8 +239,22 @@ FunPay с `last_synced_price` (что бот записал в прошлый р
 `resolve.py` (маппинг, AmbiguousMatch), `purchase.py` (NS create/pay/wait),
 `delivery.py` (двухфазная доставка), `holds.py` (manual_hold/_mark_failed/
 _emergency_disable_lot). `processor.py` остаётся оркестратором.
-Поведение НЕ менять — только перенос; 1075 тестов должны пройти без правок
-(кроме импортов в тестах).
+Поведение НЕ менять — только перенос; тесты должны пройти.
+
+**Прогресс (поэтапно, каждый инкремент = коммит + полный прогон):**
+- [x] Инкр. 1 (`6bd903e`): `events.py` (FunPayOrderEvent, ре-экспорт из
+  processor) + `stages/resolve.py` (матчинг + `_resolve_mapping`/
+  `_resolve_chat_id`). 1551→1260 строк. 1145 зелёных. Тесты, патчащие
+  `processor.session_factory` per-module, получили парный патч
+  `stages/resolve.session_factory`.
+- [ ] Инкр. 2 (holds): `_trigger_manual_hold`/`_mark_failed`/
+  `_emergency_disable_lot` + общие хелперы `_pins_from_order`/
+  `_order_age_seconds` в leaf-модуль. ВНИМАНИЕ: эти зовутся через `proc.*`
+  в тестах (ре-экспорт обязателен) и используют session_factory
+  (доп. патч). `_is_hard_timeout` патчится тестами — оставить в processor.
+- [ ] Инкр. 3 (delivery): `_deliver_pins`/`_should_hold_delivery`.
+- [ ] Инкр. 4 (purchase): извлечь NS create/pay/wait из `_process_locked`
+  (это уже не чистый перенос, а экстракция — самый аккуратный шаг).
 
 **Приёмка.** `processor.py` < 400 строк; полный прогон тестов зелёный;
 никаких изменений в логике (diff поведения = 0).
