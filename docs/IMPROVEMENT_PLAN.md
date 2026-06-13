@@ -13,7 +13,25 @@ SQLite WAL, systemd (funpay-ns-bot + funpay-ns-api).
 
 ## P0 — масштаб и деньги (делать первыми)
 
-### [ ] P0-1. Sync не масштабируется: per-lot GET на каждый цикл
+### [~] P0-1. Sync не масштабируется: per-lot GET на каждый цикл — ФАЗА A DONE (`<pending>`)
+
+**Фаза A (сделано, безопасно, оффлайн):** джиттер TTL diff-cache
+(`SYNC_STOCK_DIFF_CACHE_JITTER_SECONDS`, default 60) — детерминированный
+per-lot сдвиг 0..jitter в `_is_cache_hit` растягивает переоткалибровку по
+окну, убирая ЗАЛП одновременных GET (корень «maximum number of running
+instances»). Тесты `tests/test_sync_diff_cache_jitter.py` (7). Это снимает
+burst-симптом; вместе с quick-fix .env закрывает прод-боль.
+
+**Фаза B (TODO, нужен прод-HTML):** полноценный snapshot-sync по нодам
+(1 GET `/lots/{node}/trade` на ноду вместо N offerEdit). Блокер: парсинг
+ЦЕНЫ из строки trade-страницы — нужна реальная вёрстка. Запросить у юзера
+`./.venv/bin/python -m src.tools.funpay_node_offers <node> --raw-out
+/root/trade.html`, по ней доработать `list_node_offers` (добавить price),
+затем переписать цикл sync_once с группировкой по `Mapping.funpay_node_id`
+(добавить колонку + ALTER + fill из migrate/runner) и fallback на per-lot.
+Оригинальное ТЗ ниже сохранено.
+
+#### Оригинальное ТЗ P0-1 (для фазы B)
 
 **Проблема.** `sync_once` делает GET `offerEdit` на КАЖДЫЙ маппинг
 (`src/sync/stock_sync.py`, `_decide_for_one`). Diff-cache гасит часть, но его
@@ -123,7 +141,7 @@ FunPay-запросов; в логах `Sync done ... http=[... r429=0 ...]` в 
 
 ---
 
-### [x] P0-4. Цены/сток: верификация записей не покрывает price/stock — DONE (`<pending>`)
+### [x] P0-4. Цены/сток: верификация записей не покрывает price/stock — DONE (`591d963`)
 
 Сделано (дёшево, без extra GET): `_decide_for_one` сравнивает текущую цену
 FunPay с `last_synced_price` (что бот записал в прошлый раз); расхождение

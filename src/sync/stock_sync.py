@@ -346,20 +346,35 @@ def _compute_target_quickly(
     )
 
 
+def _lot_ttl_jitter(funpay_lot_id: int, jitter_seconds: int) -> int:
+    """
+    Детерминированный сдвиг TTL для лота: 0..jitter_seconds.
+
+    Стабилен между циклами (зависит только от lot_id), поэтому каждый лот
+    всегда переоткалибровывается в свою фазу окна — без этого все лоты
+    после общего цикла истекают разом и дают залп GET к FunPay (P0-1 A).
+    """
+    if jitter_seconds <= 0:
+        return 0
+    return int(funpay_lot_id) % (jitter_seconds + 1)
+
+
 def _is_cache_hit(
     *,
     mapping: Any,
     target: PricingResult,
     ttl_seconds: int,
     now: datetime | None = None,
+    jitter_seconds: int = 0,
 ) -> bool:
     """
     True, если target совпадает с last_synced и last_synced свежий.
 
     Все три условия должны быть выполнены:
       1. Cache заполнен (`last_synced_at` не NULL — иначе первый run);
-      2. Cache свежий: `now - last_synced_at < TTL` (защита от рассинхрона
-         с FunPay, если кто-то правит цены через UI вручную);
+      2. Cache свежий: `now - last_synced_at < TTL + per-lot джиттер`
+         (защита от рассинхрона с FunPay + растяжка переоткалибровки,
+         чтобы все лоты не истекали разом — см. _lot_ttl_jitter);
       3. Target == cache:
          - price (округлённая): сравниваем как float с допуском 0.005
          - stock: int-сравнение
@@ -378,7 +393,10 @@ def _is_cache_hit(
         return False
 
     current_time = now or datetime.utcnow()
-    if (current_time - last_at).total_seconds() >= ttl_seconds:
+    effective_ttl = ttl_seconds + _lot_ttl_jitter(
+        getattr(mapping, "funpay_lot_id", 0), jitter_seconds
+    )
+    if (current_time - last_at).total_seconds() >= effective_ttl:
         return False
 
     target_price = target.round_price()
@@ -587,6 +605,9 @@ async def sync_once(
         # Готовим diff-cache параметры заранее (читаем из settings один раз).
         diff_cache_enabled = getattr(settings, "sync_stock_diff_cache_enabled", True)
         diff_cache_ttl = int(getattr(settings, "sync_stock_diff_cache_ttl_seconds", 300))
+        diff_cache_jitter = int(
+            getattr(settings, "sync_stock_diff_cache_jitter_seconds", 0)
+        )
         cache_check_now = datetime.utcnow()  # фиксируем "now" для всех проверок цикла
 
         decisions: list[LotSyncDecision] = []
@@ -621,6 +642,7 @@ async def sync_once(
                     target=quick_target,
                     ttl_seconds=diff_cache_ttl,
                     now=cache_check_now,
+                    jitter_seconds=diff_cache_jitter,
                 ):
                     label = mapping.label or f"lot {mapping.funpay_lot_id}"
                     logger.debug(
