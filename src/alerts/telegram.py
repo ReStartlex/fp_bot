@@ -327,13 +327,19 @@ class TelegramNotifier:
         ns_price_usd: float,
         funpay_price_rub: Optional[float],
         buyer_username: Optional[str],
+        profit_rub: Optional[float] = None,
     ) -> None:
+        profit_line = (
+            f"Прибыль: {profit_rub:.2f}₽" if profit_rub is not None
+            else "Прибыль: n/a"
+        )
         text = (
             f"✅ <b>Заказ выполнен</b>\n"
             f"FunPay: <code>{funpay_order_id}</code>\n"
             f"NS: <code>{ns_custom_id}</code>\n"
             f"Куплено за: {ns_price_usd:.4f}$\n"
             f"Продано за: {funpay_price_rub or '?'}₽\n"
+            f"{profit_line}\n"
             f"Покупатель: {buyer_username or '?'}"
         )
         await self.send(text)

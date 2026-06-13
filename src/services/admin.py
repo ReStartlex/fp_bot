@@ -11,7 +11,7 @@ from src.config import Settings, get_settings
 from src.db.models import LotGroup, Mapping, Order, SyncRun
 from src.db.repo import get_daily_summary
 from src.db.session import session_factory
-from src.mapping.rules import estimate_profit_rub
+from src.mapping.rules import order_financials
 from src.sync.fx import get_rate_breakdown
 
 
@@ -208,21 +208,19 @@ async def get_profit_summary(days: int = 7, settings: Settings | None = None) ->
     revenue = cost = profit = withdrawal_fee = 0.0
     counted = exact_count = 0
     for order in orders:
-        fx = order.fx_rate_at_sale or rate.effective
-        estimated = estimate_profit_rub(
-            order.funpay_price_rub,
-            order.ns_price_usd,
-            fx,
+        fin = order_financials(
+            order,
+            fallback_fx=rate.effective,
             withdrawal_fee_percent=settings.funpay_withdrawal_fee_percent,
         )
-        if estimated is None:
+        if fin is None:
             continue
-        order_revenue, order_cost, order_profit, margin = estimated
+        order_revenue, order_cost, order_fee, order_profit = fin
         if order.fx_rate_at_sale is not None:
             exact_count += 1
         revenue += order_revenue
         cost += order_cost
-        withdrawal_fee += order_revenue * settings.funpay_withdrawal_fee_percent / 100.0
+        withdrawal_fee += order_fee
         profit += order_profit
         counted += 1
     margin = profit / revenue * 100.0 if revenue > 0 else 0.0

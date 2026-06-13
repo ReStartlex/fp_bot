@@ -17,7 +17,7 @@ from src.db.repo import (
 )
 from src.db.session import session_factory
 from src.funpay.client import FunPayClient
-from src.mapping.rules import estimate_profit_rub
+from src.mapping.rules import compute_profit_breakdown
 from src.orders.events import FunPayOrderEvent
 from src.orders.stages.holds import _emergency_disable_lot
 from src.sync.fx import get_usd_rub_rate
@@ -217,20 +217,30 @@ async def _deliver_pins(
         }
 
     log.success(f"Доставил {len(pins)} код(а/ов) в чат {event.chat_id}")
+    # P&L заказа из УЖЕ известных данных (без внешних запросов): курс
+    # берём текущий сохранённый (get_usd_rub_rate кешируется и не ходит в
+    # сеть на горячем пути), цену продажи и ns_price_usd — из заказа.
+    # Любой сбой расчёта НЕ ломает выдачу: профит просто останется None
+    # → уведомление покажет «n/a».
     fx_rate_at_sale: float | None = None
     profit_rub: float | None = None
     profit_margin_percent: float | None = None
+    cost_rub: float | None = None
+    funpay_fee_rub: float | None = None
     try:
         settings = get_settings()
         fx_rate_at_sale = await get_usd_rub_rate(settings)
-        estimated = estimate_profit_rub(
-            event.funpay_price_rub,
-            ns_price_usd,
-            fx_rate_at_sale,
-            withdrawal_fee_percent=settings.funpay_withdrawal_fee_percent,
+        breakdown = compute_profit_breakdown(
+            sold_rub=event.funpay_price_rub,
+            ns_price_usd=ns_price_usd,
+            usd_rub_rate_at_sale=fx_rate_at_sale,
+            fee_rate=settings.funpay_withdrawal_fee_percent / 100.0,
         )
-        if estimated is not None:
-            _, _, profit_rub, profit_margin_percent = estimated
+        if breakdown is not None:
+            profit_rub = float(breakdown.profit_rub)
+            profit_margin_percent = float(breakdown.margin_percent)
+            cost_rub = float(breakdown.cost_rub)
+            funpay_fee_rub = float(breakdown.funpay_fee_rub)
     except Exception as exc:
         log.warning(f"Не смог посчитать точную прибыль заказа: {exc}")
     async with session_factory()() as session:
@@ -243,6 +253,8 @@ async def _deliver_pins(
             fx_rate_at_sale=fx_rate_at_sale,
             profit_rub=profit_rub,
             profit_margin_percent=profit_margin_percent,
+            cost_rub=cost_rub,
+            funpay_fee_rub=funpay_fee_rub,
         )
         # Инвалидация diff-cache. FunPay при продаже САМ списывает сток
         # (100→97), наш target = min(NS, cap) = 100 не меняется, поэтому
@@ -277,6 +289,7 @@ async def _deliver_pins(
             ns_price_usd=ns_price_usd,
             funpay_price_rub=event.funpay_price_rub,
             buyer_username=event.buyer_username,
+            profit_rub=profit_rub,
         )
 
     return {

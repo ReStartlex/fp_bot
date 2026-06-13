@@ -56,7 +56,7 @@ from src.shop.repo import (
 )
 from src.funpay.client import FunPayClient
 from src.orders.sync_paid import sync_pending_confirmation
-from src.mapping.rules import compute_pricing, estimate_profit_rub
+from src.mapping.rules import compute_pricing, order_financials
 from src.mapping.safety import mapping_risk_warnings
 from src.ns import NSClient
 from src.ns.models import StockResponse
@@ -2436,23 +2436,19 @@ class TelegramBot:
         by_group: dict[str, list[float]] = {}
         exact_count = 0
         for order in orders:
-            fx = getattr(order, "fx_rate_at_sale", None) or rate.effective
-            estimated = estimate_profit_rub(
-                order.funpay_price_rub,
-                order.ns_price_usd,
-                fx,
+            fin = order_financials(
+                order,
+                fallback_fx=rate.effective,
                 withdrawal_fee_percent=self._settings.funpay_withdrawal_fee_percent,
             )
-            if estimated is None:
+            if fin is None:
                 continue
-            order_revenue, order_cost, order_profit, _ = estimated
+            order_revenue, order_cost, order_fee, order_profit = fin
             if getattr(order, "fx_rate_at_sale", None) is not None:
                 exact_count += 1
             revenue += order_revenue
             cost += order_cost
-            withdrawal_fee += (
-                order_revenue * self._settings.funpay_withdrawal_fee_percent / 100.0
-            )
+            withdrawal_fee += order_fee
             profit += order_profit
             counted += 1
             mapping = mappings.get(order.funpay_lot_id)

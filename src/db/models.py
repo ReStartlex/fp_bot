@@ -261,6 +261,13 @@ class Order(Base):
     fx_rate_at_sale: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     profit_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     profit_margin_percent: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Разложение прибыли (P&L), сохраняется при доставке из УЖЕ известных
+    # данных (без внешних запросов). funpay_price_rub = sold_rub,
+    # fx_rate_at_sale = usd_rub_rate_at_sale. Хранятся явно, чтобы дневная/
+    # недельная/месячная прибыль СУММИРОВАЛАСЬ из сохранённого, а не
+    # пересчитывалась задним числом по текущему курсу.
+    cost_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    funpay_fee_rub: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="received")
     # Возможные статусы:
     #   received → ns_created → ns_paid → pins_ready → delivering → delivered

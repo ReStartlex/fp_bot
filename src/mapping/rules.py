@@ -2,10 +2,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from src.config import Currency, Settings
 from src.db.models import Mapping
 from src.ns.models import Service
+
+
+_CENT = Decimal("0.01")
+
+
+def _money(value: Decimal) -> Decimal:
+    """Округление денежной величины до копеек (банковское HALF_UP)."""
+    return value.quantize(_CENT, rounding=ROUND_HALF_UP)
+
+
+def _to_decimal(value) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return None
 
 
 @dataclass
@@ -152,3 +170,104 @@ def estimate_profit_rub(
     profit_rub = funpay_price_rub - withdrawal_fee_rub - cost_rub
     margin_percent = profit_rub / funpay_price_rub * 100.0
     return funpay_price_rub, cost_rub, profit_rub, margin_percent
+
+
+@dataclass(frozen=True)
+class ProfitBreakdown:
+    """
+    Разложение прибыли по выполненному заказу (в RUB), деньги — Decimal.
+
+    profit_rub = sold_rub - funpay_fee_rub - cost_rub
+      cost_rub      = ns_price_usd * usd_rub_rate_at_sale
+      funpay_fee_rub = sold_rub * fee_rate (комиссия вывода с FunPay)
+    """
+    sold_rub: Decimal
+    cost_rub: Decimal
+    funpay_fee_rub: Decimal
+    profit_rub: Decimal
+    margin_percent: Decimal
+    usd_rub_rate_at_sale: Decimal
+
+
+def compute_profit_breakdown(
+    *,
+    sold_rub,
+    ns_price_usd,
+    usd_rub_rate_at_sale,
+    fee_rate,
+) -> ProfitBreakdown | None:
+    """
+    Прибыль по заказу из УЖЕ ИЗВЕСТНЫХ данных (без внешних запросов).
+    Decimal на всех денежных шагах. None — если не хватает данных или
+    значения невалидны (вызывающий покажет «n/a», выдачу не ломаем).
+
+    Параметры — что угодно, приводимое к Decimal (float/str/Decimal):
+      sold_rub               — цена продажи на FunPay (RUB);
+      ns_price_usd           — сколько списал NS (USD);
+      usd_rub_rate_at_sale   — курс USD→RUB на момент продажи;
+      fee_rate               — доля комиссии вывода FunPay (0.03 = 3%).
+    """
+    sold = _to_decimal(sold_rub)
+    ns_usd = _to_decimal(ns_price_usd)
+    rate = _to_decimal(usd_rub_rate_at_sale)
+    fee = _to_decimal(fee_rate)
+    if sold is None or ns_usd is None or rate is None or fee is None:
+        return None
+    if sold <= 0 or ns_usd < 0 or rate <= 0 or fee < 0:
+        return None
+
+    cost = _money(ns_usd * rate)
+    fee_rub = _money(sold * fee)
+    profit = _money(sold - fee_rub - cost)
+    margin = (profit / sold * Decimal(100)).quantize(_CENT, rounding=ROUND_HALF_UP)
+    return ProfitBreakdown(
+        sold_rub=_money(sold),
+        cost_rub=cost,
+        funpay_fee_rub=fee_rub,
+        profit_rub=profit,
+        margin_percent=margin,
+        usd_rub_rate_at_sale=rate,
+    )
+
+
+def order_financials(
+    order,
+    *,
+    fallback_fx: float,
+    withdrawal_fee_percent: float,
+) -> tuple[float, float, float, float] | None:
+    """
+    (revenue, cost, fee, profit) в RUB для одного заказа в СВОДКАХ.
+
+    Приоритет — СОХРАНЁННЫЕ при доставке значения: дневная/недельная/
+    месячная прибыль суммируется из `order.profit_rub`, а НЕ пересчитывается
+    задним числом по текущему курсу. Для старых заказов без сохранённого
+    `profit_rub` — fallback-пересчёт по сохранённому `fx_rate_at_sale`
+    (или `fallback_fx`, если и его нет). None — если данных не хватает.
+    """
+    sold = getattr(order, "funpay_price_rub", None)
+    stored_profit = getattr(order, "profit_rub", None)
+    if stored_profit is not None and sold is not None:
+        cost = getattr(order, "cost_rub", None)
+        if cost is None:
+            ns_usd = getattr(order, "ns_price_usd", None) or 0.0
+            fx = getattr(order, "fx_rate_at_sale", None) or fallback_fx
+            cost = ns_usd * fx
+        fee = getattr(order, "funpay_fee_rub", None)
+        if fee is None:
+            fee = sold * withdrawal_fee_percent / 100.0
+        return float(sold), float(cost), float(fee), float(stored_profit)
+
+    # Старый заказ без сохранённого профита — пересчитываем по сохранённому fx.
+    fx = getattr(order, "fx_rate_at_sale", None) or fallback_fx
+    est = estimate_profit_rub(
+        sold,
+        getattr(order, "ns_price_usd", None),
+        fx,
+        withdrawal_fee_percent=withdrawal_fee_percent,
+    )
+    if est is None:
+        return None
+    revenue, cost, profit, _ = est
+    fee = revenue * withdrawal_fee_percent / 100.0
+    return revenue, cost, fee, profit

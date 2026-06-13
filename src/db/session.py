@@ -193,7 +193,10 @@ def _migrate_sqlite_schema(sync_conn) -> None:
             logger.info("init_db: добавлена колонка mappings.zombie_reaper_notified_at")
     if "orders" in tables:
         columns = {col["name"] for col in inspector.get_columns("orders")}
-        for name in ("fx_rate_at_sale", "profit_rub", "profit_margin_percent"):
+        for name in (
+            "fx_rate_at_sale", "profit_rub", "profit_margin_percent",
+            "cost_rub", "funpay_fee_rub",
+        ):
             if name not in columns:
                 sync_conn.execute(text(f"ALTER TABLE orders ADD COLUMN {name} FLOAT"))
                 logger.info(f"init_db: добавлена колонка orders.{name}")

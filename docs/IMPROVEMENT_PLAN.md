@@ -590,6 +590,24 @@ funpay_lot_id<=0 (`list_mappings_missing_node_id`). Тесты: +4. 1130
 зелёных. ОСТАЁТСЯ (B2/B3): надёжное детектирование «лот удалён» по
 ответу FunPay (404/parse) для лотов с last_synced_active≠0.
 
+### P&L по заказу: сохранённая прибыль + breakdown (2026-06-13, `<pending>`)
+
+Запрошенное улучшение (холодный расчёт, без внешних запросов в момент
+выдачи). Прибыль считается из УЖЕ известных данных:
+`profit = sold_rub - sold_rub*fee_rate - ns_price_usd*fx_at_sale`.
+- `mapping/rules.compute_profit_breakdown` — Decimal на всех денежных
+  шагах, quantize до копеек; None при нехватке данных (выдача не ломается).
+- `Order` + колонки `cost_rub`, `funpay_fee_rub` (+ ALTER); `sold_rub` =
+  `funpay_price_rub`, `usd_rub_rate_at_sale` = `fx_rate_at_sale`
+  (переиспользованы, без дублей). Ставятся при delivered.
+- Комиссия — существующая `FUNPAY_WITHDRAWAL_FEE_PERCENT=3.0` (3% ≡ 0.03;
+  НЕ добавлял parallel FEE_RATE — один источник истины для денег).
+- `order_success`: строка «Прибыль: X₽» / «n/a».
+- Сводки (`/stats`, `/api/dashboard`) через `order_financials`:
+  СУММИРУЮТ сохранённый `profit_rub`, не пересчитывают по текущему курсу;
+  для старых заказов без сохранённого — fallback по сохранённому fx.
+- Тесты `tests/test_order_profit.py` (8). 1153 зелёных.
+
 ## Что НЕ трогать (работает, проверено в этой итерации)
 
 - Деактивация лотов (active-only + verify-after-save) — починено `2d90d01`.
