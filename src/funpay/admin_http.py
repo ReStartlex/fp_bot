@@ -647,11 +647,25 @@ class FunPayAdminClient:
         if csrf:
             self._csrf_token = csrf
 
+        # Маркер ЯВНОГО разлогина: форма логина в body или редирект на
+        # /account/login. Нужен, чтобы отличить «точно разлогинены» от
+        # «не смогли распарсить user_id» (транзиент/смена вёрстки) —
+        # иначе watchdog даёт false positive (инцидент 2026-06-13).
+        low = r.text.lower()
+        final_url = str(getattr(r, "url", "") or "")
+        login_marker = (
+            any(m.lower() in low for m in _LOGIN_REDIRECT_MARKERS)
+            or "/account/login" in final_url.lower()
+        )
+
         return {
             "user_id": user_id,
             "username": username,
             "authenticated": bool(user_id),
             "csrf_token": csrf,
+            "http_status": r.status_code,
+            "final_url": final_url,
+            "login_marker": login_marker,
         }
 
     async def _ensure_csrf(self) -> str | None:

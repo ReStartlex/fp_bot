@@ -5,9 +5,11 @@ P0-3: watchdog протухания golden_key.
   1. sync_once при FunPayAuthError из get_lot_fields НЕ падает, а
      помечает лот auth_error и возвращает result["auth_errors"] > 0
      (это сигнал, по которому _safe_sync шлёт алерт «обнови golden_key»).
-  2. FunPayClient.check_auth возвращает False, когда whoami говорит
-     authenticated=False (страница логина), True — когда авторизован,
-     и True (не паникуем) при сетевой ошибке whoami.
+  2. FunPayClient.check_auth возвращает трёхзначный статус:
+     "authed" — распарсили user_id; "logged_out" — есть маркер логина
+     (форма/редирект); "unknown" — ни то ни другое (транзиент/сеть/
+     смена вёрстки). unknown НЕ трактуется как разлогин — это и был
+     источник false positive (инцидент 2026-06-13).
 """
 from __future__ import annotations
 
@@ -106,14 +108,26 @@ async def test_sync_once_surfaces_auth_errors(db_factory, monkeypatch):
 # ───────────── check_auth ─────────────
 
 class _FakeAdmin:
-    def __init__(self, authed: bool | None, raise_exc: bool = False):
+    def __init__(
+        self,
+        authed: bool | None,
+        raise_exc: bool = False,
+        login_marker: bool = False,
+    ):
         self._authed = authed
         self._raise = raise_exc
+        self._login_marker = login_marker
 
     async def whoami(self):
         if self._raise:
             raise RuntimeError("network down")
-        return {"authenticated": self._authed, "user_id": 617001 if self._authed else None}
+        return {
+            "authenticated": self._authed,
+            "user_id": 617001 if self._authed else None,
+            "login_marker": self._login_marker,
+            "http_status": 200,
+            "final_url": "https://funpay.com/",
+        }
 
 
 def _client_with_admin(admin) -> FunPayClient:
@@ -123,19 +137,111 @@ def _client_with_admin(admin) -> FunPayClient:
 
 
 @pytest.mark.asyncio
-async def test_check_auth_true_when_authenticated():
+async def test_check_auth_authed_when_user_id_parsed():
     fp = _client_with_admin(_FakeAdmin(authed=True))
-    assert await fp.check_auth() is True
+    status, _reason = await fp.check_auth()
+    assert status == "authed"
 
 
 @pytest.mark.asyncio
-async def test_check_auth_false_when_login_page():
-    fp = _client_with_admin(_FakeAdmin(authed=False))
-    assert await fp.check_auth() is False
+async def test_check_auth_logged_out_only_with_login_marker():
+    """Явный маркер логина (форма/редирект) → точно разлогинены."""
+    fp = _client_with_admin(_FakeAdmin(authed=False, login_marker=True))
+    status, _reason = await fp.check_auth()
+    assert status == "logged_out"
 
 
 @pytest.mark.asyncio
-async def test_check_auth_true_on_network_error():
-    """Сетевой сбой whoami != «ключ протух» — не паникуем, возвращаем True."""
+async def test_check_auth_unknown_when_no_user_id_no_marker():
+    """user_id не распознан, но и маркера логина нет → unknown (не разлогин).
+
+    Это ядро фикса инцидента 2026-06-13: один whoami-fail при живой
+    сессии не должен трактоваться как протухший golden_key.
+    """
+    fp = _client_with_admin(_FakeAdmin(authed=False, login_marker=False))
+    status, _reason = await fp.check_auth()
+    assert status == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_check_auth_unknown_on_network_error():
+    """Сетевой сбой whoami != «ключ протух» — unknown, не паникуем."""
     fp = _client_with_admin(_FakeAdmin(authed=None, raise_exc=True))
-    assert await fp.check_auth() is True
+    status, _reason = await fp.check_auth()
+    assert status == "unknown"
+
+
+# ───────────── streak-механизм алерта (инцидент 2026-06-13) ─────────────
+
+class _RecordingTg:
+    """Записывает доставленные алерты, чтобы проверить, что и когда летит."""
+    def __init__(self):
+        self.errors: list[str] = []
+        self.infos: list[str] = []
+
+    async def error(self, text: str):
+        self.errors.append(text)
+
+    async def info(self, text: str):
+        self.infos.append(text)
+
+
+def _app_for_streak(confirm_failures: int = 2):
+    from src.main import App
+    app = App.__new__(App)  # минуем тяжёлый __init__ (get_settings/клиенты)
+    app.settings = _settings(
+        funpay_auth_watchdog_confirm_failures=confirm_failures,
+        funpay_auth_watchdog_alert_cooldown_seconds=3600,
+    )
+    app.tg = _RecordingTg()
+    app._funpay_auth_fail_streak = 0
+    app._last_golden_key_alert = None
+    return app
+
+
+@pytest.mark.asyncio
+async def test_single_auth_failure_does_not_alert():
+    """Один whoami-fail (streak 1 < порог 2) НЕ шлёт алерт — это и есть
+    фикс false positive: одиночный сбой при живой сессии молчит."""
+    app = _app_for_streak(confirm_failures=2)
+    await app._register_funpay_auth_failure(context="whoami: logged_out")
+    assert app._funpay_auth_fail_streak == 1
+    assert app.tg.errors == []
+    assert app._last_golden_key_alert is None
+
+
+@pytest.mark.asyncio
+async def test_two_confirmations_trigger_alert():
+    """Подтверждение из 2 источников/циклов → алерт «golden_key протух»."""
+    app = _app_for_streak(confirm_failures=2)
+    await app._register_funpay_auth_failure(context="whoami: logged_out")
+    await app._register_funpay_auth_failure(context="2 auth-ошибок в sync")
+    assert app._funpay_auth_fail_streak == 2
+    assert len(app.tg.errors) == 1
+    assert "golden_key" in app.tg.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_auth_ok_resets_streak_and_sends_recovery():
+    """Удачный авторизованный sync сбрасывает streak; если алертили —
+    летит «✅ восстановлено»."""
+    app = _app_for_streak(confirm_failures=2)
+    await app._register_funpay_auth_failure(context="x")
+    await app._register_funpay_auth_failure(context="y")
+    assert len(app.tg.errors) == 1  # был алерт
+
+    await app._register_funpay_auth_ok()
+    assert app._funpay_auth_fail_streak == 0
+    assert app._last_golden_key_alert is None
+    assert len(app.tg.infos) == 1
+    assert "восстановлена" in app.tg.infos[0]
+
+
+@pytest.mark.asyncio
+async def test_auth_ok_without_prior_alert_is_silent():
+    """Сброс streak без предшествующего алерта не шлёт «✅» (не флудим)."""
+    app = _app_for_streak(confirm_failures=2)
+    await app._register_funpay_auth_failure(context="single blip")
+    await app._register_funpay_auth_ok()  # streak был 1, алерта не было
+    assert app._funpay_auth_fail_streak == 0
+    assert app.tg.infos == []

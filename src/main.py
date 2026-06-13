@@ -84,6 +84,10 @@ class App:
         # Время последнего алерта о протухшем golden_key (анти-спам).
         # None = ещё не алертили / авторизация в норме.
         self._last_golden_key_alert: datetime | None = None
+        # Подряд-подтверждения «разлогинены» (whoami=logged_out + auth-ошибки
+        # sync). Сбрасывается любым удачным авторизованным sync. Алерт —
+        # только при streak >= confirm_failures (защита от false positive).
+        self._funpay_auth_fail_streak = 0
         # Время последнего алерта о расхождении цены (P0-4, анти-спам 1/час).
         self._last_price_mismatch_alert: datetime | None = None
 
@@ -525,15 +529,27 @@ class App:
                     await self.tg.error(f"Sync run упал: <code>{short}</code>")
                 return
 
-            # Протух golden_key: sync_once гасит FunPayAuthError в skip'ы и
-            # сообщает их числом auth_errors. Алертим сразу (не ждём
-            # 10-минутный watchdog), с тем же анти-спамом по кулдауну.
+            # golden_key: sync_once гасит FunPayAuthError в skip'ы и
+            # сообщает их числом auth_errors. Питаем общий streak-механизм
+            # (алерт только при подтверждении confirm_failures). При этом
+            # любой удачный авторизованный sync (FunPay-операции прошли,
+            # http.ok>0, auth_errors=0) СБРАСЫВАЕТ streak — это и чинит
+            # false positive whoami: реальные операции = доказательство
+            # живой сессии (инцидент 2026-06-13).
+            http_ok = int((result.get("http") or {}).get("ok", 0))
             if int(result.get("auth_errors", 0)) > 0:
                 logger.error(
                     f"Sync: {result['auth_errors']} лот(ов) пропущено из-за "
                     f"auth-ошибки FunPay (golden_key)"
                 )
-                await self._alert_golden_key_expired(context="ошибки авторизации в sync")
+                await self._register_funpay_auth_failure(
+                    context=f"{result['auth_errors']} auth-ошибок в sync"
+                )
+            elif http_ok > 0 and (
+                self._funpay_auth_fail_streak > 0
+                or self._last_golden_key_alert is not None
+            ):
+                await self._register_funpay_auth_ok()
 
             # P0-4: цена на FunPay разошлась с последней записанной — признак
             # неприменённого save_lot / ручной правки. Сигнал, не фикс
@@ -780,36 +796,68 @@ class App:
         except Exception as exc:
             logger.warning(f"price mismatch alert не доставлен: {exc}")
 
+    async def _register_funpay_auth_ok(self) -> None:
+        """
+        Зафиксировать, что FunPay-авторизация в норме (whoami=authed ИЛИ
+        удачный авторизованный sync). Сбрасывает streak; если до этого был
+        алерт — шлёт «✅ восстановлено».
+        """
+        had_alerted = self._last_golden_key_alert is not None
+        self._funpay_auth_fail_streak = 0
+        self._last_golden_key_alert = None
+        if had_alerted and self.tg is not None:
+            try:
+                await self.tg.info(
+                    "✅ <b>FunPay golden_key снова валиден</b> — "
+                    "авторизация восстановлена."
+                )
+            except Exception as exc:
+                logger.warning(f"golden_key recover alert не доставлен: {exc}")
+
+    async def _register_funpay_auth_failure(self, *, context: str) -> None:
+        """
+        Зафиксировать подтверждение «разлогинены» (whoami=logged_out или
+        auth-ошибки sync). Алертит ТОЛЬКО когда streak достиг порога
+        confirm_failures — одиночный сбой при живой сессии не триггерит.
+        """
+        self._funpay_auth_fail_streak += 1
+        threshold = int(self.settings.funpay_auth_watchdog_confirm_failures)
+        logger.warning(
+            f"FunPay auth-fail подтверждение "
+            f"{self._funpay_auth_fail_streak}/{threshold}: {context}"
+        )
+        if self._funpay_auth_fail_streak >= threshold:
+            await self._alert_golden_key_expired(
+                context=f"{context} (подтверждено ×{self._funpay_auth_fail_streak})"
+            )
+
     async def _funpay_auth_watchdog(self) -> None:
         """
-        Периодически проверяет, жив ли golden_key (один лёгкий whoami).
+        Периодически проверяет состояние golden_key (один лёгкий whoami).
 
-        При потере авторизации — алерт с инструкцией (анти-спам внутри
-        _alert_golden_key_expired). При восстановлении — сбрасываем
-        кулдаун и шлём «✅», если до этого алертили.
+        authed → сброс streak (+ «✅», если алертили). logged_out → +1 к
+        streak (алерт только на пороге). unknown (транзиент/parse/сеть) →
+        НИЧЕГО не делаем: это и был источник false positive (инцидент
+        2026-06-13) — нельзя считать неопределённость за разлогин.
         """
         if self.fp is None:
             return
         try:
-            authed = await self.fp.check_auth()
+            status, reason = await self.fp.check_auth()
         except Exception as exc:
             logger.debug(f"funpay auth watchdog: check_auth упал: {exc}")
             return
 
-        if authed:
-            if self._last_golden_key_alert is not None and self.tg is not None:
-                try:
-                    await self.tg.info(
-                        "✅ <b>FunPay golden_key снова валиден</b> — "
-                        "авторизация восстановлена."
-                    )
-                except Exception as exc:
-                    logger.warning(f"golden_key recover alert не доставлен: {exc}")
-            self._last_golden_key_alert = None
-            return
-
-        logger.error("funpay auth watchdog: golden_key невалиден (whoami: не авторизован)")
-        await self._alert_golden_key_expired(context="плановая проверка whoami")
+        if status == "authed":
+            await self._register_funpay_auth_ok()
+        elif status == "logged_out":
+            logger.error(f"funpay auth watchdog: whoami=logged_out — {reason}")
+            await self._register_funpay_auth_failure(context=f"whoami: {reason}")
+        else:  # unknown
+            logger.debug(
+                f"funpay auth watchdog: whoami неопределён ({reason}) — "
+                f"НЕ считаю за разлогин (транзиент)"
+            )
 
     # ---------- FunPay events ----------
 

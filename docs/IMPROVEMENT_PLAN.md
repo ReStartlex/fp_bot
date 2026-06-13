@@ -113,6 +113,20 @@ FunPay-запросов; в логах `Sync done ... http=[... r429=0 ...]` в 
 
 ### [x] P0-3. Нет проактивного watchdog'а протухания golden_key — DONE (`8df7aad`)
 
+**Follow-up (инцидент 2026-06-13, `<pending>`): устранён false positive.**
+После деплоя watchdog прислал «golden_key протух» по ОДНОМУ whoami-fail,
+хотя рядом save_lot/sync работали авторизованно. Причины две: (1) `whoami`
+не отличал «точно разлогинены» (форма/редирект `/account/login`) от «не
+смогли распарсить user_id» (транзиент/смена вёрстки) — теперь отдаёт
+явный `login_marker`; (2) алерт летел с первого же сбоя. Исправлено:
+`check_auth()` → `(status, reason)` где status ∈ `authed`/`logged_out`/
+`unknown` (unknown НЕ трактуется как разлогин); streak-механизм
+`_register_funpay_auth_failure/_ok` — алерт только при
+`FUNPAY_AUTH_WATCHDOG_CONFIRM_FAILURES` (default 2) подтверждениях из
+разных источников/циклов, любой удачный авторизованный sync (http.ok>0,
+auth_errors=0) сбрасывает streak. Тесты: +5 в test_funpay_auth_watchdog.py
+(трёхзначный check_auth + streak-порог + recovery). 1110 зелёных.
+
 Сделано: job `_funpay_auth_watchdog` (каждые 600с, `FUNPAY_AUTH_WATCHDOG_*`)
 дёргает `FunPayClient.check_auth()` (whoami) → при потере авторизации алерт
 с инструкцией обновить golden_key (анти-спам по кулдауну, по умолчанию 1ч),

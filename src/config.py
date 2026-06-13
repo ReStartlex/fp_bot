@@ -416,6 +416,13 @@ class Settings(BaseSettings):
     funpay_auth_watchdog_alert_cooldown_seconds: int = Field(
         default=3600, ge=300, le=86400
     )
+    # Сколько подряд подтверждений «разлогинены» нужно до алерта. Защита
+    # от false positive: одиночный whoami-fail при живой сессии (рядом
+    # sync/save_lot работают) НЕ должен слать «golden_key протух». Streak
+    # инкрементят whoami=logged_out и auth-ошибки sync, а сбрасывает любой
+    # удачный авторизованный sync. 2 = нужно подтверждение из 2 источников/
+    # циклов (инцидент 2026-06-13).
+    funpay_auth_watchdog_confirm_failures: int = Field(default=2, ge=1, le=10)
 
     @field_validator("ns_api_secret")
     @classmethod

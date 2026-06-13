@@ -786,23 +786,39 @@ class FunPayClient:
             return {"ok": 0, "retry_429": 0, "retry_5xx": 0, "exhausted": 0}
         return cached.get_and_reset_http_metrics()
 
-    async def check_auth(self) -> bool:
+    async def check_auth(self) -> tuple[str, str]:
         """
-        Жив ли golden_key прямо сейчас. Делает один лёгкий GET главной
-        страницы FunPay (whoami) и смотрит, распарсился ли наш user_id.
+        Состояние авторизации golden_key прямо сейчас (один GET whoami).
 
-        Используется golden_key-watchdog'ом (src/main.py): при инвалидации
-        ключа FunPay отдаёт страницу логина → user_id не парсится →
-        authenticated=False. Не бросает наружу — на сетевой ошибке
-        возвращает True (не паникуем на «моргание сети», только на
-        явную потерю авторизации).
+        Возвращает (status, reason), status ∈:
+          * "authed"      — распарсили свой user_id (точно авторизованы);
+          * "logged_out"  — на странице маркеры логина (форма/редирект
+                            /account/login) → точно разлогинены;
+          * "unknown"     — ни то, ни другое (транзиент / смена вёрстки /
+                            сетевой сбой). НЕ трактуем как разлогин —
+                            иначе watchdog даёт false positive (инцидент
+                            2026-06-13: один whoami-fail при живой сессии,
+                            рядом save_lot/sync работали авторизованно).
+
+        Никогда не бросает наружу. reason — короткая диагностика для алерта.
         """
         try:
             me = await self._admin.whoami()
         except Exception as exc:
-            logger.debug(f"check_auth: whoami упал (трактую как 'не знаю'): {exc}")
-            return True
-        return bool(me.get("authenticated"))
+            return ("unknown", f"whoami упал: {type(exc).__name__}: {exc}")
+        if me.get("authenticated"):
+            return ("authed", f"user_id={me.get('user_id')}")
+        if me.get("login_marker"):
+            return (
+                "logged_out",
+                f"страница логина (status={me.get('http_status')}, "
+                f"url={me.get('final_url')})",
+            )
+        return (
+            "unknown",
+            f"user_id не распознан без маркера логина "
+            f"(status={me.get('http_status')}, url={me.get('final_url')})",
+        )
 
     async def get_lot_fields(self, lot_id: int, node_id: int | None = None) -> Any:
         """
