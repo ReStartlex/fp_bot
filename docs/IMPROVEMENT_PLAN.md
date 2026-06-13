@@ -29,7 +29,7 @@ burst-симптом; вместе с quick-fix .env закрывает прод
 ОПАСНО chat/?node (бьёт по delivery).
 
 Под-этапы:
-- [x] **B1 — фундамент (`<pending>`):** колонка `Mapping.funpay_node_id`
+- [x] **B1 — фундамент (`3177bd7`):** колонка `Mapping.funpay_node_id`
   (nullable) + ALTER в `init_db` + параметр в `upsert_mapping`
   (None=не трогать, чтобы обычный upsert не затирал backfill).
   migrate/runner пишет node при создании. Backfill старых:
