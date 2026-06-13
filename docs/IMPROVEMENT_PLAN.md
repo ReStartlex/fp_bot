@@ -211,7 +211,7 @@ monkeypatch и зависимость, поднять requests/urllib3.
 
 ---
 
-### [x] P1-3. `datetime.utcnow()` → `datetime.now(UTC)` (36 вхождений) — DONE (`<pending>`)
+### [x] P1-3. `datetime.utcnow()` → `datetime.now(UTC)` (36 вхождений) — DONE (`e1c01b6`)
 
 Сделано: `src/timeutil.utcnow()` возвращает naive-UTC
 (`datetime.now(timezone.utc).replace(tzinfo=None)`) — точная семантика
