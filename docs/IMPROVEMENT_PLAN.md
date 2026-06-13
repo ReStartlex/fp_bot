@@ -40,7 +40,7 @@ burst-симптом; вместе с quick-fix .env закрывает прод
   **Деплой-чеклист B1:** после деплоя прогнать
   `python -m src.tools.backfill_node_ids --apply` на VPS (заполнит node
   для существующих ~110 лотов) — нужно ДО включения B3.
-- [x] **B2 — парсер (`<pending>`):** `list_node_offers` теперь возвращает
+- [x] **B2 — парсер (`3f12416`):** `list_node_offers` теперь возвращает
   `price` (float, из `tc-price[data-s]`, бывает дробной 439.04) и `amount`
   (int, `tc-amount`) — этого хватает для snapshot-сравнения с target.
   Реальная вёрстка прода зафиксирована фикстурами
