@@ -141,13 +141,26 @@ async def reap_zombie_lots_once(
     result = ReaperResult()
     max_per_run = settings.zombie_lot_reaper_max_per_run
 
-    # 1. Собираем кандидатов: disabled-маппинги с funpay_lot_id.
+    # 1. Собираем кандидатов: disabled-маппинги, которые МОГУТ быть
+    #    половинчато-выключенными зомби (на FunPay ещё active).
+    #
+    #    Фильтры (инцидент id=49 / удалённый лот 69932320):
+    #      * funpay_lot_id > 0 — отсекает sentinel-0 и мусорные строки
+    #        (GET lot 0 падает «обязателен node_id», GET удалённого —
+    #        бесконечно валится в errors);
+    #      * last_synced_active IS NOT 0 — если мы УЖЕ зафиксировали лот
+    #        неактивным (или он удалён), зомби нет, проверять незачем.
+    #        Настоящий зомби рождается из ПРОВАЛЕННОГО save_lot(active=False)
+    #        → last_synced НЕ обновился → остаётся 1/NULL → берём как раньше.
+    #      enabled=False оставляем: это и есть мишень reaper'а (НЕ менять
+    #      на enabled=True — иначе reaper перестанет чинить зомби).
     try:
         async with session_factory()() as session:
             stmt = (
                 select(Mapping)
                 .where(Mapping.enabled.is_(False))
-                .where(Mapping.funpay_lot_id.is_not(None))
+                .where(Mapping.funpay_lot_id > 0)
+                .where(Mapping.last_synced_active.isnot(False))
                 .order_by(Mapping.id)
                 .limit(max_per_run)
             )

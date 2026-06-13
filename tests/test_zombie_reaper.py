@@ -410,6 +410,72 @@ async def test_reap_notify_failure_does_not_break(db_factory):
     assert result.errors == 0
 
 
+async def test_reap_skips_lot_already_known_inactive(db_factory):
+    """
+    Фильтр кандидатов (инцидент id=49 / удалённый 69932320): disabled
+    mapping с last_synced_active=0 — мы УЖЕ знаем, что лот неактивен
+    (или удалён) → reaper его НЕ берёт (никакого GET). Раньше reaper
+    бесконечно GET'ил удалённый лот и копил errors.
+    """
+    from src.db.models import Mapping
+
+    settings = _settings()
+    async with db_factory() as s:
+        m = await upsert_mapping(
+            s, funpay_lot_id=69932320, ns_service_id=42,
+            enabled=False, label="Apple Gift Card | USA | 6 USD (deleted)",
+        )
+        m.last_synced_active = False  # знаем: неактивен/удалён
+        await s.commit()
+
+    fp = _FakeFP(fail_on_get={69932320})  # GET упал бы, если б его взяли
+    result = await reap_zombie_lots_once(funpay_client=fp, settings=settings)
+
+    assert result.checked == 0
+    assert result.errors == 0
+    assert fp.save_calls == []
+
+
+async def test_reap_skips_sentinel_lot_id_zero(db_factory):
+    """funpay_lot_id<=0 (sentinel/мусор) reaper не берёт — иначе GET lot 0
+    падает «обязателен node_id»."""
+    from src.db.models import Mapping
+
+    settings = _settings()
+    async with db_factory() as s:
+        m = await upsert_mapping(
+            s, funpay_lot_id=1, ns_service_id=42, enabled=False, label="junk",
+        )
+        # симулируем sentinel-строку (как пытался юзер на проде)
+        m.funpay_lot_id = 0
+        await s.commit()
+
+    fp = _FakeFP()
+    result = await reap_zombie_lots_once(funpay_client=fp, settings=settings)
+    assert result.checked == 0
+
+
+async def test_reap_still_catches_zombie_with_active_true_last_synced(db_factory):
+    """last_synced_active=1 (или NULL) НЕ отсекается: настоящий зомби
+    рождается из проваленного save(active=False) и остаётся active."""
+    from src.db.models import Mapping
+
+    settings = _settings()
+    async with db_factory() as s:
+        m = await upsert_mapping(
+            s, funpay_lot_id=200, ns_service_id=42,
+            enabled=False, label="real zombie",
+        )
+        m.last_synced_active = True
+        await s.commit()
+
+    fp = _FakeFP({200: _FakeLot(200, active=True, amount=50)})
+    result = await reap_zombie_lots_once(funpay_client=fp, settings=settings)
+    assert result.checked == 1
+    assert result.deactivated == 1
+    assert fp.save_calls == [(200, False, 50)]
+
+
 def test_reaper_result_reaped_property():
     """Свойство reaped: True если есть deactivated."""
     assert ReaperResult(deactivated=1).reaped is True

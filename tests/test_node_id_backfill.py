@@ -85,3 +85,23 @@ async def test_list_mappings_missing_node_id(session):
 
     missing = await list_mappings_missing_node_id(session)
     assert {m.funpay_lot_id for m in missing} == {2, 3}
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_disabled_and_sentinel(session):
+    """backfill не должен ходить в disabled/удалённые/служебные строки
+    (инцидент id=49 / удалённый 69932320, sentinel lot_id=0)."""
+    await upsert_mapping(session, funpay_lot_id=10, ns_service_id=10)  # enabled, без node
+    await upsert_mapping(
+        session, funpay_lot_id=11, ns_service_id=11, enabled=False
+    )  # disabled — пропустить
+    m = await upsert_mapping(session, funpay_lot_id=12, ns_service_id=12)
+    m.funpay_lot_id = 0  # sentinel — пропустить
+    await session.commit()
+
+    missing = await list_mappings_missing_node_id(session)
+    assert {m.funpay_lot_id for m in missing} == {10}
+
+    # only_enabled=False всё равно отсекает sentinel lot_id<=0
+    incl_disabled = await list_mappings_missing_node_id(session, only_enabled=False)
+    assert {m.funpay_lot_id for m in incl_disabled} == {10, 11}

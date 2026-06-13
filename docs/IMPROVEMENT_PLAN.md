@@ -526,6 +526,23 @@ FunPayAPI-резерв: admin_http исчерпал 3 попытки с «Обн
 Резерв FunPayAPI в send_message трогать НЕ будем, пока admin_http не
 подтвердит primary-доставку на проде (acceptance этапа 2 P1-2).
 
+### zombie_reaper долбил удалённый лот (id=49 / 69932320, `<pending>`)
+
+Всплыло при backfill node_id (B1): удалённый вручную FunPay-лот
+69932320 (disabled mapping id=49, last_synced_active=0) бесконечно
+брался zombie_reaper'ом → GET падал → копились errors. Попытка sentinel
+funpay_lot_id=0 дала «GET lot 0: обязателен node_id».
+
+Фикс фильтра кандидатов reaper'а (НЕ `enabled=1` — это убило бы саму
+ловлю зомби!): `enabled=False AND funpay_lot_id > 0 AND
+last_synced_active IS NOT 0`. last_synced_active=0 = мы уже знаем лот
+неактивным/удалённым → зомби нет. Настоящий зомби (проваленный
+save(active=False)) имеет last_synced_active 1/NULL → берётся как раньше.
+Аналогично `backfill_node_ids` теперь пропускает disabled и
+funpay_lot_id<=0 (`list_mappings_missing_node_id`). Тесты: +4. 1130
+зелёных. ОСТАЁТСЯ (B2/B3): надёжное детектирование «лот удалён» по
+ответу FunPay (404/parse) для лотов с last_synced_active≠0.
+
 ## Что НЕ трогать (работает, проверено в этой итерации)
 
 - Деактивация лотов (active-only + verify-after-save) — починено `2d90d01`.

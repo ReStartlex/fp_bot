@@ -100,13 +100,26 @@ async def set_mapping_node_id(
 
 async def list_mappings_missing_node_id(
     session: AsyncSession,
+    *,
+    only_enabled: bool = True,
 ) -> list[Mapping]:
-    """Маппинги без funpay_node_id (кандидаты на backfill)."""
-    res = await session.execute(
+    """
+    Маппинги без funpay_node_id — кандидаты на backfill (P0-1 Фаза B).
+
+    По умолчанию ходим ТОЛЬКО за enabled-лотами с реальным funpay_lot_id>0:
+    disabled/удалённые/служебные строки (sentinel lot_id=0, удалённый на
+    FunPay лот) backfill'ить не нужно — snapshot-sync их не синхронизирует,
+    а GET по ним падает (инцидент id=49 / 69932320).
+    """
+    stmt = (
         select(Mapping)
         .where(Mapping.funpay_node_id.is_(None))
+        .where(Mapping.funpay_lot_id > 0)
         .order_by(Mapping.funpay_lot_id)
     )
+    if only_enabled:
+        stmt = stmt.where(Mapping.enabled.is_(True))
+    res = await session.execute(stmt)
     return list(res.scalars().all())
 
 
