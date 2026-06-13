@@ -38,6 +38,7 @@ async def db_factory(monkeypatch):
     factory = async_sessionmaker(engine, expire_on_commit=False)
     monkeypatch.setattr("src.orders.processor.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.resolve.session_factory", lambda: factory)
+    monkeypatch.setattr("src.orders.stages.holds.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.reconciler.session_factory", lambda: factory)
     proc._order_locks.clear()
     yield factory

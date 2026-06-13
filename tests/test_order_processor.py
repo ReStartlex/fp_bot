@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from src.config import Settings
@@ -49,6 +50,7 @@ async def db_session_factory(monkeypatch):
     # processor.session_factory() возвращает фабрику; подменяем модульно
     monkeypatch.setattr("src.orders.processor.session_factory", lambda: factory)
     monkeypatch.setattr("src.orders.stages.resolve.session_factory", lambda: factory)
+    monkeypatch.setattr("src.orders.stages.holds.session_factory", lambda: factory)
 
     # Чистим in-memory locks между тестами
     proc._order_locks.clear()
@@ -760,7 +762,7 @@ async def test_delivery_failure_keeps_pins_ready_for_retry(
     async with db_session_factory() as s:
         mapping = (
             await s.execute(
-                proc.select(Mapping).where(Mapping.funpay_lot_id == 69300023)
+                select(Mapping).where(Mapping.funpay_lot_id == 69300023)
             )
         ).scalar_one()
         assert mapping.enabled is False
@@ -943,7 +945,7 @@ async def test_order_failure_disables_lot_before_more_buyers(
     async with db_session_factory() as s:
         mapping = (
             await s.execute(
-                proc.select(Mapping).where(Mapping.funpay_lot_id == 69300023)
+                select(Mapping).where(Mapping.funpay_lot_id == 69300023)
             )
         ).scalar_one()
         assert mapping.enabled is False
