@@ -84,6 +84,8 @@ class App:
         # Время последнего алерта о протухшем golden_key (анти-спам).
         # None = ещё не алертили / авторизация в норме.
         self._last_golden_key_alert: datetime | None = None
+        # Время последнего алерта о расхождении цены (P0-4, анти-спам 1/час).
+        self._last_price_mismatch_alert: datetime | None = None
 
     # ---------- Lifecycle ----------
 
@@ -533,6 +535,13 @@ class App:
                 )
                 await self._alert_golden_key_expired(context="ошибки авторизации в sync")
 
+            # P0-4: цена на FunPay разошлась с последней записанной — признак
+            # неприменённого save_lot / ручной правки. Сигнал, не фикс
+            # (sync сам выровняет на этом же цикле). Анти-спам 1/час.
+            mismatches = int(result.get("price_mismatches", 0))
+            if mismatches > 0:
+                await self._alert_price_mismatch(count=mismatches)
+
             # Visibility: если retry-логика FunPay-клиента не справилась
             # (429 повторялся пока budget не кончился), часть лотов в этом
             # цикле НЕ обновилась. Один такой случай — это «плохая минута»,
@@ -740,6 +749,36 @@ class App:
             )
         except Exception as exc:
             logger.warning(f"golden_key alert не доставлен: {exc}")
+
+    async def _alert_price_mismatch(self, *, count: int) -> None:
+        """
+        WARNING-алерт о расхождении цены FunPay vs last_synced (P0-4).
+
+        Это наблюдаемость, не критическая ошибка: sync на этом же цикле
+        перезапишет цену. Но устойчивое расхождение значит, что save_lot
+        «успешно» не применяется (контракт FunPay изменился) ИЛИ кто-то
+        правит цены вручную. Анти-спам: не чаще раза в час.
+        """
+        if self.tg is None:
+            return
+        now = datetime.now()
+        if (
+            self._last_price_mismatch_alert is not None
+            and now - self._last_price_mismatch_alert < timedelta(hours=1)
+        ):
+            return
+        self._last_price_mismatch_alert = now
+        try:
+            await self.tg.warning(
+                f"⚠ <b>Расхождение цены на FunPay</b> ({count} лот(ов))\n"
+                f"Текущая цена на FunPay отличается от последней, которую "
+                f"выставил бот. Sync выровняет её на этом же цикле, но если "
+                f"повторяется — возможно, save_lot не применяется (изменился "
+                f"контракт FunPay) или цены правят вручную.\n"
+                f"Детали — построчно в логах (grep «разошлась с последней»)."
+            )
+        except Exception as exc:
+            logger.warning(f"price mismatch alert не доставлен: {exc}")
 
     async def _funpay_auth_watchdog(self) -> None:
         """

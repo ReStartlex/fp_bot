@@ -56,6 +56,10 @@ class LotSyncDecision:
     # (FunPayAuthError). Используется sync_once для агрегата auth_errors
     # → немедленный алерт оператору из _safe_sync.
     auth_error: bool = False
+    # True, если текущая цена на FunPay существенно разошлась с последней
+    # записанной нами (last_synced_price): признак, что прошлый save_lot
+    # не применился ИЛИ цену сменили вручную. См. P0-4 — сигнал, не фикс.
+    price_mismatch: bool = False
 
 
 def _flatten_services(stock: StockResponse) -> dict[int, Service]:
@@ -185,6 +189,30 @@ async def _decide_for_one(
     current_stock = _extract_stock(lot_fields)
     current_active = _extract_active(lot_fields)
 
+    # P0-4: verify, что наш прошлый write реально применился. last_synced_price
+    # — цена, которую мы записали в прошлый раз (обновляется только на
+    # успешном save_lot / verified-no-action). Если текущая цена на FunPay
+    # существенно отличается — save «успешно» не применился, либо цену
+    # сменили вручную. Это НЕ ошибка sync'а текущего цикла (его мы сделаем
+    # как обычно), а сигнал оператору. Порог 1% > рантайм-округлений.
+    price_mismatch = False
+    last_synced_price = getattr(mapping, "last_synced_price", None)
+    if (
+        last_synced_price is not None
+        and current_price is not None
+        and current_price > 0
+        and float(last_synced_price) > 0
+    ):
+        rel = abs(current_price - float(last_synced_price)) / float(last_synced_price)
+        if rel > 0.01:
+            price_mismatch = True
+            logger.warning(
+                f"  [{mapping.label or mapping.funpay_lot_id}] цена на FunPay "
+                f"({current_price}) разошлась с последней записанной "
+                f"({last_synced_price}) на {rel * 100:.1f}% — прошлый save_lot "
+                f"мог не примениться (или цену сменили вручную)"
+            )
+
     risk_reason = _risk_skip_reason(
         target=target, current_price=current_price, settings=settings
     )
@@ -225,6 +253,7 @@ async def _decide_for_one(
         will_update_stock=will_update_stock,
         will_activate=will_activate,
         will_deactivate=will_deactivate,
+        price_mismatch=price_mismatch,
     )
 
 
@@ -500,6 +529,9 @@ async def sync_once(
     # Сколько лотов пропущено из-за протухшего golden_key (FunPayAuthError).
     # >0 → _safe_sync шлёт немедленный алерт «обнови golden_key».
     auth_errors = 0
+    # Сколько лотов с расхождением цены FunPay vs last_synced (P0-4):
+    # признак неприменённого save_lot / ручной правки. >0 → WARNING-алерт.
+    price_mismatches = 0
     error: str | None = None
     # Маппинги, которые нужно обновить last_synced_* после успешного цикла
     # (только те, для которых _apply_decision прошёл без исключения).
@@ -619,6 +651,8 @@ async def sync_once(
 
         for decision in decisions:
             lots_checked += 1
+            if decision.price_mismatch:
+                price_mismatches += 1
             actions = []
             if decision.will_update_price:
                 actions.append(
@@ -807,5 +841,6 @@ async def sync_once(
         "skipped": lots_skipped,
         "capped": lots_capped,
         "auth_errors": auth_errors,
+        "price_mismatches": price_mismatches,
         "http": http_metrics,
     }

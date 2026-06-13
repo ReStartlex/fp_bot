@@ -93,7 +93,7 @@ FunPay-запросов; в логах `Sync done ... http=[... r429=0 ...]` в 
 
 ---
 
-### [x] P0-3. Нет проактивного watchdog'а протухания golden_key — DONE (`<pending>`)
+### [x] P0-3. Нет проактивного watchdog'а протухания golden_key — DONE (`8df7aad`)
 
 Сделано: job `_funpay_auth_watchdog` (каждые 600с, `FUNPAY_AUTH_WATCHDOG_*`)
 дёргает `FunPayClient.check_auth()` (whoami) → при потере авторизации алерт
@@ -123,7 +123,13 @@ FunPay-запросов; в логах `Sync done ... http=[... r429=0 ...]` в 
 
 ---
 
-### [ ] P0-4. Цены/сток: верификация записей не покрывает price/stock
+### [x] P0-4. Цены/сток: верификация записей не покрывает price/stock — DONE (`<pending>`)
+
+Сделано (дёшево, без extra GET): `_decide_for_one` сравнивает текущую цену
+FunPay с `last_synced_price` (что бот записал в прошлый раз); расхождение
+>1% → `decision.price_mismatch` + WARNING-строка в лог. `sync_once` агрегирует
+`result["price_mismatches"]`, `_safe_sync` шлёт WARNING-алерт (анти-спам 1/час).
+Тесты `tests/test_sync_price_mismatch.py` (3). 1093 зелёных.
 
 **Проблема.** Verify-after-save сделан только для деактивации
 (`stock_sync._apply_decision`). Запись цены/стока верит ответу offerSave.
