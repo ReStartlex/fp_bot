@@ -388,26 +388,50 @@ async def _finalize_failure(
         await mark_order_failed(session, order_id=order_id, error=error)
         await session.commit()
 
+    # P1-5: возврат средств покупателю — денежная операция. Если упал,
+    # НЕ молчим (раньше только log): покупателю нельзя писать «средства
+    # возвращены», а оператор обязан вернуть вручную. refund идемпотентен,
+    # так что повторный вызов/ручной возврат безопасны.
+    refund_ok = True
     try:
         async with session_factory()() as session:
             await refund_failed_order(session, order_id=order_id)
             await session.commit()
     except Exception as exc:
+        refund_ok = False
         log.opt(exception=exc).error(f"refund упал: {exc}")
+        if notify_owner is not None:
+            try:
+                await notify_owner(
+                    f"🚨 <b>REFUND FAILED</b> для shop order #{order_id}\n"
+                    f"Возврат средств покупателю НЕ выполнен: "
+                    f"<code>{str(exc)[:300]}</code>\n"
+                    f"Верни баланс вручную — иначе покупатель потерял деньги."
+                )
+            except Exception as exc2:
+                log.warning(f"refund-fail alert владельцу не доставлен: {exc2}")
 
     async with session_factory()() as session:
         order = await get_shop_order(session, order_id)
 
     if notify_buyer is not None and order is not None:
+        # Про возврат пишем покупателю только если он реально прошёл —
+        # иначе «средства возвращены» было бы ложью (см. P1-5).
+        refund_line = (
+            "💰 Средства возвращены на баланс. "
+            "Можешь попробовать заказать снова или выбрать другой "
+            "номинал/регион."
+            if refund_ok
+            else "⏳ Возврат средств обрабатывается оператором — "
+            "напиши в 🆘 Поддержку, если баланс не вернётся в ближайшее время."
+        )
         try:
             await notify_buyer(
                 order.user_id,
                 "❌ <b>Заказ не выполнен</b>\n\n"
                 f"#<code>{order.id}</code> · {order.ns_service_name}\n\n"
                 f"<i>Причина: {error[:200]}</i>\n\n"
-                f"💰 Средства возвращены на баланс. "
-                "Можешь попробовать заказать снова или выбрать другой "
-                "номинал/регион.",
+                f"{refund_line}",
             )
         except Exception as exc:
             log.warning(f"notify_buyer (fail) упал: {exc}")

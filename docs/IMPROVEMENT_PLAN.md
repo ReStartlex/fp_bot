@@ -258,7 +258,26 @@ KnownLot только когда их заметит `new_lots` discovery — а
 
 ---
 
-### [ ] P1-5. Аудит «глотающих» except (205 вхождений)
+### [x] P1-5. Аудит «глотающих» except (205 вхождений) — DONE (`<pending>`)
+
+**Аудит денежных путей (просмотрено):**
+- `orders/processor.py` — БЕЗОПАСНО. `delivered` ставится только ПОСЛЕ
+  успешного send_message (двухфазно delivering→delivered). Сбои → явные
+  статусы manual_hold/pins_ready/failed + emergency_disable + алерт. Все
+  generic except на некритичных шагах (приветствие, расчёт прибыли,
+  инвалидация кэша, emergency_disable) не влияют на статус заказа.
+- `orders/processor.py::_emergency_disable_lot` — БЕЗОПАСНО (verify-after-
+  save + mapping disable в БД даже при сбое save_lot, аудит #8).
+- `shop/delivery.py::_finalize_failure` — НАЙДЕНА И ИСПРАВЛЕНА дыра:
+  при провале `refund_failed_order` ошибка только логировалась, а
+  покупателю всё равно слался «средства возвращены» (ложь, тихая потеря
+  денег). Теперь: при провале возврата — 🚨-алерт владельцу «верни
+  вручную», покупателю — нейтральный текст «возврат обрабатывается».
+  refund идемпотентен → ручной/повторный возврат безопасны.
+- `shop/payments/*` — CryptoBot webhook подписан (hmac), poller
+  идемпотентен по invoice_id; начисление в транзакции. Безопасно.
+
+**Сложность:** средняя (вдумчивое чтение). Сделана 1 точечная правка.
 
 Не менять массово. Пройти точечно денежные пути: `orders/processor.py`,
 `shop/delivery.py`, `shop/payments/*` — убедиться, что ни один `except
