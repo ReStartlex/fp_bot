@@ -34,6 +34,7 @@ from fastapi import (
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from src.api.ratelimit import auth_rate_limit
 from src.api.telegram_login import LoginAuthError, verify_login_widget
 from src.api.webapp_auth import WebAppAuthError, verify_init_data
 from src.api.web_session import (
@@ -247,7 +248,10 @@ async def _build_me(user: ShopUser, settings: Settings) -> dict[str, Any]:
 # ─── Endpoints ─────────────────────────────────────────────────────
 
 
-@router.post("/auth/telegram", response_model=LoginResponse)
+@router.post(
+    "/auth/telegram", response_model=LoginResponse,
+    dependencies=[Depends(auth_rate_limit)],
+)
 async def auth_telegram(
     response: Response,
     payload: dict[str, Any] = Body(...),
@@ -301,7 +305,10 @@ async def auth_telegram(
     return LoginResponse(token=token, **me)
 
 
-@router.post("/auth/webapp", response_model=LoginResponse)
+@router.post(
+    "/auth/webapp", response_model=LoginResponse,
+    dependencies=[Depends(auth_rate_limit)],
+)
 async def auth_webapp(
     response: Response,
     body: WebAppAuthRequest,
@@ -352,7 +359,10 @@ async def auth_webapp(
     return LoginResponse(token=token, **me)
 
 
-@router.post("/auth/oauth", response_model=LoginResponse)
+@router.post(
+    "/auth/oauth", response_model=LoginResponse,
+    dependencies=[Depends(auth_rate_limit)],
+)
 async def auth_oauth(
     response: Response,
     body: OAuthLoginRequest,

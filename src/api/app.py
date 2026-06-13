@@ -48,6 +48,10 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan,
     )
+    # P2-6: in-memory rate-limiter для auth-ручек. Свой на каждое
+    # приложение (на app.state) — тесты не пересекаются.
+    from src.api.ratelimit import InMemoryRateLimiter
+    app.state.rate_limiter = InMemoryRateLimiter()
     if WEB_DIR.exists():
         app.mount("/static", StaticFiles(directory=WEB_DIR / "static"), name="static")
 

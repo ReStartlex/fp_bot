@@ -352,7 +352,14 @@ ambiguous_matches, r429, exhausted, deactivations) и показывать в
 
 **Приёмка.** `/status` показывает счётчики за сегодня/вчера.
 
-### [ ] P2-6. Rate-limit на вход site-API
+### [x] P2-6. Rate-limit на вход site-API — DONE (`<pending>`)
+
+Сделано: `src/api/ratelimit.py` — InMemoryRateLimiter (скользящее окно
+per-key `path:ip`, IP из X-Forwarded-For), dependency `auth_rate_limit`
+на `/auth/telegram|webapp|oauth`. Лимитер на `app.state` (тесты не
+пересекаются). Настройки `SITE_AUTH_RATE_LIMIT` (10), `SITE_AUTH_RATE_
+WINDOW_SECONDS` (60), 0=выкл. > N/мин с IP → 429. Тесты
+`tests/test_api_ratelimit.py` (3). 1105 зелёных.
 
 `src/api/site_router.py` — публичные эндпоинты логина (Google/Yandex/
 Telegram initData). Проверить и добавить простейший rate-limit

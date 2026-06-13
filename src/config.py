@@ -200,6 +200,10 @@ class Settings(BaseSettings):
     # secure-флаг cookie. В проде (https neurodrop.ru) обязателен True;
     # для локальной разработки/тестов по http выставляй False.
     site_cookie_secure: bool = True
+    # P2-6: rate-limit auth-ручек сайта (брутфорс-барьер). Лимит запросов
+    # с одного IP на ручку за окно. 0 = выключено.
+    site_auth_rate_limit: int = Field(default=10, ge=0, le=1000)
+    site_auth_rate_window_seconds: int = Field(default=60, ge=1, le=3600)
     # Максимальный возраст data из Telegram Login Widget (anti-replay).
     # После верификации мы выдаём свою долгоживущую сессию, поэтому само
     # окно логина можно держать коротким — 1 час.
