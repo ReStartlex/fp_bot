@@ -844,6 +844,26 @@ class FunPayClient:
             )
             raise
 
+    async def list_node_offers(self, node_id: int) -> list[dict[str, Any]]:
+        """
+        Снимок офферов раздела (node) с trade-страницы: offer_id, title,
+        active, price (float ₽), amount (int). P0-1 Фаза B (snapshot-sync):
+        ОДИН GET на ноду вместо N per-lot offerEdit.
+
+        На 429-исчерпании / сетевом сбое — пробрасывает исключение (это
+        сигнал деградации FunPay для детектора в sync_once, НЕ пустой
+        список). FunPayAuthError — протух golden_key.
+        """
+        from src.funpay.admin_http import FunPayAuthError
+        try:
+            return await self._admin.list_node_offers(node_id)
+        except FunPayAuthError as exc:
+            logger.error(
+                f"FunPay list_node_offers(node={node_id}) auth-error: {exc}. "
+                f"Обнови FUNPAY_GOLDEN_KEY в .env."
+            )
+            raise
+
     @staticmethod
     def _looks_like_session_expired(exc: BaseException) -> bool:
         """

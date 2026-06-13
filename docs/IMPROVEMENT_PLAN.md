@@ -52,14 +52,24 @@ burst-симптом; вместе с quick-fix .env закрывает прод
   Решения о ДЕАКТИВАЦИИ на snapshot НЕ опираются — B3 верифицирует
   деактивацию отдельным per-lot GET (их мало). Если у ноды появятся
   снятые лоты с иным маркером — добрать фикстуру.
-- [ ] **B3 — новый цикл + детектор деградации:** sync_once группирует по
-  node, 1 snapshot-GET на ноду, offerEdit+save_lot ТОЛЬКО для
-  изменившихся; маппинги без node → fallback per-lot. ДЕТЕКТОР: отличать
-  «мы долбим offerEdit» (структурно лечит snapshot) от «FunPay лежит»
-  (snapshot-GET сам 429-ит / устойчивые 429 по всем эндпоинтам) →
-  глобальный backoff, который НЕ мешает chat/delivery и не добивает
-  FunPay. Стратегия стока (snapshot не видит сток): редкий полный проход
-  раз в N циклов + GET только лотов с продажами (invalidate-hook).
+- [x] **B3 — новый цикл + детектор деградации (`<pending>`, за флагом):**
+  В `sync_once` при diff-cache MISS вместо per-lot offerEdit GET сверяемся
+  со snapshot ноды (`_snapshot_in_sync`): цена (в пределах порога) + сток
+  совпали → per-lot GET ПРОПУЩЕН, last_synced переоткалиброван (snapshot —
+  реальная проверка FunPay). Сток ВИДЕН в snapshot (`tc-amount`), поэтому
+  отдельный «полный проход по стоку» НЕ нужен (отклонение от исходного ТЗ
+  в плюс). Маппинги без node / неопределённость / деактивация → fallback
+  per-lot. ДЕТЕКТОР деградации: snapshot-GET сам падает/429 на ≥
+  `SYNC_SNAPSHOT_DEGRADED_NODE_THRESHOLD` (default 2) нодах → `degraded`,
+  апдейты цен/стока пропускаются весь цикл (бережём rate-budget для
+  chat/delivery), `_safe_sync` шлёт WARNING-алерт (анти-спам 1/час).
+  За флагом `SYNC_SNAPSHOT_MODE` (default OFF). `FunPayClient.list_node_offers`
+  пробрасывает исключение на 429-исчерпании (сигнал деградации, не пустой
+  список). Тесты `tests/test_sync_snapshot.py` (11: юнит in-sync + 4
+  интеграции). 1145 зелёных.
+  **Приёмка (на проде):** включить `SYNC_SNAPSHOT_MODE=true`, убедиться:
+  в логах `Sync done ... snapshot_synced=N`, daily_stats r429 падает,
+  автовыдача без регрессий. Откат = флаг в .env без редеплоя.
   Оригинальное ТЗ ниже сохранено.
 
 #### Оригинальное ТЗ P0-1 (для фазы B)

@@ -118,6 +118,18 @@ class Settings(BaseSettings):
     # сдвиг 0..jitter растягивает переоткалибровку по окну, убирая залп.
     # 0 = выключено. По умолчанию ~половина TTL.
     sync_stock_diff_cache_jitter_seconds: int = Field(default=60, ge=0, le=1800)
+    # P0-1 Фаза B (snapshot-sync). При diff-cache MISS вместо per-lot
+    # offerEdit GET сверяемся с ОДНИМ snapshot-GET на ноду
+    # (/lots/{node}/trade → цена+сток всех офферов). offerEdit+save_lot —
+    # только для реально изменившихся лотов. Главный источник 429
+    # (offerEdit) структурно схлопывается. Default OFF: включать на проде
+    # осознанно через .env, откат без редеплоя.
+    sync_snapshot_mode: bool = False
+    # Детектор деградации FunPay: если snapshot-GET сам 429-ит/падает на
+    # >= N нодах за цикл — это «FunPay лежит» (а не «мы долбим offerEdit»).
+    # Тогда апдейты цен/стока этого цикла ПРОПУСКАЕМ целиком, сохраняя
+    # rate-budget для chat/delivery и не добивая FunPay.
+    sync_snapshot_degraded_node_threshold: int = Field(default=2, ge=1, le=100)
     # Комиссия FunPay для оценки цены клиента: чисто справочно для /calc.
     # Не влияет на то, какую цену мы записываем (мы пишем цену продавца, FunPay
     # сам добавит комиссию). Реальная комиссия зависит от категории.

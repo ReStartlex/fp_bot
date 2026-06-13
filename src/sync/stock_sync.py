@@ -125,6 +125,45 @@ def _risk_skip_reason(
     return None
 
 
+def _snapshot_in_sync(
+    quick_target: PricingResult,
+    snap: dict[str, Any] | None,
+    settings: Settings,
+) -> bool:
+    """
+    P0-1 Фаза B: по snapshot-строке ноды решить, нужен ли per-lot
+    offerEdit GET. True = лот УЖЕ соответствует target → GET НЕ нужен.
+
+    trade-страница перечисляет только активные офферы (см. B2), поэтому:
+      * target неактивен (stock=0): in-sync ⟺ оффер ОТСУТСТВУЕТ в snapshot
+        (уже снят). Если присутствует — нужна деактивация (per-lot).
+      * target активен: оффер должен быть в snapshot И цена (в пределах
+        порога обновления) И сток совпадать с target. Иначе — per-lot.
+
+    Любая неопределённость (нет snapshot-строки при активном target, не
+    распарсилась цена/сток) → False = идём безопасным per-lot путём.
+    """
+    target_active = quick_target.stock > 0
+    if not target_active:
+        return snap is None
+    if snap is None:
+        return False
+    snap_price = snap.get("price")
+    snap_amount = snap.get("amount")
+    if snap_price is None or snap_amount is None:
+        return False
+    if int(snap_amount) != int(quick_target.stock):
+        return False
+    target_price = quick_target.round_price()
+    if target_price <= 0:
+        return False
+    # «в синке» = изменение цены НЕ превышает порог обновления (та же
+    # функция, что решает should_update в обычном пути).
+    return not should_update_price(
+        float(snap_price), target_price, settings.price_update_threshold_percent
+    )
+
+
 async def _decide_for_one(
     ns_service: Service | None,
     mapping: Any,
@@ -555,6 +594,11 @@ async def sync_once(
     # признак неприменённого save_lot / ручной правки. >0 → WARNING-алерт.
     price_mismatches = 0
     error: str | None = None
+    # P0-1 Фаза B: сколько лотов пропустили per-lot GET благодаря snapshot
+    # (вошли в lots_unchanged), и сигнал глобальной деградации FunPay.
+    lots_snapshot_synced = 0
+    snapshot_degraded = False
+    snapshot_failed_nodes = 0
     # Маппинги, которые нужно обновить last_synced_* после успешного цикла
     # (только те, для которых _apply_decision прошёл без исключения).
     pending_cache_updates: list[tuple[int, float, int, bool]] = []
@@ -614,9 +658,50 @@ async def sync_once(
         )
         cache_check_now = utcnow()  # фиксируем "now" для всех проверок цикла
 
+        # === P0-1 Фаза B: snapshot по нодам ===
+        # При diff-cache MISS вместо per-lot offerEdit GET сверяемся с ОДНИМ
+        # snapshot-GET на ноду (/lots/{node}/trade → цена+сток всех офферов).
+        # Детектор деградации: если snapshot-GET сам падает/429-ит на >=
+        # пороге нод — это «FunPay лежит», а не «мы долбим» → пропускаем
+        # апдейты цен/стока этот цикл (бережём rate-budget для chat/delivery).
+        snapshot_mode = bool(getattr(settings, "sync_snapshot_mode", False))
+        node_snapshots: dict[int, dict[int, dict[str, Any]]] = {}
+        if snapshot_mode:
+            node_ids = sorted(
+                {m.funpay_node_id for m in mappings if m.funpay_node_id}
+            )
+            for node_id in node_ids:
+                try:
+                    offers = await funpay_client.list_node_offers(node_id)
+                except FunPayAuthError:
+                    raise  # протух golden_key — общий обработчик ниже/в sync_once
+                except Exception as exc:  # noqa: BLE001
+                    snapshot_failed_nodes += 1
+                    logger.warning(
+                        f"  snapshot node {node_id}: GET упал "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+                    continue
+                node_snapshots[node_id] = {
+                    int(o["offer_id"]): o for o in offers if o.get("offer_id")
+                }
+            threshold = int(
+                getattr(settings, "sync_snapshot_degraded_node_threshold", 2)
+            )
+            if node_ids and snapshot_failed_nodes >= threshold:
+                snapshot_degraded = True
+                logger.warning(
+                    f"snapshot: FunPay деградирует "
+                    f"({snapshot_failed_nodes}/{len(node_ids)} нод 429/fail ≥ "
+                    f"порога {threshold}) — пропускаю апдейты цен/стока этот "
+                    f"цикл (берегу rate-budget для chat/delivery)"
+                )
+
         decisions: list[LotSyncDecision] = []
 
-        for mapping in mappings:
+        # При деградации не входим в цикл (decisions пуст → apply-loop и
+        # cache-write ниже сами no-op'ят, finally→finish_sync_run отработает).
+        for mapping in (mappings if not snapshot_degraded else []):
             ns_service = services_index.get(mapping.ns_service_id)
             if ns_service is not None:
                 reserved = reserved_by_service.get(mapping.ns_service_id, 0)
@@ -625,10 +710,9 @@ async def sync_once(
                     ns_service, settings.sync_min_ns_stock_to_sell
                 )
 
-            # === Diff-cache fast-path ===
-            # Если NS-target совпадает с last_synced и last_synced свежий —
-            # пропускаем FunPay-запрос полностью (главный источник 429-нагрузки).
-            if diff_cache_enabled:
+            # quick_target нужен и для diff-cache, и для snapshot fast-path.
+            quick_target = None
+            if diff_cache_enabled or snapshot_mode:
                 quick_target = _compute_target_quickly(
                     ns_service=ns_service,
                     mapping=mapping,
@@ -641,26 +725,61 @@ async def sync_once(
                         if mapping.group_id is not None else None
                     ),
                 )
-                if quick_target is not None and _is_cache_hit(
-                    mapping=mapping,
-                    target=quick_target,
-                    ttl_seconds=diff_cache_ttl,
-                    now=cache_check_now,
-                    jitter_seconds=diff_cache_jitter,
-                ):
+
+            # === Diff-cache fast-path ===
+            # Если NS-target совпадает с last_synced и last_synced свежий —
+            # пропускаем FunPay-запрос полностью (главный источник 429-нагрузки).
+            if diff_cache_enabled and quick_target is not None and _is_cache_hit(
+                mapping=mapping,
+                target=quick_target,
+                ttl_seconds=diff_cache_ttl,
+                now=cache_check_now,
+                jitter_seconds=diff_cache_jitter,
+            ):
+                label = mapping.label or f"lot {mapping.funpay_lot_id}"
+                logger.debug(
+                    f"  [{label}] cache hit (price={quick_target.round_price()}, "
+                    f"stock={quick_target.stock}) — skip FunPay"
+                )
+                lots_unchanged += 1
+                # ВАЖНО: НЕ обновляем last_synced_at при cache-hit!
+                # TTL должен срабатывать честно — это гарантия того,
+                # что мы периодически переоткалибруем кеш с реальным
+                # FunPay-стоком. Иначе FunPay сам при продаже снижает
+                # сток (100→97), наш target всё ещё 100 (cap), cache
+                # видит совпадение и пропускает sync навсегда —
+                # см. инцидент 2026-05-25.
+                continue
+
+            # === Snapshot fast-path (P0-1 Фаза B) ===
+            # diff-cache промахнулся (TTL истёк / первый прогон). Вместо
+            # per-lot offerEdit GET сверяемся со свежим snapshot ноды. Если
+            # лот уже соответствует target — GET не нужен; обновляем
+            # last_synced (snapshot — это РЕАЛЬНАЯ проверка FunPay, поэтому
+            # переоткалибровка честная, в отличие от cache-hit выше).
+            if (
+                snapshot_mode
+                and quick_target is not None
+                and mapping.funpay_node_id
+            ):
+                snap = node_snapshots.get(mapping.funpay_node_id, {}).get(
+                    mapping.funpay_lot_id
+                )
+                if _snapshot_in_sync(quick_target, snap, settings):
                     label = mapping.label or f"lot {mapping.funpay_lot_id}"
                     logger.debug(
-                        f"  [{label}] cache hit (price={quick_target.round_price()}, "
-                        f"stock={quick_target.stock}) — skip FunPay"
+                        f"  [{label}] snapshot in-sync "
+                        f"(price={quick_target.round_price()}, "
+                        f"stock={quick_target.stock}) — skip per-lot GET"
                     )
                     lots_unchanged += 1
-                    # ВАЖНО: НЕ обновляем last_synced_at при cache-hit!
-                    # TTL должен срабатывать честно — это гарантия того,
-                    # что мы периодически переоткалибруем кеш с реальным
-                    # FunPay-стоком. Иначе FunPay сам при продаже снижает
-                    # сток (100→97), наш target всё ещё 100 (cap), cache
-                    # видит совпадение и пропускает sync навсегда —
-                    # см. инцидент 2026-05-25.
+                    lots_snapshot_synced += 1
+                    pending_cache_updates.append((
+                        mapping.id,
+                        quick_target.round_price(),
+                        quick_target.stock,
+                        quick_target.stock > 0,
+                    ))
                     continue
 
             # === Обычный путь: FunPay GET для проверки текущего состояния ===
@@ -844,13 +963,20 @@ async def sync_once(
     # строки. Конкретные имена capped-лотов не пишем — это видно
     # построчно через action_str «(capped: NS=N>cap=K)».
     capped_suffix = f", capped={lots_capped}" if lots_capped > 0 else ""
+    snap_suffix = (
+        f", snapshot_synced={lots_snapshot_synced}"
+        if lots_snapshot_synced > 0 else ""
+    )
+    if snapshot_degraded:
+        snap_suffix += f", DEGRADED(failed_nodes={snapshot_failed_nodes})"
 
-    if total_mappings > 0 or error:
+    if total_mappings > 0 or error or snapshot_degraded:
         # На exhausted'ы хотим обращать внимание — повышаем уровень до WARNING.
         line = (
             f"Sync done: checked={lots_checked}, "
             f"unchanged={lots_unchanged}, "
-            f"updated={lots_updated}, skipped={lots_skipped}{capped_suffix}, {http_str}"
+            f"updated={lots_updated}, skipped={lots_skipped}"
+            f"{capped_suffix}{snap_suffix}, {http_str}"
         )
         if http_metrics["exhausted"] > 0:
             logger.warning(line + "  (есть исчерпания retry — лоты пропущены!)")
@@ -872,4 +998,8 @@ async def sync_once(
         "auth_errors": auth_errors,
         "price_mismatches": price_mismatches,
         "http": http_metrics,
+        # P0-1 Фаза B
+        "snapshot_synced": lots_snapshot_synced,
+        "snapshot_failed_nodes": snapshot_failed_nodes,
+        "degraded": snapshot_degraded,
     }

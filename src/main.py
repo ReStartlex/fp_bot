@@ -90,6 +90,8 @@ class App:
         self._funpay_auth_fail_streak = 0
         # Время последнего алерта о расхождении цены (P0-4, анти-спам 1/час).
         self._last_price_mismatch_alert: datetime | None = None
+        # Время последнего алерта о деградации FunPay (P0-1 B3, анти-спам 1/час).
+        self._last_degraded_alert: datetime | None = None
 
     # ---------- Lifecycle ----------
 
@@ -596,6 +598,29 @@ class App:
                     except Exception as exc:
                         logger.warning(f"sync exhausted recover alert не доставлен: {exc}")
                 self._sync_exhausted_streak = 0
+
+            # P0-1 B3: snapshot-режим обнаружил глобальную деградацию FunPay
+            # и пропустил апдейты цен/стока (не наш over-poll). Сигналим
+            # владельцу, анти-спам 1/час. Автовыдача (chat/delivery) при этом
+            # работает — мы лишь придержали sync.
+            if result.get("degraded") and self.tg is not None:
+                now = datetime.now()
+                if (
+                    self._last_degraded_alert is None
+                    or now - self._last_degraded_alert >= timedelta(hours=1)
+                ):
+                    self._last_degraded_alert = now
+                    failed = int(result.get("snapshot_failed_nodes", 0))
+                    try:
+                        await self.tg.warning(
+                            f"⚠ <b>FunPay деградирует</b> — snapshot-GET падал "
+                            f"на {failed} нод(ах). Sync цен/стока придержан "
+                            f"этот цикл (берегу лимиты для выдачи/чата). "
+                            f"Автовыдача работает. Если повторяется — это "
+                            f"проблема на стороне FunPay, не бота."
+                        )
+                    except Exception as exc:
+                        logger.warning(f"degraded alert не доставлен: {exc}")
 
             # P2-5: суточная статистика. Рантайм-счётчики (429/exhausted/
             # деактивации) персистим в daily_stats. Best-effort: сбой
